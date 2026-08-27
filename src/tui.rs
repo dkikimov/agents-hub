@@ -26,8 +26,10 @@ use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
 /// keeps the UI responsive when three agents stream at once.
 const FRAME: Duration = Duration::from_millis(16);
 
-/// Sidebar width; also the x split that decides what the wheel scrolls.
+/// Sidebar width: start, and the bounds the drag handle clamps to.
 const SIDE_W: u16 = 30;
+const SIDE_MIN: u16 = 14;
+const PANE_MIN: u16 = 20;
 
 /// Lines per wheel tick.
 const WHEEL: usize = 3;
@@ -333,6 +335,13 @@ struct App {
     agents: Vec<String>,
     pane: (u16, u16), // cols, rows
     pane_org: (u16, u16), // top-left of the pane on screen, for mouse coords
+    side_w: u16,
+    /// Top-left of the sidebar list, and the row it's scrolled to — together they turn a
+    /// click's y into a `rows` index. The offset persists so the list doesn't jump.
+    side_org: (u16, u16),
+    side_off: usize,
+    /// Dragging the border between sidebar and pane.
+    drag_split: bool,
     status: String,
     dirty: bool,
 }
@@ -703,22 +712,71 @@ fn mouse_bytes(m: MouseEvent, screen: &vt100::Screen, col: u16, row: u16) -> Opt
     })
 }
 
-/// Mouse over the sidebar moves the selection. Over the pane, the app inside gets the
-/// event if it turned mouse reporting on (Claude Code does — that's how its own chat
-/// scrolls); otherwise the wheel walks our vt100 scrollback instead.
+/// The two border columns between sidebar and pane, so the drag handle is a two-cell
+/// target from either side.
+fn on_split(col: u16, side_w: u16) -> bool {
+    col + 1 >= side_w && col <= side_w
+}
+
+/// Screen row of a sidebar click → the row it landed on. `top` is the list's first line
+/// (under the border) and `off` how far it's scrolled; the inert "…" rows aren't clickable.
+fn row_at(rows: &[Row], off: usize, top: u16, y: u16) -> Option<usize> {
+    let i = off + usize::from(y.checked_sub(top)?);
+    match rows.get(i)? {
+        Row::Elide(_) => None,
+        _ => Some(i),
+    }
+}
+
+/// Mouse over the sidebar selects and scrolls; the border between the two panes drags to
+/// resize. Over the pane, the app inside gets the event if it turned mouse reporting on
+/// (Claude Code does — that's how its own chat scrolls); otherwise the wheel walks our
+/// vt100 scrollback instead.
 fn on_mouse(app: &mut App, m: MouseEvent) {
     if app.modal.is_some() {
         return;
     }
+    let left = matches!(
+        m.kind,
+        MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left)
+    );
     let wheel = match m.kind {
         MouseEventKind::ScrollUp => Some(true),
         MouseEventKind::ScrollDown => Some(false),
         _ => None,
     };
-    if m.column < SIDE_W {
+
+    if app.drag_split {
+        match m.kind {
+            MouseEventKind::Drag(_) => {
+                app.side_w = (m.column + 1).max(SIDE_MIN); // draw clamps the far edge
+                app.dirty = true;
+            }
+            _ => app.drag_split = false,
+        }
+        return;
+    }
+    if left && on_split(m.column, app.side_w) {
+        app.drag_split = true;
+        return;
+    }
+
+    if m.column < app.side_w {
         if let Some(up) = wheel {
             app.dirty = true;
             app.step(!up);
+        }
+        if let Some(i) = left
+            .then(|| row_at(&app.rows, app.side_off, app.side_org.1, m.row))
+            .flatten()
+        {
+            // A click on a session keeps terminal focus, so switching chats mid-typing
+            // doesn't cost a second keypress; anything else has nothing to type into.
+            app.sel = i;
+            if !matches!(app.rows[i], Row::Session(..)) {
+                app.focus = Focus::Sidebar;
+            }
+            app.dirty = true;
         }
         return;
     }
@@ -922,9 +980,13 @@ fn draw(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(f.area());
+    // Clamped here rather than in the drag handler: this is where the terminal's width
+    // is known, and Min() alone would let the two disagree about where the border is.
+    let max = f.area().width.saturating_sub(PANE_MIN).max(SIDE_MIN);
+    app.side_w = app.side_w.clamp(SIDE_MIN.min(max), max);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(SIDE_W), Constraint::Min(20)])
+        .constraints([Constraint::Length(app.side_w), Constraint::Min(PANE_MIN)])
         .split(outer[0]);
 
     // sidebar
@@ -958,9 +1020,13 @@ fn draw(f: &mut Frame, app: &mut App) {
                 .bg(if side_focused { Color::Blue } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         );
-    let mut st = ListState::default();
+    let mut st = ListState::default().with_offset(app.side_off);
     st.select(Some(app.sel));
     f.render_stateful_widget(list, cols[0], &mut st);
+    // Rendering clamps the offset and scrolls to the selection; keep what it settled on
+    // so clicks map to the rows actually on screen.
+    app.side_off = st.offset();
+    app.side_org = (cols[0].x + 1, cols[0].y + 1);
 
     // terminal pane
     let sel = app.cur().map(|(vi, s)| (vi, s.clone()));
@@ -1058,7 +1124,8 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
                 Line::from("  ^]       back to list    r   restart stopped"),
                 Line::from("  /        filter          q   quit"),
                 Line::from("  space    fold a folder's middle away into …"),
-                Line::from("  mouse    goes to the session · ⌥drag selects text"),
+                Line::from("  mouse    click a row to switch · drag the split to resize"),
+                Line::from("           over the pane it goes to the session"),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  folders come from each session's cwd; n starts one there",
@@ -1066,7 +1133,7 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
                 )),
             ],
             62,
-            10,
+            11,
         ),
         Modal::Kill { label, .. } => (
             " kill session ",
@@ -1183,6 +1250,10 @@ pub async fn run() -> Result<()> {
         agents: cfg.agent_names(),
         pane: (80, 24),
         pane_org: (0, 0),
+        side_w: SIDE_W,
+        side_org: (0, 0),
+        side_off: 0,
+        drag_split: false,
         status: String::new(),
         dirty: true,
     };
@@ -1308,6 +1379,23 @@ mod tests {
             mouse_bytes(ev(MouseEventKind::Up(MouseButton::Right)), x10.screen(), 2, 3).unwrap(),
             vec![0x1b, b'[', b'M', 35, 35, 36]
         );
+    }
+
+    #[test]
+    fn sidebar_clicks_land_on_the_right_row() {
+        // The border columns of a 30-wide sidebar are 29 (its own) and 30 (the pane's).
+        assert!(!on_split(28, 30));
+        assert!(on_split(29, 30));
+        assert!(on_split(30, 30));
+        assert!(!on_split(31, 30));
+
+        let rows = [Row::Vm(0), Row::Elide(1), Row::Session(0, 0, 2), Row::Folder(0)];
+        assert_eq!(row_at(&rows, 0, 1, 1), Some(0)); // first line under the border
+        assert_eq!(row_at(&rows, 0, 1, 3), Some(2));
+        assert_eq!(row_at(&rows, 0, 1, 2), None); // "…" is inert
+        assert_eq!(row_at(&rows, 0, 1, 0), None); // the border itself
+        assert_eq!(row_at(&rows, 0, 1, 9), None); // empty space below the list
+        assert_eq!(row_at(&rows, 2, 1, 1), Some(2)); // scrolled two rows down
     }
 
     #[test]
