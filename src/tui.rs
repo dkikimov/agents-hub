@@ -5,7 +5,8 @@ use crate::config::{Config, Vm};
 use crate::proto::*;
 use anyhow::{bail, Result};
 use ratatui::crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -19,10 +20,17 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tui_term::widget::PseudoTerminal;
 use tui_term::vt100;
+use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// One redraw per frame at most, however many bytes arrive in between. This is what
 /// keeps the UI responsive when three agents stream at once.
 const FRAME: Duration = Duration::from_millis(16);
+
+/// Sidebar width; also the x split that decides what the wheel scrolls.
+const SIDE_W: u16 = 30;
+
+/// Lines per wheel tick.
+const WHEEL: usize = 3;
 
 type Rd = Box<dyn AsyncRead + Unpin + Send>;
 type Wr = Box<dyn AsyncWrite + Unpin + Send>;
@@ -158,6 +166,7 @@ struct App {
     editing_filter: bool,
     agents: Vec<String>,
     pane: (u16, u16), // cols, rows
+    pane_org: (u16, u16), // top-left of the pane on screen, for mouse coords
     status: String,
     dirty: bool,
 }
@@ -341,6 +350,10 @@ fn on_key(app: &mut App, k: KeyEvent) -> bool {
             let (id, running) = (s.id.clone(), s.status == Status::Running);
             if running {
                 if let Some(bytes) = key_bytes(k) {
+                    // Typing jumps back to the live bottom, like every other terminal.
+                    if let Some(p) = app.panes.get_mut(&(vi, id.clone())) {
+                        p.screen_mut().set_scrollback(0);
+                    }
                     app.send(vi, Req::Input { id, data: b64(&bytes) });
                 }
             }
@@ -407,6 +420,133 @@ fn on_key(app: &mut App, k: KeyEvent) -> bool {
     true
 }
 
+/// crossterm mouse event → the bytes a real terminal would send, in whatever protocol
+/// the app inside the pane turned on. `None` means that app didn't ask for this event
+/// (or for any mouse at all), and we should handle it ourselves.
+///
+/// `col`/`row` are 0-based cells inside the pane.
+fn mouse_bytes(m: MouseEvent, screen: &vt100::Screen, col: u16, row: u16) -> Option<Vec<u8>> {
+    use MouseEventKind::*;
+    let mode = screen.mouse_protocol_mode();
+    let motion = matches!(m.kind, Drag(_) | Moved);
+    let wanted = match mode {
+        MouseProtocolMode::None => false,
+        // X10 reports presses only — no release, no motion.
+        MouseProtocolMode::Press => !matches!(m.kind, Up(_)) && !motion,
+        MouseProtocolMode::PressRelease => !motion,
+        MouseProtocolMode::ButtonMotion => !matches!(m.kind, Moved),
+        MouseProtocolMode::AnyMotion => true,
+    };
+    if !wanted {
+        return None;
+    }
+
+    let button = |b| match b {
+        ratatui::crossterm::event::MouseButton::Left => 0,
+        ratatui::crossterm::event::MouseButton::Middle => 1,
+        ratatui::crossterm::event::MouseButton::Right => 2,
+    };
+    let mut cb: u16 = match m.kind {
+        Down(b) | Up(b) => button(b),
+        Drag(b) => button(b) + 32,
+        Moved => 3 + 32, // motion with no button held
+        ScrollUp => 64,
+        ScrollDown => 65,
+        ScrollLeft => 66,
+        ScrollRight => 67,
+    };
+    cb += u16::from(m.modifiers.contains(KeyModifiers::SHIFT)) * 4
+        + u16::from(m.modifiers.contains(KeyModifiers::ALT)) * 8
+        + u16::from(m.modifiers.contains(KeyModifiers::CONTROL)) * 16;
+
+    let (x, y) = (col + 1, row + 1); // the wire protocol is 1-based
+    Some(match screen.mouse_protocol_encoding() {
+        MouseProtocolEncoding::Sgr => {
+            let end = if matches!(m.kind, Up(_)) { 'm' } else { 'M' };
+            format!("\x1b[<{cb};{x};{y}{end}").into_bytes()
+        }
+        // ponytail: the pre-SGR encodings cap coordinates at 223 and can't name the
+        // button on release — fine, since nothing written this decade asks for them.
+        _ => {
+            let cb = if matches!(m.kind, Up(_)) { 3 } else { cb };
+            let byte = |v: u16| (32 + v).min(255) as u8;
+            vec![0x1b, b'[', b'M', byte(cb), byte(x), byte(y)]
+        }
+    })
+}
+
+/// Mouse over the sidebar moves the selection. Over the pane, the app inside gets the
+/// event if it turned mouse reporting on (Claude Code does — that's how its own chat
+/// scrolls); otherwise the wheel walks our vt100 scrollback instead.
+fn on_mouse(app: &mut App, m: MouseEvent) {
+    if app.modal.is_some() {
+        return;
+    }
+    let wheel = match m.kind {
+        MouseEventKind::ScrollUp => Some(true),
+        MouseEventKind::ScrollDown => Some(false),
+        _ => None,
+    };
+    if m.column < SIDE_W {
+        if let Some(up) = wheel {
+            app.dirty = true;
+            app.sel = if up {
+                app.sel.saturating_sub(1)
+            } else {
+                (app.sel + 1).min(app.rows.len().saturating_sub(1))
+            };
+        }
+        return;
+    }
+
+    let (ox, oy) = app.pane_org;
+    let (cols, rows) = app.pane;
+    let (Some(col), Some(row)) = (m.column.checked_sub(ox), m.row.checked_sub(oy)) else {
+        return; // on the border or the status bar
+    };
+    if col >= cols || row >= rows {
+        return;
+    }
+    let Some((vi, id, running)) = app
+        .cur()
+        .map(|(vi, s)| (vi, s.id.clone(), s.status == Status::Running))
+    else {
+        return;
+    };
+
+    let bytes = app
+        .panes
+        .get(&(vi, id.clone()))
+        .and_then(|p| mouse_bytes(m, p.screen(), col, row));
+    if running {
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            app.focus = Focus::Terminal; // clicking in means you meant to type there
+            app.dirty = true;
+        }
+        if let Some(bytes) = bytes {
+            app.send(vi, Req::Input { id, data: b64(&bytes) });
+            return;
+        }
+    }
+
+    // The app doesn't want the mouse (plain shell, or the session is stopped), so the
+    // wheel is ours: walk the scrollback. set_scrollback clamps to what's buffered.
+    if let (Some(up), Some(p)) = (wheel, app.panes.get_mut(&(vi, id))) {
+        app.dirty = true;
+        let at = p.screen().scrollback();
+        p.screen_mut()
+            .set_scrollback(if up { at + WHEEL } else { at.saturating_sub(WHEEL) });
+    }
+}
+
+/// "~/Documents/agents-hub" → "agents-hub", so a session gets a useful name for free.
+fn default_name(cwd: &str, agent: &str) -> String {
+    match cwd.trim_end_matches('/').rsplit('/').next() {
+        Some(dir) if !dir.is_empty() && dir != "~" => dir.to_string(),
+        _ => agent.to_string(),
+    }
+}
+
 fn modal_key(app: &mut App, modal: Modal, k: KeyEvent) -> bool {
     match modal {
         Modal::Help => {
@@ -439,7 +579,7 @@ fn modal_key(app: &mut App, modal: Modal, k: KeyEvent) -> bool {
                         app.status = "no [agents.*] in config.toml".into();
                     } else {
                         let display = if name.trim().is_empty() {
-                            agent_name.clone()
+                            default_name(&cwd, &agent_name)
                         } else {
                             name.trim().to_string()
                         };
@@ -542,7 +682,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .split(f.area());
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(20)])
+        .constraints([Constraint::Length(SIDE_W), Constraint::Min(20)])
         .split(outer[0]);
 
     // sidebar
@@ -606,6 +746,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let inner = block.inner(cols[1]);
     f.render_widget(block, cols[1]);
 
+    app.pane_org = (inner.x, inner.y);
     app.resize_panes(inner.width.max(1), inner.height.max(1));
 
     match sel {
@@ -674,6 +815,7 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
                 Line::from("  ⏎ / l    focus terminal  d   kill session"),
                 Line::from("  ^]       back to list    r   restart stopped"),
                 Line::from("  /        filter          q   quit"),
+                Line::from("  mouse    goes to the session · ⌥drag selects text"),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  VM groups come from [[vm]] in config.toml",
@@ -711,7 +853,18 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
                     Line::from(format!("  on {}", app.vms[*vm].name)),
                     Line::from(""),
                     Line::from(format!("{} agent  ← {} →", mark(0), agent_name)),
-                    Line::from(format!("{} name   {}", mark(1), name)),
+                    Line::from(vec![
+                        Span::raw(format!("{} name   ", mark(1))),
+                        if name.is_empty() {
+                            // Dim, so it reads as the fallback rather than typed text.
+                            Span::styled(
+                                default_name(cwd, agent_name),
+                                Style::default().fg(Color::DarkGray),
+                            )
+                        } else {
+                            Span::raw(name.clone())
+                        },
+                    ]),
                     Line::from(format!("{} cwd    {}", mark(2), cwd)),
                     Line::from(""),
                     Line::from(Span::styled(
@@ -784,12 +937,22 @@ pub async fn run() -> Result<()> {
         editing_filter: false,
         agents: cfg.agent_names(),
         pane: (80, 24),
+        pane_org: (0, 0),
         status: String::new(),
         dirty: true,
     };
     app.rebuild();
 
     let mut term = ratatui::init();
+    // Wheel events only arrive with capture on — the cost is that the terminal's own
+    // click-drag selection now needs the usual modifier (option on macOS).
+    // ponytail: capture stays on for the whole session; make it a toggle if selection annoys.
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    let hook = std::panic::take_hook(); // ratatui's, which restores the screen
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        hook(info);
+    }));
     let mut ticker = tokio::time::interval(FRAME);
     let result = loop {
         tokio::select! {
@@ -805,6 +968,7 @@ pub async fn run() -> Result<()> {
                     Ui::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
                         if !on_key(&mut app, k) { break Ok(()) }
                     }
+                    Ui::Input(Event::Mouse(m)) => on_mouse(&mut app, m),
                     Ui::Input(Event::Resize(..)) => app.dirty = true,
                     Ui::Input(_) => {}
                     Ui::Up(i) => {
@@ -848,6 +1012,7 @@ pub async fn run() -> Result<()> {
             }
         }
     };
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -855,6 +1020,61 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_bytes_match_a_real_terminal() {
+        use ratatui::crossterm::event::MouseButton;
+        let ev = |kind| MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::NONE };
+        let screen = |seq: &str| {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(seq.as_bytes());
+            p
+        };
+
+        // No mouse mode: the app gets nothing and we keep the event.
+        let off = screen("");
+        assert!(mouse_bytes(ev(MouseEventKind::ScrollUp), off.screen(), 0, 0).is_none());
+
+        // What Claude Code asks for: any-motion tracking, SGR encoding.
+        let sgr = screen("\x1b[?1003h\x1b[?1006h");
+        let b = |kind, c, r| {
+            mouse_bytes(ev(kind), sgr.screen(), c, r).map(|v| String::from_utf8(v).unwrap())
+        };
+        assert_eq!(b(MouseEventKind::ScrollUp, 4, 9).unwrap(), "\x1b[<64;5;10M");
+        assert_eq!(b(MouseEventKind::ScrollDown, 0, 0).unwrap(), "\x1b[<65;1;1M");
+        assert_eq!(b(MouseEventKind::Down(MouseButton::Left), 2, 3).unwrap(), "\x1b[<0;3;4M");
+        assert_eq!(b(MouseEventKind::Up(MouseButton::Left), 2, 3).unwrap(), "\x1b[<0;3;4m");
+        assert_eq!(b(MouseEventKind::Drag(MouseButton::Left), 2, 3).unwrap(), "\x1b[<32;3;4M");
+        assert_eq!(b(MouseEventKind::Moved, 2, 3).unwrap(), "\x1b[<35;3;4M");
+
+        // Press/release only (?1000h): drags and moves stay with us.
+        let vt200 = screen("\x1b[?1000h\x1b[?1006h");
+        assert!(mouse_bytes(ev(MouseEventKind::Moved), vt200.screen(), 1, 1).is_none());
+        assert!(mouse_bytes(ev(MouseEventKind::Drag(MouseButton::Left)), vt200.screen(), 1, 1).is_none());
+        assert!(mouse_bytes(ev(MouseEventKind::ScrollUp), vt200.screen(), 1, 1).is_some());
+
+        // Legacy encoding: 0x20-biased bytes, release reported as button 3.
+        let x10 = screen("\x1b[?1000h");
+        assert_eq!(
+            mouse_bytes(ev(MouseEventKind::Down(MouseButton::Right)), x10.screen(), 2, 3).unwrap(),
+            vec![0x1b, b'[', b'M', 34, 35, 36]
+        );
+        assert_eq!(
+            mouse_bytes(ev(MouseEventKind::Up(MouseButton::Right)), x10.screen(), 2, 3).unwrap(),
+            vec![0x1b, b'[', b'M', 35, 35, 36]
+        );
+    }
+
+    #[test]
+    fn default_name_is_the_folder() {
+        assert_eq!(default_name("/Users/d/Documents/agents-hub", "claude"), "agents-hub");
+        assert_eq!(default_name("/Users/d/Documents/agents-hub/", "claude"), "agents-hub");
+        assert_eq!(default_name("~/src/foo", "claude"), "foo");
+        // Nothing folder-shaped to use — fall back to the agent.
+        assert_eq!(default_name("~", "claude"), "claude");
+        assert_eq!(default_name("/", "claude"), "claude");
+        assert_eq!(default_name("", "claude"), "claude");
+    }
 
     #[test]
     fn key_bytes_match_a_real_terminal() {
