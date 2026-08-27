@@ -13,7 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -116,6 +116,153 @@ async fn vm_task(idx: usize, vm: Vm, tx: UnboundedSender<Ui>, mut rx: UnboundedR
     }
 }
 
+// ── folder tree ───────────────────────────────────────────────────────────────
+
+/// A cwd's tree segments, rooted at `~` when it sits under `$HOME`, else at `/`.
+/// Applied to remote cwds too: the client can't know a remote `$HOME`, so a remote
+/// `/home/u/x` roots at `/`, which is at least honest. Paths typed as `~/x` in the
+/// new-session modal arrive as `~/x` and root correctly on either kind of VM.
+fn segments(cwd: &str) -> Vec<String> {
+    let cwd = cwd.trim_end_matches('/');
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
+    let under = home.as_deref().and_then(|h| cwd.strip_prefix(h));
+    let (root, rest) = if cwd.is_empty() || cwd == "~" || under == Some("") {
+        ("~", "")
+    } else if let Some(r) = cwd
+        .strip_prefix("~/")
+        .or_else(|| under.and_then(|r| r.strip_prefix('/')))
+    {
+        ("~", r)
+    } else {
+        ("/", cwd.trim_start_matches('/'))
+    };
+    std::iter::once(root.to_string())
+        .chain(rest.split('/').filter(|s| !s.is_empty()).map(str::to_string))
+        .collect()
+}
+
+/// Last component of a tree path: `~/a/b` → `b`, and the roots `~` and `/` map to themselves.
+fn seg_of(path: &str) -> &str {
+    match path.rsplit('/').next() {
+        Some(s) if !s.is_empty() => s,
+        _ => path,
+    }
+}
+
+fn join(parent: &str, seg: &str) -> String {
+    match parent {
+        "" => seg.to_string(),
+        p if p.ends_with('/') => format!("{p}{seg}"),
+        p => format!("{p}/{seg}"),
+    }
+}
+
+enum Node {
+    Folder { path: String, seg: String, has_sub: bool },
+    /// Stands in for the pass-through folders a collapsed parent dropped.
+    Elide,
+    Session(usize),
+}
+
+struct Tree<'a> {
+    /// Folder path → the sessions whose cwd is exactly that folder.
+    at: &'a BTreeMap<String, Vec<usize>>,
+    kids: &'a BTreeMap<String, BTreeSet<String>>,
+    collapsed: &'a HashSet<String>,
+}
+
+impl Tree<'_> {
+    fn folder(&self, path: &str, has_sub: bool) -> Node {
+        Node::Folder {
+            path: path.to_string(),
+            seg: seg_of(path).to_string(),
+            has_sub,
+        }
+    }
+
+    fn sessions_of(&self, path: &str, depth: usize, out: &mut Vec<(usize, Node)>) {
+        for &i in self.at.get(path).into_iter().flatten() {
+            out.push((depth, Node::Session(i)));
+        }
+    }
+
+    fn walk(&self, path: &str, depth: usize, out: &mut Vec<(usize, Node)>) {
+        let subs = self.kids.get(path).map_or(0, BTreeSet::len);
+        out.push((depth, self.folder(path, subs > 0)));
+        self.sessions_of(path, depth + 1, out);
+
+        if !self.collapsed.contains(path) {
+            for c in self.kids.get(path).into_iter().flatten() {
+                self.walk(c, depth + 1, out);
+            }
+            return;
+        }
+        // Collapsed: keep only the folders that actually hold sessions and stand the
+        // pass-through ones we dropped up as a single "…".
+        let (mut keep, mut elided) = (Vec::new(), false);
+        self.descend(path, &mut keep, &mut elided);
+        if keep.is_empty() {
+            return;
+        }
+        keep.sort();
+        // ponytail: one "…" for the whole subtree, and the survivors show only their last
+        // segment — right for the chain this is meant for, lossy on a wide tree. Give each
+        // survivor its path relative to the collapsed folder if that ever reads wrong.
+        let base = if elided {
+            out.push((depth + 1, Node::Elide));
+            depth + 2
+        } else {
+            depth + 1
+        };
+        for p in keep {
+            out.push((base, self.folder(&p, false)));
+            self.sessions_of(&p, base + 1, out);
+        }
+    }
+
+    /// Every session-bearing descendant of `path`; `elided` records whether anything
+    /// else was passed over on the way.
+    fn descend(&self, path: &str, keep: &mut Vec<String>, elided: &mut bool) {
+        for c in self.kids.get(path).into_iter().flatten() {
+            if self.at.contains_key(c) {
+                keep.push(c.clone());
+            } else {
+                *elided = true;
+            }
+            self.descend(c, keep, elided);
+        }
+    }
+}
+
+/// One VM's sidebar rows, as (depth, node). `idx` is the filter-surviving session
+/// indices, so a folder with nothing left in it simply never gets built.
+fn tree(sessions: &[SessionInfo], idx: &[usize], collapsed: &HashSet<String>) -> Vec<(usize, Node)> {
+    let mut at: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut kids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    for &i in idx {
+        let mut path = String::new();
+        for (d, seg) in segments(&sessions[i].cwd).iter().enumerate() {
+            let parent = path.clone();
+            path = join(&path, seg);
+            if d == 0 {
+                roots.insert(path.clone());
+            } else {
+                kids.entry(parent).or_default().insert(path.clone());
+            }
+            kids.entry(path.clone()).or_default();
+        }
+        at.entry(path).or_default().push(i);
+    }
+
+    let t = Tree { at: &at, kids: &kids, collapsed };
+    let mut out = Vec::new();
+    for r in &roots {
+        t.walk(r, 0, &mut out);
+    }
+    out
+}
+
 // ── state ─────────────────────────────────────────────────────────────────────
 
 struct VmState {
@@ -126,10 +273,24 @@ struct VmState {
     tx: UnboundedSender<Req>,
 }
 
+/// Sidebar rows. `Copy`, so anything with a payload lives in `App::folders` instead.
 #[derive(Clone, Copy)]
 enum Row {
     Vm(usize),
-    Session(usize, usize),
+    /// Index into `App::folders`.
+    Folder(usize),
+    /// The inert "…" placeholder, at this depth.
+    Elide(usize),
+    Session(usize, usize, usize), // vm, session, depth
+}
+
+struct Folder {
+    vm: usize,
+    path: String,
+    seg: String,
+    depth: usize,
+    collapsed: bool,
+    has_sub: bool,
 }
 
 #[derive(PartialEq)]
@@ -157,6 +318,11 @@ enum Modal {
 struct App {
     vms: Vec<VmState>,
     rows: Vec<Row>,
+    folders: Vec<Folder>,
+    /// (vm index, folder path) the user hid with space. Keyed by path, not row index,
+    /// so it survives the rebuild that every session list update triggers.
+    // ponytail: in-memory only, so folds reset on restart. Park it in state.json if that bites.
+    collapsed: HashSet<(usize, String)>,
     sel: usize,
     focus: Focus,
     panes: HashMap<(usize, String), vt100::Parser>,
@@ -174,20 +340,50 @@ struct App {
 impl App {
     fn rebuild(&mut self) {
         let mut rows = std::mem::take(&mut self.rows);
+        let mut folders = std::mem::take(&mut self.folders);
         rows.clear();
+        folders.clear();
         let f = self.filter.to_lowercase();
         for (vi, vm) in self.vms.iter().enumerate() {
             rows.push(Row::Vm(vi));
-            for (si, s) in vm.sessions.iter().enumerate() {
-                let hit = f.is_empty()
-                    || s.name.to_lowercase().contains(&f)
-                    || s.agent.to_lowercase().contains(&f);
-                if hit {
-                    rows.push(Row::Session(vi, si));
+            let idx: Vec<usize> = vm
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    f.is_empty()
+                        || s.name.to_lowercase().contains(&f)
+                        || s.agent.to_lowercase().contains(&f)
+                        || s.cwd.to_lowercase().contains(&f)
+                })
+                .map(|(si, _)| si)
+                .collect();
+            let hidden: HashSet<String> = self
+                .collapsed
+                .iter()
+                .filter(|(v, _)| *v == vi)
+                .map(|(_, p)| p.clone())
+                .collect();
+            for (depth, node) in tree(&vm.sessions, &idx, &hidden) {
+                match node {
+                    Node::Folder { path, seg, has_sub } => {
+                        rows.push(Row::Folder(folders.len()));
+                        folders.push(Folder {
+                            vm: vi,
+                            collapsed: hidden.contains(&path),
+                            path,
+                            seg,
+                            depth,
+                            has_sub,
+                        });
+                    }
+                    Node::Elide => rows.push(Row::Elide(depth)),
+                    Node::Session(si) => rows.push(Row::Session(vi, si, depth)),
                 }
             }
         }
         self.rows = rows;
+        self.folders = folders;
         if self.sel >= self.rows.len() {
             self.sel = self.rows.len().saturating_sub(1);
         }
@@ -195,15 +391,44 @@ impl App {
 
     fn cur(&self) -> Option<(usize, &SessionInfo)> {
         match self.rows.get(self.sel)? {
-            Row::Session(vi, si) => Some((*vi, self.vms[*vi].sessions.get(*si)?)),
-            Row::Vm(_) => None,
+            Row::Session(vi, si, _) => Some((*vi, self.vms[*vi].sessions.get(*si)?)),
+            _ => None,
         }
     }
 
     fn cur_vm(&self) -> usize {
         match self.rows.get(self.sel) {
-            Some(Row::Vm(vi)) | Some(Row::Session(vi, _)) => *vi,
-            None => 0,
+            Some(Row::Vm(vi)) | Some(Row::Session(vi, _, _)) => *vi,
+            Some(Row::Folder(fi)) => self.folders[*fi].vm,
+            _ => 0,
+        }
+    }
+
+    /// Moves the selection one row, stepping over the inert "…" placeholders.
+    fn step(&mut self, down: bool) {
+        let last = self.rows.len().saturating_sub(1);
+        loop {
+            match self.sel {
+                s if down && s < last => self.sel = s + 1,
+                s if !down && s > 0 => self.sel = s - 1,
+                _ => return,
+            }
+            if !matches!(self.rows[self.sel], Row::Elide(_)) {
+                return;
+            }
+        }
+    }
+
+    /// cwd to seed a new session with: the folder you're standing in, or the one the
+    /// selected session runs in, else this VM's default.
+    fn new_cwd(&self) -> String {
+        match self.rows.get(self.sel) {
+            Some(Row::Folder(fi)) => self.folders[*fi].path.clone(),
+            Some(Row::Session(vi, si, _)) => self.vms[*vi].sessions[*si].cwd.clone(),
+            _ if self.vms[self.cur_vm()].local => std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "~".into()),
+            _ => "~".into(),
         }
     }
 
@@ -364,10 +589,8 @@ fn on_key(app: &mut App, k: KeyEvent) -> bool {
     match k.code {
         KeyCode::Char('q') => return false,
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return false,
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.sel = (app.sel + 1).min(app.rows.len().saturating_sub(1))
-        }
-        KeyCode::Char('k') | KeyCode::Up => app.sel = app.sel.saturating_sub(1),
+        KeyCode::Char('j') | KeyCode::Down => app.step(true),
+        KeyCode::Char('k') | KeyCode::Up => app.step(false),
         KeyCode::Char('g') | KeyCode::Home => app.sel = 0,
         KeyCode::Char('G') | KeyCode::End => app.sel = app.rows.len().saturating_sub(1),
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -380,20 +603,25 @@ fn on_key(app: &mut App, k: KeyEvent) -> bool {
             app.filter.clear();
         }
         KeyCode::Char('?') => app.modal = Some(Modal::Help),
+        // Collapsing only drops rows *below* the folder, so the selection stays put.
+        KeyCode::Char(' ') => {
+            if let Some(Row::Folder(fi)) = app.rows.get(app.sel).copied() {
+                let f = &app.folders[fi];
+                if f.has_sub {
+                    let key = (f.vm, f.path.clone());
+                    if !app.collapsed.remove(&key) {
+                        app.collapsed.insert(key);
+                    }
+                    app.rebuild();
+                }
+            }
+        }
         KeyCode::Char('n') => {
-            let vm = app.cur_vm();
-            let cwd = if app.vms[vm].local {
-                std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "~".into())
-            } else {
-                "~".into()
-            };
             app.modal = Some(Modal::New {
-                vm,
+                vm: app.cur_vm(),
                 agent: 0,
                 name: String::new(),
-                cwd,
+                cwd: app.new_cwd(),
                 field: 0,
             });
         }
@@ -490,11 +718,7 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
     if m.column < SIDE_W {
         if let Some(up) = wheel {
             app.dirty = true;
-            app.sel = if up {
-                app.sel.saturating_sub(1)
-            } else {
-                (app.sel + 1).min(app.rows.len().saturating_sub(1))
-            };
+            app.step(!up);
         }
         return;
     }
@@ -651,7 +875,26 @@ fn sidebar_items(app: &App) -> Vec<ListItem<'static>> {
                 }
                 ListItem::new(Line::from(spans))
             }
-            Row::Session(vi, si) => {
+            Row::Folder(fi) => {
+                let f = &app.folders[fi];
+                // A leaf gets a bullet rather than a caret: nothing to fold, but the
+                // column still needs anchoring.
+                let glyph = match (f.collapsed, f.has_sub) {
+                    (true, _) => "▸ ",
+                    (false, true) => "▾ ",
+                    (false, false) => "· ",
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw("  ".repeat(f.depth + 1)),
+                    Span::styled(glyph, Style::default().fg(Color::DarkGray)),
+                    Span::styled(f.seg.clone(), Style::default().fg(Color::Blue)),
+                ]))
+            }
+            Row::Elide(depth) => ListItem::new(Line::from(vec![
+                Span::raw("  ".repeat(depth + 1)),
+                Span::styled("…", Style::default().fg(Color::DarkGray)),
+            ])),
+            Row::Session(vi, si, depth) => {
                 let vm = &app.vms[vi];
                 let s = &vm.sessions[si];
                 let (glyph, color) = match (vm.online, s.status) {
@@ -660,13 +903,12 @@ fn sidebar_items(app: &App) -> Vec<ListItem<'static>> {
                     (true, Status::Stopped) => ("○", Color::DarkGray),
                 };
                 ListItem::new(Line::from(vec![
-                    Span::raw("  "),
+                    Span::raw("  ".repeat(depth + 1)),
                     Span::styled(glyph, Style::default().fg(color)),
                     Span::raw(" "),
-                    Span::styled(
-                        format!("{:<7}", s.agent),
-                        Style::default().fg(Color::Magenta),
-                    ),
+                    // Unpadded: the indent already groups these, and at depth the
+                    // sidebar has no columns to spare.
+                    Span::styled(s.agent.clone(), Style::default().fg(Color::Magenta)),
                     Span::raw(" "),
                     Span::raw(s.name.clone()),
                 ]))
@@ -815,15 +1057,16 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
                 Line::from("  ⏎ / l    focus terminal  d   kill session"),
                 Line::from("  ^]       back to list    r   restart stopped"),
                 Line::from("  /        filter          q   quit"),
+                Line::from("  space    fold a folder's middle away into …"),
                 Line::from("  mouse    goes to the session · ⌥drag selects text"),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  VM groups come from [[vm]] in config.toml",
+                    "  folders come from each session's cwd; n starts one there",
                     Style::default().fg(Color::DarkGray),
                 )),
             ],
-            56,
-            9,
+            62,
+            10,
         ),
         Modal::Kill { label, .. } => (
             " kill session ",
@@ -928,6 +1171,8 @@ pub async fn run() -> Result<()> {
     let mut app = App {
         vms,
         rows: Vec::new(),
+        folders: Vec::new(),
+        collapsed: HashSet::new(),
         sel: 0,
         focus: Focus::Sidebar,
         panes: HashMap::new(),
@@ -1074,6 +1319,104 @@ mod tests {
         assert_eq!(default_name("~", "claude"), "claude");
         assert_eq!(default_name("/", "claude"), "claude");
         assert_eq!(default_name("", "claude"), "claude");
+    }
+
+    fn sess(cwd: &str) -> SessionInfo {
+        SessionInfo {
+            id: cwd.into(),
+            agent: "claude".into(),
+            name: "x".into(),
+            cwd: cwd.into(),
+            status: Status::Stopped,
+            created_at: 0,
+        }
+    }
+
+    /// (depth, label) per row — folders by segment, sessions as `#index`.
+    fn shape(rows: &[(usize, Node)]) -> Vec<(usize, String)> {
+        rows.iter()
+            .map(|(d, n)| {
+                (
+                    *d,
+                    match n {
+                        Node::Folder { seg, .. } => seg.clone(),
+                        Node::Elide => "…".into(),
+                        Node::Session(i) => format!("#{i}"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn want(rows: &[(usize, &str)]) -> Vec<(usize, String)> {
+        rows.iter().map(|(d, s)| (*d, s.to_string())).collect()
+    }
+
+    #[test]
+    fn segments_normalize_paths() {
+        std::env::set_var("HOME", "/Users/d");
+        assert_eq!(segments("/Users/d/Documents/x"), ["~", "Documents", "x"]);
+        assert_eq!(segments("/Users/d"), ["~"]);
+        assert_eq!(segments("/Users/d/"), ["~"]);
+        assert_eq!(segments("~"), ["~"]);
+        assert_eq!(segments("~/a/b"), ["~", "a", "b"]);
+        assert_eq!(segments(""), ["~"]);
+        assert_eq!(segments("/etc/nginx"), ["/", "etc", "nginx"]);
+        // A sibling of $HOME is not $HOME — prefix matching alone would get this wrong.
+        assert_eq!(segments("/Users/dx/a"), ["/", "Users", "dx", "a"]);
+    }
+
+    #[test]
+    fn tree_groups_sessions_by_cwd() {
+        let s = [sess("~/Documents/agents-hub"), sess("~/Documents/notes")];
+        assert_eq!(
+            shape(&tree(&s, &[0, 1], &HashSet::new())),
+            want(&[
+                (0, "~"),
+                (1, "Documents"),
+                (2, "agents-hub"),
+                (3, "#0"),
+                (2, "notes"),
+                (3, "#1"),
+            ])
+        );
+    }
+
+    #[test]
+    fn collapse_elides_the_middle() {
+        let s = [sess("~/Documents/f1/f2/f3")];
+        let hidden = HashSet::from(["~/Documents".to_string()]);
+        assert_eq!(
+            shape(&tree(&s, &[0], &hidden)),
+            want(&[(0, "~"), (1, "Documents"), (2, "…"), (3, "f3"), (4, "#0")])
+        );
+    }
+
+    #[test]
+    fn collapse_without_a_middle_emits_no_elide() {
+        let s = [sess("~/Documents/a"), sess("~/Documents/b")];
+        let hidden = HashSet::from(["~/Documents".to_string()]);
+        let out = tree(&s, &[0, 1], &hidden);
+        assert_eq!(
+            shape(&out),
+            want(&[
+                (0, "~"),
+                (1, "Documents"),
+                (2, "a"),
+                (3, "#0"),
+                (2, "b"),
+                (3, "#1"),
+            ])
+        );
+    }
+
+    #[test]
+    fn filtered_out_sessions_take_their_folders_with_them() {
+        let s = [sess("~/Documents/a"), sess("/etc/nginx")];
+        assert_eq!(
+            shape(&tree(&s, &[1], &HashSet::new())),
+            want(&[(0, "/"), (1, "etc"), (2, "nginx"), (3, "#1")])
+        );
     }
 
     #[test]
