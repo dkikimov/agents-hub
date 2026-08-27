@@ -547,8 +547,9 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // sidebar
     let side_focused = app.focus == Focus::Sidebar;
-    let title = if app.editing_filter || !app.filter.is_empty() {
-        format!(" filter: {} ", app.filter)
+    let filter_active = app.editing_filter || !app.filter.is_empty();
+    let title = if filter_active {
+        format!(" filter: {}_ ", app.filter)
     } else {
         " VMs & Sessions ".into()
     };
@@ -556,12 +557,19 @@ fn draw(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(if side_focused {
+                .border_style(Style::default().fg(if filter_active {
+                    Color::Yellow
+                } else if side_focused {
                     Color::Cyan
                 } else {
                     Color::DarkGray
                 }))
-                .title(title),
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(if filter_active { Color::Yellow } else { Color::Reset })
+                        .add_modifier(if filter_active { Modifier::BOLD } else { Modifier::empty() }),
+                )),
         )
         .highlight_style(
             Style::default()
