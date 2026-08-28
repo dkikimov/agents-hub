@@ -78,6 +78,14 @@ async fn stdio() -> Result<()> {
     Ok(())
 }
 
+fn systemd_unit(exe: &str, shell: &str) -> String {
+    format!(
+        "[Unit]\nDescription=agents-hub daemon\n\n\
+         [Service]\nExecStart=\"{shell}\" -lc 'exec \"$$0\" serve' \"{exe}\"\nRestart=always\nRestartSec=2\n\n\
+         [Install]\nWantedBy=default.target\n"
+    )
+}
+
 fn install_service(enable: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
     let exe = exe.display().to_string();
@@ -118,14 +126,8 @@ fn install_service(enable: bool) -> Result<()> {
     } else {
         let path = home().join(".config/systemd/user/agents-hub.service");
         std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(
-            &path,
-            format!(
-                "[Unit]\nDescription=agents-hub daemon\n\n\
-                 [Service]\nExecStart={exe} serve\nRestart=always\nRestartSec=2\n\n\
-                 [Install]\nWantedBy=default.target\n"
-            ),
-        )?;
+        let shell = std::env::var("SHELL").context("$SHELL not set")?;
+        std::fs::write(&path, systemd_unit(&exe, &shell))?;
         println!("wrote {}", path.display());
         if enable {
             let status = std::process::Command::new("systemctl")
@@ -268,5 +270,13 @@ mod tests {
             .vm
             .iter()
             .any(|v| v.name == "box" && v.ssh.as_deref() == Some("buildbox")));
+    }
+
+    #[test]
+    fn linux_service_starts_daemon_from_login_shell() {
+        let unit = systemd_unit("/home/u/.cargo/bin/agents-hub", "/bin/bash");
+        assert!(unit.contains(
+            "ExecStart=\"/bin/bash\" -lc 'exec \"$$0\" serve' \"/home/u/.cargo/bin/agents-hub\"\n"
+        ));
     }
 }

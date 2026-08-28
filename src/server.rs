@@ -329,6 +329,7 @@ impl Hub {
                     let _ = tx.send(Resp::Output {
                         id: id.clone(),
                         data: b64(&replay),
+                        live: false,
                     });
                 }
                 let sub = {
@@ -352,6 +353,7 @@ impl Hub {
                                     let msg = Resp::Output {
                                         id: id.clone(),
                                         data: b64(&d),
+                                        live: true,
                                     };
                                     if out.send(msg).is_err() {
                                         break;

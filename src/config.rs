@@ -52,7 +52,7 @@ command = ["claude"]
 resume  = ["claude", "--continue"]
 
 [agents.codex]
-command = ["codex"]
+command = ["codex", "--no-alt-screen"]
 
 [agents.shell]
 command = ["$SHELL", "-l"]
@@ -101,6 +101,7 @@ mod tests {
         assert!(cfg.vm[0].ssh.is_none());
         assert_eq!(cfg.agents["claude"].command, vec!["claude"]);
         assert!(cfg.agents["claude"].resume.is_some());
+        assert_eq!(cfg.agents["codex"].command, ["codex", "--no-alt-screen"]);
         assert_eq!(cfg.agent_names(), ["claude", "codex", "shell"]);
     }
 

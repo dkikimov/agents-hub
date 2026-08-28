@@ -46,7 +46,14 @@ pub enum Req {
 #[serde(tag = "t")]
 pub enum Resp {
     Sessions { sessions: Vec<SessionInfo> },
-    Output { id: String, data: String },
+    Output {
+        id: String,
+        data: String,
+        /// False for persisted replay. Defaults false so new clients never replay
+        /// side effects from an older server that does not send this field.
+        #[serde(default)]
+        live: bool,
+    },
     Exited { id: String, code: i32 },
     Error { msg: String },
 }
@@ -120,6 +127,7 @@ mod tests {
             Resp::Output {
                 id: "x".into(),
                 data: b64(&[0u8, 255, 10, 13]),
+                live: true,
             },
             Resp::Exited {
                 id: "x".into(),
@@ -132,6 +140,17 @@ mod tests {
             assert!(!line.contains('\n'));
             assert_eq!(r, serde_json::from_str::<Resp>(&line).unwrap());
         }
+
+        let old_output: Resp =
+            serde_json::from_str(r#"{"t":"Output","id":"x","data":"aGk="}"#).unwrap();
+        assert_eq!(
+            old_output,
+            Resp::Output {
+                id: "x".into(),
+                data: "aGk=".into(),
+                live: false,
+            }
+        );
     }
 
     #[test]

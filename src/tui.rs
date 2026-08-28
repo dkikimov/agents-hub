@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::Write as _;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -36,6 +37,45 @@ const WHEEL: usize = 3;
 
 type Rd = Box<dyn AsyncRead + Unpin + Send>;
 type Wr = Box<dyn AsyncWrite + Unpin + Send>;
+
+#[derive(Default)]
+struct Clipboard(Vec<Vec<u8>>);
+
+impl vt100::Callbacks for Clipboard {
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _: &[u8], data: &[u8]) {
+        if let Ok(data) = std::str::from_utf8(data) {
+            if let Ok(data) = unb64(data) {
+                self.0.push(data);
+            }
+        }
+    }
+}
+
+impl Clipboard {
+    fn take(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.0)
+    }
+
+    fn take_if(&mut self, allowed: bool) -> Vec<Vec<u8>> {
+        let copies = self.take();
+        if allowed { copies } else { Vec::new() }
+    }
+}
+
+fn copy_local(data: &[u8]) -> Result<()> {
+    let mut child = std::process::Command::new("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        bail!("pbcopy stdin unavailable")
+    };
+    stdin.write_all(data)?;
+    drop(stdin);
+    if !child.wait()?.success() {
+        bail!("pbcopy failed")
+    }
+    Ok(())
+}
 
 enum Ui {
     Input(Event),
@@ -317,6 +357,14 @@ enum Modal {
     Help,
 }
 
+struct Selection {
+    vm: usize,
+    id: String,
+    down: Option<MouseEvent>,
+    start: (u16, u16),
+    end: (u16, u16),
+}
+
 struct App {
     vms: Vec<VmState>,
     rows: Vec<Row>,
@@ -327,7 +375,7 @@ struct App {
     collapsed: HashSet<(usize, String)>,
     sel: usize,
     focus: Focus,
-    panes: HashMap<(usize, String), vt100::Parser>,
+    panes: HashMap<(usize, String), vt100::Parser<Clipboard>>,
     attached: HashSet<(usize, String)>,
     modal: Option<Modal>,
     filter: String,
@@ -342,6 +390,7 @@ struct App {
     side_off: usize,
     /// Dragging the border between sidebar and pane.
     drag_split: bool,
+    selection: Option<Selection>,
     status: String,
     dirty: bool,
 }
@@ -457,6 +506,13 @@ impl App {
         let live: HashSet<String> = self.vms[vi].sessions.iter().map(|s| s.id.clone()).collect();
         self.panes.retain(|(v, id), _| *v != vi || live.contains(id));
         self.attached.retain(|(v, id)| *v != vi || live.contains(id));
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|s| !self.panes.contains_key(&(s.vm, s.id.clone())))
+        {
+            self.selection = None;
+        }
 
         let fresh: Vec<String> = live
             .iter()
@@ -465,7 +521,15 @@ impl App {
             .collect();
         for id in fresh {
             self.panes
-                .insert((vi, id.clone()), vt100::Parser::new(rows, cols, 2000));
+                .insert(
+                    (vi, id.clone()),
+                    vt100::Parser::new_with_callbacks(
+                        rows,
+                        cols,
+                        2000,
+                        Clipboard::default(),
+                    ),
+                );
             self.attached.insert((vi, id.clone()));
             self.send(vi, Req::Attach { id, cols, rows });
         }
@@ -476,6 +540,7 @@ impl App {
             return;
         }
         self.pane = (cols, rows);
+        self.selection = None;
         for p in self.panes.values_mut() {
             p.screen_mut().set_size(rows, cols);
         }
@@ -549,6 +614,7 @@ fn key_bytes(k: KeyEvent) -> Option<Vec<u8>> {
 /// Returns false when the app should quit.
 fn on_key(app: &mut App, k: KeyEvent) -> bool {
     app.dirty = true;
+    app.selection = None;
 
     if let Some(modal) = app.modal.take() {
         return modal_key(app, modal, k);
@@ -657,11 +723,57 @@ fn on_key(app: &mut App, k: KeyEvent) -> bool {
     true
 }
 
+fn pane_cell(
+    (ox, oy): (u16, u16),
+    (cols, rows): (u16, u16),
+    (x, y): (u16, u16),
+    clamp: bool,
+) -> Option<(u16, u16)> {
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    if clamp {
+        return Some((
+            x.saturating_sub(ox).min(cols - 1),
+            y.saturating_sub(oy).min(rows - 1),
+        ));
+    }
+    let (col, row) = (x.checked_sub(ox)?, y.checked_sub(oy)?);
+    (col < cols && row < rows).then_some((col, row))
+}
+
+fn selected_text(
+    screen: &vt100::Screen,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> Option<String> {
+    if start == end {
+        return None;
+    }
+    let (rows, cols) = screen.size();
+    if [start, end]
+        .into_iter()
+        .any(|(col, row)| col >= cols || row >= rows)
+    {
+        return None;
+    }
+    let (start, end) = if (start.1, start.0) <= (end.1, end.0) {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let text = screen.contents_between(
+        start.1,
+        start.0,
+        end.1,
+        end.0.saturating_add(1).min(cols),
+    );
+    (!text.is_empty()).then_some(text)
+}
+
 /// crossterm mouse event → the bytes a real terminal would send, in whatever protocol
 /// the app inside the pane turned on. `None` means that app didn't ask for this event
 /// (or for any mouse at all), and we should handle it ourselves.
-///
-/// `col`/`row` are 0-based cells inside the pane.
 fn mouse_bytes(m: MouseEvent, screen: &vt100::Screen, col: u16, row: u16) -> Option<Vec<u8>> {
     use MouseEventKind::*;
     let mode = screen.mouse_protocol_mode();
@@ -712,6 +824,19 @@ fn mouse_bytes(m: MouseEvent, screen: &vt100::Screen, col: u16, row: u16) -> Opt
     })
 }
 
+fn click_bytes(
+    down: MouseEvent,
+    up: MouseEvent,
+    screen: &vt100::Screen,
+    (col, row): (u16, u16),
+) -> Vec<u8> {
+    [down, up]
+        .into_iter()
+        .filter_map(|m| mouse_bytes(m, screen, col, row))
+        .flatten()
+        .collect()
+}
+
 /// The two border columns between sidebar and pane, so the drag handle is a two-cell
 /// target from either side.
 fn on_split(col: u16, side_w: u16) -> bool {
@@ -736,15 +861,88 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
     if app.modal.is_some() {
         return;
     }
-    let left = matches!(
+    let left_down = matches!(
         m.kind,
         MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left)
+    );
+    let left_drag = matches!(
+        m.kind,
+        MouseEventKind::Drag(ratatui::crossterm::event::MouseButton::Left)
+    );
+    let left_up = matches!(
+        m.kind,
+        MouseEventKind::Up(ratatui::crossterm::event::MouseButton::Left)
     );
     let wheel = match m.kind {
         MouseEventKind::ScrollUp => Some(true),
         MouseEventKind::ScrollDown => Some(false),
         _ => None,
     };
+
+    if app.selection.as_ref().is_some_and(|s| s.down.is_some()) && (left_drag || left_up) {
+        let Some(cell) = pane_cell(
+            app.pane_org,
+            app.pane,
+            (m.column, m.row),
+            true,
+        ) else {
+            return;
+        };
+        if left_drag {
+            if let Some(selection) = app.selection.as_mut() {
+                selection.end = cell;
+            }
+            app.dirty = true;
+            return;
+        }
+
+        let mut selection = app.selection.take().expect("active selection");
+        selection.end = cell;
+        let text = app
+            .panes
+            .get(&(selection.vm, selection.id.clone()))
+            .and_then(|p| selected_text(p.screen(), selection.start, selection.end));
+        if let Some(text) = text {
+            app.status = match copy_local(text.as_bytes()) {
+                Ok(()) => format!("copied {} chars", text.chars().count()),
+                Err(e) => format!("copy failed: {e}"),
+            };
+            selection.down = None;
+            app.selection = Some(selection);
+        } else {
+            let running = app.vms[selection.vm]
+                .sessions
+                .iter()
+                .find(|s| s.id == selection.id)
+                .is_some_and(|s| s.status == Status::Running);
+            let bytes = app
+                .panes
+                .get(&(selection.vm, selection.id.clone()))
+                .map(|p| {
+                    click_bytes(
+                        selection.down.expect("active selection"),
+                        m,
+                        p.screen(),
+                        selection.start,
+                    )
+                })
+                .unwrap_or_default();
+            if running {
+                app.focus = Focus::Terminal;
+                if !bytes.is_empty() {
+                    app.send(
+                        selection.vm,
+                        Req::Input {
+                            id: selection.id,
+                            data: b64(&bytes),
+                        },
+                    );
+                }
+            }
+        }
+        app.dirty = true;
+        return;
+    }
 
     if app.drag_split {
         match m.kind {
@@ -756,17 +954,21 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
         }
         return;
     }
-    if left && on_split(m.column, app.side_w) {
+    if left_down && on_split(m.column, app.side_w) {
+        app.selection = None;
         app.drag_split = true;
         return;
     }
 
     if m.column < app.side_w {
+        if left_down || wheel.is_some() {
+            app.selection = None;
+        }
         if let Some(up) = wheel {
             app.dirty = true;
             app.step(!up);
         }
-        if let Some(i) = left
+        if let Some(i) = left_down
             .then(|| row_at(&app.rows, app.side_off, app.side_org.1, m.row))
             .flatten()
         {
@@ -781,20 +983,38 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
         return;
     }
 
-    let (ox, oy) = app.pane_org;
-    let (cols, rows) = app.pane;
-    let (Some(col), Some(row)) = (m.column.checked_sub(ox), m.row.checked_sub(oy)) else {
+    let Some((col, row)) = pane_cell(
+        app.pane_org,
+        app.pane,
+        (m.column, m.row),
+        false,
+    ) else {
         return; // on the border or the status bar
     };
-    if col >= cols || row >= rows {
-        return;
-    }
     let Some((vi, id, running)) = app
         .cur()
         .map(|(vi, s)| (vi, s.id.clone(), s.status == Status::Running))
     else {
         return;
     };
+
+    if left_down
+        && m.modifiers == KeyModifiers::NONE
+        && app.panes.contains_key(&(vi, id.clone()))
+    {
+        app.selection = Some(Selection {
+            vm: vi,
+            id,
+            down: Some(m),
+            start: (col, row),
+            end: (col, row),
+        });
+        app.dirty = true;
+        return;
+    }
+    if wheel.is_some() {
+        app.selection = None;
+    }
 
     let bytes = app
         .panes
@@ -1062,6 +1282,30 @@ fn draw(f: &mut Frame, app: &mut App) {
             Some(parser) => {
                 let screen = parser.screen();
                 f.render_widget(PseudoTerminal::new(screen), inner);
+                if let Some(selection) = app.selection.as_ref().filter(|selection| {
+                    selection.vm == vi && selection.id == s.id && selection.start != selection.end
+                }) {
+                    let (start, end) = if (selection.start.1, selection.start.0)
+                        <= (selection.end.1, selection.end.0)
+                    {
+                        (selection.start, selection.end)
+                    } else {
+                        (selection.end, selection.start)
+                    };
+                    for row in start.1..=end.1 {
+                        let first = if row == start.1 { start.0 } else { 0 };
+                        let last = if row == end.1 {
+                            end.0
+                        } else {
+                            inner.width.saturating_sub(1)
+                        };
+                        for col in first..=last {
+                            f.buffer_mut()[(inner.x + col, inner.y + row)].set_style(
+                                Style::default().add_modifier(Modifier::REVERSED),
+                            );
+                        }
+                    }
+                }
                 if app.focus == Focus::Terminal && !screen.hide_cursor() {
                     let (r, c) = screen.cursor_position();
                     f.set_cursor_position((inner.x + c, inner.y + r));
@@ -1125,7 +1369,7 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
                 Line::from("  /        filter          q   quit"),
                 Line::from("  space    fold a folder's middle away into …"),
                 Line::from("  mouse    click a row to switch · drag the split to resize"),
-                Line::from("           over the pane it goes to the session"),
+                Line::from("           click pane controls · drag pane text to copy"),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  folders come from each session's cwd; n starts one there",
@@ -1254,15 +1498,14 @@ pub async fn run() -> Result<()> {
         side_org: (0, 0),
         side_off: 0,
         drag_split: false,
+        selection: None,
         status: String::new(),
         dirty: true,
     };
     app.rebuild();
 
     let mut term = ratatui::init();
-    // Wheel events only arrive with capture on — the cost is that the terminal's own
-    // click-drag selection now needs the usual modifier (option on macOS).
-    // ponytail: capture stays on for the whole session; make it a toggle if selection annoys.
+    // Capture keeps pane/sidebar mouse features available; pane drags are copied locally.
     let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let hook = std::panic::take_hook(); // ratatui's, which restores the screen
     std::panic::set_hook(Box::new(move |info| {
@@ -1285,7 +1528,10 @@ pub async fn run() -> Result<()> {
                         if !on_key(&mut app, k) { break Ok(()) }
                     }
                     Ui::Input(Event::Mouse(m)) => on_mouse(&mut app, m),
-                    Ui::Input(Event::Resize(..)) => app.dirty = true,
+                    Ui::Input(Event::Resize(..)) => {
+                        app.selection = None;
+                        app.dirty = true;
+                    }
                     Ui::Input(_) => {}
                     Ui::Up(i) => {
                         app.vms[i].online = true;
@@ -1306,11 +1552,32 @@ pub async fn run() -> Result<()> {
                                 app.rebuild();
                                 app.reconcile(i);
                             }
-                            Resp::Output { id, data } => {
+                            Resp::Output { id, data, live } => {
+                                let selected = app
+                                    .cur()
+                                    .is_some_and(|(vi, s)| vi == i && s.id == id);
+                                if app.selection.as_ref().is_some_and(|selection| {
+                                    selection.down.is_none()
+                                        && selection.vm == i
+                                        && selection.id == id
+                                }) {
+                                    app.selection = None;
+                                }
+                                let mut copy = None;
                                 if let (Ok(bytes), Some(p)) =
                                     (unb64(&data), app.panes.get_mut(&(i, id)))
                                 {
                                     p.process(&bytes);
+                                    copy = p.callbacks_mut().take_if(live && selected).pop();
+                                }
+                                if let Some(copy) = copy {
+                                    app.status = match copy_local(&copy) {
+                                        Ok(()) => format!(
+                                            "copied {} chars",
+                                            String::from_utf8_lossy(&copy).chars().count()
+                                        ),
+                                        Err(e) => format!("copy failed: {e}"),
+                                    };
                                 }
                             }
                             Resp::Exited { id, code } => {
@@ -1336,6 +1603,68 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osc52_copy_survives_split_pty_chunks() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, Clipboard::default());
+        parser.process(b"\x1b]52;c;aGV");
+        parser.process(b"sbG8=\x07");
+        parser.process(b"\x1b]52;c;?\x07"); // reads never reach the local clipboard
+
+        assert_eq!(parser.callbacks_mut().take(), vec![b"hello".to_vec()]);
+        assert!(parser.callbacks_mut().take().is_empty());
+    }
+
+    #[test]
+    fn suppressed_osc52_copies_are_discarded() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, Clipboard::default());
+        parser.process(b"\x1b]52;c;c3RhbGU=\x07");
+
+        assert!(parser.callbacks_mut().take_if(false).is_empty());
+        assert!(parser.callbacks_mut().take_if(true).is_empty());
+    }
+
+    #[test]
+    fn drag_selection_is_inclusive_and_direction_independent() {
+        let mut parser = vt100::Parser::new(3, 10, 0);
+        parser.process(b"alpha\r\nbeta");
+
+        assert_eq!(selected_text(parser.screen(), (1, 0), (1, 1)), Some("lpha\nbe".into()));
+        assert_eq!(selected_text(parser.screen(), (1, 1), (1, 0)), Some("lpha\nbe".into()));
+        assert_eq!(selected_text(parser.screen(), (1, 0), (1, 0)), None);
+    }
+
+    #[test]
+    fn stationary_left_drag_remains_a_child_click() {
+        use ratatui::crossterm::event::MouseButton;
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[?1003h\x1b[?1006h");
+        let event = |kind| MouseEvent {
+            kind,
+            column: 12,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            click_bytes(
+                event(MouseEventKind::Down(MouseButton::Left)),
+                event(MouseEventKind::Up(MouseButton::Left)),
+                parser.screen(),
+                (2, 3),
+            ),
+            b"\x1b[<0;3;4M\x1b[<0;3;4m"
+        );
+    }
+
+    #[test]
+    fn drag_endpoints_clamp_to_the_visible_pane() {
+        assert_eq!(pane_cell((10, 5), (20, 4), (12, 6), false), Some((2, 1)));
+        assert_eq!(pane_cell((10, 5), (20, 4), (2, 99), false), None);
+        assert_eq!(pane_cell((10, 5), (20, 4), (2, 99), true), Some((0, 3)));
+    }
 
     #[test]
     fn mouse_bytes_match_a_real_terminal() {
