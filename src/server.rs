@@ -89,20 +89,80 @@ fn read_tail(path: &Path, max: u64) -> Vec<u8> {
     buf
 }
 
-/// Keeps the tail and drops the head once a log outgrows `LOG_MAX`.
-fn trim_log(path: &Path) {
-    let len = match std::fs::metadata(path) {
-        Ok(m) => m.len(),
-        Err(_) => return,
-    };
-    if len <= LOG_MAX {
-        return;
+/// One session's append-only log, which trims its own head once it outgrows `LOG_MAX`.
+/// Every write is best-effort: a full disk must not take the session down with it.
+struct SessionLog {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    since_check: u64,
+}
+
+impl SessionLog {
+    fn open(path: PathBuf) -> SessionLog {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+        SessionLog {
+            path,
+            file,
+            since_check: 0,
+        }
     }
-    let tail = read_tail(path, LOG_KEEP);
-    let tmp = path.with_extension("trim");
-    if std::fs::write(&tmp, &tail).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+
+    fn append(&mut self, chunk: &[u8]) {
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.write_all(chunk);
+        }
+        self.since_check += chunk.len() as u64;
+        if self.since_check > LOG_KEEP {
+            self.since_check = 0;
+            self.file = None; // release the fd before the rename lands on it
+            self.trim();
+            *self = SessionLog::open(std::mem::take(&mut self.path));
+        }
     }
+
+    /// Keeps the tail and drops the head. tmp-file + rename, so a crash mid-trim
+    /// leaves the old log rather than a half-written one.
+    fn trim(&self) {
+        let len = match std::fs::metadata(&self.path) {
+            Ok(m) => m.len(),
+            Err(_) => return,
+        };
+        if len <= LOG_MAX {
+            return;
+        }
+        let tail = read_tail(&self.path, LOG_KEEP);
+        let tmp = self.path.with_extension("trim");
+        if std::fs::write(&tmp, &tail).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.path);
+        }
+    }
+}
+
+/// Fans one PTY's output out to whoever is attached and appends it to the session log.
+/// Returns the child's exit code once the PTY closes.
+fn pty_reader(
+    mut reader: Box<dyn Read + Send>,
+    log_path: PathBuf,
+    tx: &broadcast::Sender<Ev>,
+    child: &Mutex<Box<dyn Child + Send + Sync>>,
+) -> i32 {
+    let mut log = SessionLog::open(log_path);
+    let mut buf = [0u8; 8192];
+    while let Ok(n @ 1..) = reader.read(&mut buf) {
+        let chunk = &buf[..n];
+        log.append(chunk);
+        let _ = tx.send(Ev::Data(Arc::new(chunk.to_vec())));
+    }
+    child
+        .lock()
+        .unwrap()
+        .wait()
+        .map(|s| s.exit_code() as i32)
+        .unwrap_or(-1)
 }
 
 impl Hub {
@@ -200,7 +260,7 @@ impl Hub {
             .with_context(|| format!("launching {prog}"))?;
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader()?;
+        let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         let tx = broadcast::channel(CHUNK_CAP).0;
         let child = Arc::new(Mutex::new(child));
@@ -211,42 +271,7 @@ impl Hub {
         let etx = tx.clone();
         let echild = child.clone();
         std::thread::spawn(move || {
-            let mut log = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .ok();
-            let mut since_check: u64 = 0;
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let chunk = &buf[..n];
-                        if let Some(f) = log.as_mut() {
-                            let _ = f.write_all(chunk);
-                        }
-                        since_check += n as u64;
-                        if since_check > LOG_KEEP {
-                            since_check = 0;
-                            drop(log.take()); // release the fd before trim renames over it
-                            trim_log(&log_path);
-                            log = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&log_path)
-                                .ok();
-                        }
-                        let _ = etx.send(Ev::Data(Arc::new(chunk.to_vec())));
-                    }
-                }
-            }
-            let code = echild
-                .lock()
-                .unwrap()
-                .wait()
-                .map(|s| s.exit_code() as i32)
-                .unwrap_or(-1);
+            let code = pty_reader(reader, log_path, &etx, &echild);
             let _ = etx.send(Ev::Exited(code));
             hub.mark_stopped(&sid);
         });
@@ -509,6 +534,30 @@ mod tests {
         assert_eq!(read_tail(&p, 4), b"6789");
         assert_eq!(read_tail(&p, 100), b"0123456789");
         assert!(read_tail(&dir.join("missing"), 10).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_log_rotates_itself_and_keeps_the_tail() {
+        let dir = std::env::temp_dir().join(format!("ah-log-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.log");
+
+        let mut log = SessionLog::open(path.clone());
+        let chunk = vec![b'x'; 64 * 1024];
+        // Past LOG_MAX, so the check that fires at every LOG_KEEP bytes has to trim.
+        for _ in 0..(LOG_MAX / chunk.len() as u64 + 2) {
+            log.append(&chunk);
+        }
+        // The size check only runs every LOG_KEEP bytes, so that overshoot is the
+        // real ceiling — LOG_MAX is a rotation trigger, not a hard cap.
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len <= LOG_MAX + LOG_KEEP, "{len} bytes went untrimmed");
+        assert!(len >= LOG_KEEP, "the tail is what a client replays from");
+
+        // Appends still land after a rotation — a lost fd would show up as a dead log.
+        log.append(b"after");
+        assert!(read_tail(&path, 5) == b"after");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

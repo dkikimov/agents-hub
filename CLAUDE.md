@@ -11,8 +11,9 @@ remote VMs from one TUI, grouped by VM name. Sessions and their scrollback survi
 
 ```bash
 cargo build
-cargo test                                     # 9 unit + 1 integration
+cargo test                                     # 49 unit + 1 integration
 cargo test --test roundtrip                    # integration only (spawns real daemons + PTYs)
+cargo test tui::event::                        # one module's tests
 cargo test key_bytes_match_a_real_terminal     # single test by name
 cargo clippy --all-targets                     # kept clean
 cargo install --path . --locked                # --locked matters, see "vt100" below
@@ -43,9 +44,30 @@ One binary, three roles (`src/main.rs` dispatches on `argv[1]`):
 
 | Role | Where | Does |
 |---|---|---|
-| TUI client (no args) | macOS | `src/tui.rs` — one task per VM, one vt100 parser per session |
+| TUI client (no args) | macOS | `src/tui/` — one task per VM, one vt100 parser per session |
 | `serve` | macOS + Linux | `src/server.rs` — owns every PTY, 0600 Unix socket only |
 | `stdio` | remote VM | pipes stdin/stdout ↔ local socket; what SSH runs |
+
+`src/setup.rs` is the `install-service` / `add-vm` provisioning, which runs once and
+never during normal operation — keep it out of the runtime files.
+
+Inside `src/tui/`, the split is by *who is allowed to mutate what*:
+
+| File | Role |
+|---|---|
+| `mod.rs` | constants, the `Ui` event union, and the select loop; terminal setup/teardown |
+| `app.rs` | all client state, plus the queries and invariants over it (`rebuild`, `reconcile`) |
+| `event.rs` | the **only** thing that mutates `App` — keys, mouse, paste, daemon frames |
+| `render.rs` | the **only** thing that paints it; writes back just the geometry clicks need |
+| `link.rs` | one reconnecting task per VM, local socket or SSH pipe |
+| `tree.rs` | cwds → the folder tree, pure |
+| `input.rs` | crossterm event → guest bytes, and click → cell hit-testing, pure |
+| `clipboard.rs` | OSC 52 from the guest, `pbcopy` locally |
+
+`tree.rs`, `input.rs` and `clipboard.rs` know nothing about `App`, so their tests are
+plain function calls. `app.rs::fixture` builds an `App` over a fake VM with the request
+channel exposed, which is how `event.rs` asserts on what a keystroke actually sent —
+prefer that over driving tmux when the behaviour isn't about pixels.
 
 **Transport is SSH, and there is no network listener anywhere in the binary.** Local clients
 hit the Unix socket directly; remote clients spawn `ssh <host> agents-hub stdio`. Both sides
@@ -94,9 +116,10 @@ work. `Run`'s fields are `Arc<Mutex<..>>` specifically to make that possible.
 
 ## Conventions
 
-- Five source files, and it should stay that way. Deps are deliberately few — no `clap`
-  (a `match` on argv), no `dirs` (hardcoded `~/.config` + `~/.local/state`), no `tracing`
-  (`eprintln!` to the daemon log).
+- A file earns its existence by having one job someone can name. Split when a file
+  stops fitting that sentence, not on a line count; don't add one for a single function.
+  Deps are deliberately few — no `clap` (a `match` on argv), no `dirs` (hardcoded
+  `~/.config` + `~/.local/state`), no `tracing` (`eprintln!` to the daemon log).
 - `ponytail:` comments mark deliberate shortcuts with a named ceiling and upgrade path. Read the
   ceiling before "fixing" the shortcut.
 - Non-trivial logic leaves one runnable check behind. `tests/roundtrip.rs` is the load-bearing
