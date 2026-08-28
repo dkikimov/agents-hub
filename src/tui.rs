@@ -16,7 +16,7 @@ use ratatui::Frame;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tui_term::widget::PseudoTerminal;
@@ -26,6 +26,7 @@ use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
 /// One redraw per frame at most, however many bytes arrive in between. This is what
 /// keeps the UI responsive when three agents stream at once.
 const FRAME: Duration = Duration::from_millis(16);
+const ACTIVITY_WINDOW: Duration = Duration::from_secs(1);
 
 /// Sidebar width: start, and the bounds the drag handle clamps to.
 const SIDE_W: u16 = 30;
@@ -377,6 +378,7 @@ struct App {
     focus: Focus,
     panes: HashMap<(usize, String), vt100::Parser<Clipboard>>,
     attached: HashSet<(usize, String)>,
+    activity: HashMap<(usize, String), Instant>,
     modal: Option<Modal>,
     filter: String,
     editing_filter: bool,
@@ -506,6 +508,7 @@ impl App {
         let live: HashSet<String> = self.vms[vi].sessions.iter().map(|s| s.id.clone()).collect();
         self.panes.retain(|(v, id), _| *v != vi || live.contains(id));
         self.attached.retain(|(v, id)| *v != vi || live.contains(id));
+        self.activity.retain(|(v, id), _| *v != vi || live.contains(id));
         if self
             .selection
             .as_ref()
@@ -1176,7 +1179,26 @@ fn modal_key(app: &mut App, modal: Modal, k: KeyEvent) -> bool {
 
 // ── rendering ─────────────────────────────────────────────────────────────────
 
+fn session_marker(
+    online: bool,
+    status: Status,
+    last_activity: Option<Instant>,
+    now: Instant,
+) -> (&'static str, Color) {
+    match (online, status) {
+        (false, _) => ("◌", Color::DarkGray),
+        (true, Status::Stopped) => ("○", Color::DarkGray),
+        (true, Status::Running)
+            if last_activity.is_some_and(|last| now.duration_since(last) < ACTIVITY_WINDOW) =>
+        {
+            ("◉", Color::Yellow)
+        }
+        (true, Status::Running) => ("●", Color::Green),
+    }
+}
+
 fn sidebar_items(app: &App) -> Vec<ListItem<'static>> {
+    let now = Instant::now();
     app.rows
         .iter()
         .map(|row| match *row {
@@ -1219,11 +1241,8 @@ fn sidebar_items(app: &App) -> Vec<ListItem<'static>> {
             Row::Session(vi, si, depth) => {
                 let vm = &app.vms[vi];
                 let s = &vm.sessions[si];
-                let (glyph, color) = match (vm.online, s.status) {
-                    (false, _) => ("◌", Color::DarkGray),
-                    (true, Status::Running) => ("●", Color::Green),
-                    (true, Status::Stopped) => ("○", Color::DarkGray),
-                };
+                let last = app.activity.get(&(vi, s.id.clone())).copied();
+                let (glyph, color) = session_marker(vm.online, s.status, last, now);
                 ListItem::new(Line::from(vec![
                     Span::raw("  ".repeat(depth + 1)),
                     Span::styled(glyph, Style::default().fg(color)),
@@ -1298,14 +1317,16 @@ fn draw(f: &mut Frame, app: &mut App) {
         .as_ref()
         .is_some_and(|(vi, s)| s.status == Status::Running && app.vms[*vi].online);
     let pane_title = match &sel {
-        Some((vi, s)) => format!(
-            " {} {} · {} — {} ",
-            if s.status == Status::Running { "●" } else { "○" },
-            s.agent,
-            s.name,
-            app.vms[*vi].name
-        ),
-        None => " no session selected ".into(),
+        Some((vi, s)) => {
+            let last = app.activity.get(&(*vi, s.id.clone())).copied();
+            let (glyph, color) = session_marker(app.vms[*vi].online, s.status, last, Instant::now());
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(glyph, Style::default().fg(color)),
+                Span::raw(format!(" {} · {} — {} ", s.agent, s.name, app.vms[*vi].name)),
+            ])
+        }
+        None => Line::from(" no session selected "),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1532,6 +1553,7 @@ pub async fn run() -> Result<()> {
         focus: Focus::Sidebar,
         panes: HashMap::new(),
         attached: HashSet::new(),
+        activity: HashMap::new(),
         modal: None,
         filter: String::new(),
         editing_filter: false,
@@ -1570,6 +1592,10 @@ pub async fn run() -> Result<()> {
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
+                let before = app.activity.len();
+                let now = Instant::now();
+                app.activity.retain(|_, last| now.duration_since(*last) < ACTIVITY_WINDOW);
+                app.dirty |= app.activity.len() != before;
                 if app.dirty {
                     app.dirty = false;
                     if let Err(e) = term.draw(|f| draw(f, &mut app)) { break Err(e.into()) }
@@ -1620,10 +1646,13 @@ pub async fn run() -> Result<()> {
                                 }
                                 let mut copy = None;
                                 if let (Ok(bytes), Some(p)) =
-                                    (unb64(&data), app.panes.get_mut(&(i, id)))
+                                    (unb64(&data), app.panes.get_mut(&(i, id.clone())))
                                 {
                                     p.process(&bytes);
                                     copy = p.callbacks_mut().take_if(live && selected).pop();
+                                    if live {
+                                        app.activity.insert((i, id.clone()), Instant::now());
+                                    }
                                 }
                                 if let Some(copy) = copy {
                                     app.status = match copy_local(&copy) {
@@ -1636,6 +1665,7 @@ pub async fn run() -> Result<()> {
                                 }
                             }
                             Resp::Exited { id, code } => {
+                                app.activity.remove(&(i, id.clone()));
                                 if let Some(s) = app.vms[i].sessions.iter_mut().find(|s| s.id == id) {
                                     s.status = Status::Stopped;
                                     app.status = format!("{} exited ({code}) — r to restart", s.name);
@@ -1662,6 +1692,19 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_marker_reflects_lifecycle_and_recent_output() {
+        let now = std::time::Instant::now();
+        let recent = Some(now - Duration::from_millis(999));
+        let quiet = Some(now - Duration::from_secs(1));
+
+        assert_eq!(session_marker(false, Status::Running, recent, now), ("◌", Color::DarkGray));
+        assert_eq!(session_marker(true, Status::Stopped, recent, now), ("○", Color::DarkGray));
+        assert_eq!(session_marker(true, Status::Running, None, now), ("●", Color::Green));
+        assert_eq!(session_marker(true, Status::Running, recent, now), ("◉", Color::Yellow));
+        assert_eq!(session_marker(true, Status::Running, quiet, now), ("●", Color::Green));
+    }
 
     #[test]
     fn paste_is_one_message_not_one_per_line() {
