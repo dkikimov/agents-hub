@@ -5,8 +5,8 @@ use crate::config::{Config, Vm};
 use crate::proto::*;
 use anyhow::{bail, Result};
 use ratatui::crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -609,6 +609,50 @@ fn key_bytes(k: KeyEvent) -> Option<Vec<u8>> {
         out.insert(0, 0x1b);
     }
     Some(out)
+}
+
+/// A paste → the bytes a real terminal would have sent. `bracketed` mirrors the *guest's*
+/// mode: an app that asked for `?2004h` gets one paste it can hold as a block, anything else
+/// gets the lines raw, exactly as before. The `\x1b[201~` strip matters — pasted content
+/// containing the end marker would otherwise close the bracket early and have its tail read
+/// as typed input, which in an agent prompt means submitting.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let body = text.replace("\r\n", "\r").replace('\n', "\r").replace("\x1b[201~", "");
+    if bracketed {
+        format!("\x1b[200~{body}\x1b[201~").into_bytes()
+    } else {
+        body.into_bytes()
+    }
+}
+
+fn on_paste(app: &mut App, text: &str) {
+    app.dirty = true;
+    app.selection = None;
+
+    // Single-line text fields: replay as keys so the modal/filter accumulators stay the
+    // only place that knows how they're edited.
+    if app.modal.is_some() || app.editing_filter {
+        for c in text.chars().filter(|c| !c.is_control()) {
+            on_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        return;
+    }
+    // In the sidebar a paste would run single-letter commands ('q' quits). Drop it.
+    if app.focus != Focus::Terminal {
+        return;
+    }
+    let Some((vi, s)) = app.cur() else { return };
+    let (id, running) = (s.id.clone(), s.status == Status::Running);
+    if !running {
+        return;
+    }
+    let Some(p) = app.panes.get_mut(&(vi, id.clone())) else { return };
+    let bracketed = p.screen().bracketed_paste();
+    p.screen_mut().set_scrollback(0);
+    // ponytail: sent as one frame, and the daemon's write_all to the pty is blocking — a
+    // multi-MB paste stalls that client's connection task. Chunk it if that ever bites.
+    let data = b64(&paste_bytes(text, bracketed));
+    app.send(vi, Req::Input { id, data });
 }
 
 /// Returns false when the app should quit.
@@ -1506,10 +1550,20 @@ pub async fn run() -> Result<()> {
 
     let mut term = ratatui::init();
     // Capture keeps pane/sidebar mouse features available; pane drags are copied locally.
-    let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Bracketed paste is what keeps a multi-line paste one message: without it the host
+    // sends each line as a separate Enter, and an agent prompt submits on every one.
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        EnableMouseCapture,
+        EnableBracketedPaste
+    );
     let hook = std::panic::take_hook(); // ratatui's, which restores the screen
     std::panic::set_hook(Box::new(move |info| {
-        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         hook(info);
     }));
     let mut ticker = tokio::time::interval(FRAME);
@@ -1528,6 +1582,7 @@ pub async fn run() -> Result<()> {
                         if !on_key(&mut app, k) { break Ok(()) }
                     }
                     Ui::Input(Event::Mouse(m)) => on_mouse(&mut app, m),
+                    Ui::Input(Event::Paste(text)) => on_paste(&mut app, &text),
                     Ui::Input(Event::Resize(..)) => {
                         app.selection = None;
                         app.dirty = true;
@@ -1595,7 +1650,11 @@ pub async fn run() -> Result<()> {
             }
         }
     };
-    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -1603,6 +1662,13 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_is_one_message_not_one_per_line() {
+        let out = paste_bytes("a\r\nb\nc\x1b[201~d", true);
+        assert_eq!(out, b"\x1b[200~a\rb\rcd\x1b[201~".to_vec());
+        assert_eq!(paste_bytes("a\nb", false), b"a\rb".to_vec());
+    }
 
     #[test]
     fn osc52_copy_survives_split_pty_chunks() {
