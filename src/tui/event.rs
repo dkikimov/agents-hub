@@ -509,6 +509,20 @@ fn copy_status(data: &[u8]) -> String {
 pub fn on_msg(app: &mut App, vi: usize, resp: Resp) {
     match resp {
         Resp::Sessions { sessions } => {
+            // A restart is a new pty behind an unchanged id, and the daemon's output channel
+            // died with the old one — an attach that predates it never receives anything
+            // again. Forgetting the attachment puts the session back down the path a dropped
+            // connection takes: fresh parser, replay, then live bytes.
+            for s in &sessions {
+                let restarted = s.status == Status::Running
+                    && app.vms[vi]
+                        .sessions
+                        .iter()
+                        .any(|old| old.id == s.id && old.status == Status::Stopped);
+                if restarted {
+                    app.attached.remove(&(vi, s.id.clone()));
+                }
+            }
             app.vms[vi].sessions = sessions;
             app.rebuild();
             app.reconcile(vi);
@@ -1072,6 +1086,39 @@ mod tests {
 
         assert!(a.focus == Focus::Sidebar);
         assert_eq!(a.panes[&pane].screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn a_restarted_session_re_attaches_to_the_pty_that_replaced_it() {
+        let (mut a, mut rx) = app(&["~/a"]);
+        a.reconcile(0);
+        assert_eq!(sent(&mut rx).len(), 1, "attached once on the way in");
+        let pane = (0, "s0".to_string());
+        a.panes.get_mut(&pane).unwrap().process(b"before the restart");
+
+        let base = a.vms[0].sessions.clone();
+        let announce = |status| {
+            let mut sessions = base.clone();
+            sessions[0].status = status;
+            Resp::Sessions { sessions }
+        };
+        on_msg(&mut a, 0, announce(Status::Stopped));
+        assert!(sent(&mut rx).is_empty(), "a session dying is not a re-attach");
+
+        on_msg(&mut a, 0, announce(Status::Running));
+
+        assert_eq!(
+            sent(&mut rx),
+            [Req::Attach {
+                id: "s0".into(),
+                cols: 80,
+                rows: 24
+            }]
+        );
+        assert!(
+            !a.panes[&pane].screen().contents().contains("before"),
+            "the replay rebuilds the pane, so it must start empty"
+        );
     }
 
     #[test]
