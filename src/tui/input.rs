@@ -136,48 +136,74 @@ pub fn selected_text(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16))
 
 const TRIM: [char; 12] = ['(', ')', '[', ']', '{', '}', '<', '>', '\'', '"', '`', ','];
 
-/// The URL under a cell, joined across the pane's own wrapping so a link that ran off the
-/// right edge still opens whole. The scheme is found inside the clicked word rather than at
-/// its start, so `[docs](https://x)` and `"https://x"` both resolve.
-pub fn url_at(screen: &vt100::Screen, (col, row): (u16, u16)) -> Option<String> {
+/// A URL on screen, clipped to one row. A link the pane wrapped comes back as several of
+/// these sharing a `url`, which is what OSC 8's `id=` stitches together again.
+pub struct Link {
+    pub url: String,
+    pub row: u16,
+    pub cols: std::ops::Range<u16>,
+}
+
+/// Every URL visible on screen. Wrapped rows are joined before the search, so a link that
+/// ran off the right edge is still found whole, and the scheme is looked for *inside* each
+/// whitespace-delimited word rather than at its start, so `[docs](https://x)` resolves.
+/// Non-ASCII URLs are dropped: every consumer here assumes one cell is one column.
+pub fn links(screen: &vt100::Screen) -> Vec<Link> {
     let (rows, cols) = screen.size();
-    if col >= cols || row >= rows {
-        return None;
+    let mut out = Vec::new();
+    let mut first = 0;
+    while first < rows {
+        let mut last = first;
+        while last + 1 < rows && screen.row_wrapped(last) {
+            last += 1;
+        }
+        let mut word = String::new();
+        let mut owner: Vec<(u16, u16)> = Vec::new(); // the cell each byte of `word` came from
+        for (r, c) in (first..=last).flat_map(|r| (0..cols).map(move |c| (r, c))) {
+            let text = screen.cell(r, c).map_or("", vt100::Cell::contents);
+            if text.is_empty() || text.chars().all(char::is_whitespace) {
+                push_link(&word, &owner, &mut out);
+                word.clear();
+                owner.clear();
+            } else {
+                owner.resize(owner.len() + text.len(), (r, c));
+                word.push_str(text);
+            }
+        }
+        push_link(&word, &owner, &mut out);
+        first = last + 1;
     }
-    let (mut first, mut last) = (row, row);
-    while first > 0 && screen.row_wrapped(first - 1) {
-        first -= 1;
-    }
-    while last + 1 < rows && screen.row_wrapped(last) {
-        last += 1;
-    }
-    let cells: Vec<&str> = (first..=last)
-        .flat_map(|r| (0..cols).map(move |c| (r, c)))
-        .map(|(r, c)| screen.cell(r, c).map_or("", vt100::Cell::contents))
-        .collect();
+    out
+}
 
-    let blank = |s: &&str| s.is_empty() || s.chars().all(char::is_whitespace);
-    let at = usize::from(row - first) * usize::from(cols) + usize::from(col);
-    if blank(&cells[at]) {
-        return None;
-    }
-    let start = cells[..at].iter().rposition(blank).map_or(0, |i| i + 1);
-    let end = cells[at..]
-        .iter()
-        .position(blank)
-        .map_or(cells.len(), |i| at + i);
-    let word = cells[start..end].concat();
-
-    let scheme_end = word.find("://")?;
+fn push_link(word: &str, owner: &[(u16, u16)], out: &mut Vec<Link>) {
+    let Some(scheme_end) = word.find("://") else {
+        return;
+    };
     let scheme_start = word[..scheme_end]
         .rfind(|c: char| !(c.is_ascii_alphanumeric() || "+-.".contains(c)))
         .map_or(0, |i| i + 1);
-    let scheme = &word[scheme_start..scheme_end];
-    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) {
-        return None;
+    if !word[scheme_start..].starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return;
     }
     let url = word[scheme_start..].trim_end_matches(TRIM);
-    (url.len() > scheme_end - scheme_start + 3).then(|| url.to_string())
+    if url.len() <= scheme_end - scheme_start + 3 || !url.is_ascii() {
+        return; // nothing after the "://", or a URL we can't count columns for
+    }
+    for run in owner[scheme_start..scheme_start + url.len()].chunk_by(|a, b| a.0 == b.0) {
+        out.push(Link {
+            url: url.to_string(),
+            row: run[0].0,
+            cols: run[0].1..run[run.len() - 1].1 + 1,
+        });
+    }
+}
+
+pub fn url_at(screen: &vt100::Screen, (col, row): (u16, u16)) -> Option<String> {
+    links(screen)
+        .into_iter()
+        .find(|l| l.row == row && l.cols.contains(&col))
+        .map(|l| l.url)
 }
 
 /// crossterm mouse event → the bytes a real terminal would send, in whatever protocol

@@ -488,7 +488,15 @@ fn open_link(url: &str) {
         return; // no browser windows out of `cargo test`
     }
     let url = url.to_string();
-    std::thread::spawn(move || std::process::Command::new("/usr/bin/open").arg(url).status());
+    std::thread::spawn(move || {
+        // Silenced: a scheme with no handler makes `open` write to the terminal we are
+        // painting, which lands as garbage in the middle of the pane.
+        std::process::Command::new("/usr/bin/open")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+    });
 }
 
 fn copy_status(data: &[u8]) -> String {

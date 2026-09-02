@@ -3,14 +3,18 @@
 //! mapped to a cell without knowing where the widgets ended up.
 
 use super::app::{default_name, App, Focus, Modal, Row};
+use super::input::links;
 use super::{ACTIVITY_WINDOW, PANE_MIN, SIDE_MIN};
 use crate::proto::Status;
+use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use std::num::NonZeroU16;
 use std::time::Instant;
+use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
 
 fn session_marker(
@@ -144,6 +148,46 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     app.side_org = (area.x + 1, area.y + 1);
 }
 
+/// Wraps every URL on screen in OSC 8, handing the link back to the host terminal so its
+/// own hover underline and cmd-click apply to our pane — cmd exists nowhere else, since no
+/// mouse protocol can encode it.
+///
+/// Each cell carries the whole open/close pair rather than the run sharing one: the frame
+/// differ repaints only the cells that changed, so an opener in one cell and a closer in
+/// another are eventually written without each other, and a frame that opens a link it
+/// never closes turns everything painted after it into that link. The shared `id=` is what
+/// still makes the terminal treat the run as a single link.
+///
+/// `ForcedWidth` is not optional: the symbol's measured width now counts the escape's
+/// printable bytes, and the differ would skip that many following cells as if it were one
+/// very wide grapheme.
+fn mark_links(f: &mut Frame, inner: Rect, screen: &vt100::Screen) {
+    let spans = links(screen);
+    let mut id = 0;
+    for (i, link) in spans.iter().enumerate() {
+        let continued =
+            i > 0 && spans[i - 1].url == link.url && spans[i - 1].row + 1 == link.row;
+        if !continued {
+            id += 1;
+        }
+        if link.row >= inner.height {
+            continue;
+        }
+        // ponytail: ~40 bytes per marked cell on every repaint of it, which is nothing for
+        // the handful of URLs a session shows. Mark only hovered rows if that ever bites.
+        for col in link.cols.clone().take_while(|c| *c < inner.width) {
+            let cell = &mut f.buffer_mut()[(inner.x + col, inner.y + link.row)];
+            let marked = format!(
+                "\x1b]8;id={id};{}\x1b\\{}\x1b]8;;\x1b\\",
+                link.url,
+                cell.symbol()
+            );
+            cell.set_symbol(&marked);
+            cell.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+        }
+    }
+}
+
 /// Paints the drag highlight over the cells it covers, in whichever direction it ran.
 fn draw_selection(f: &mut Frame, app: &App, inner: Rect, vi: usize, id: &str) {
     let Some(sel) = app
@@ -216,6 +260,7 @@ fn draw_pane(f: &mut Frame, app: &mut App, area: Rect) {
     let screen = parser.screen();
     let cursor = (!screen.hide_cursor()).then(|| screen.cursor_position());
     f.render_widget(PseudoTerminal::new(screen), inner);
+    mark_links(f, inner, screen);
     draw_selection(f, app, inner, vi, &s.id);
     if let (Focus::Terminal, Some((r, c))) = (&app.focus, cursor) {
         f.set_cursor_position((inner.x + c, inner.y + r));
@@ -446,6 +491,38 @@ mod tests {
             .collect();
         assert!(text.contains("local"), "the VM group is always listed");
         assert!(text.contains("api"), "and the session under it");
+    }
+
+    #[test]
+    fn a_url_in_the_pane_is_handed_to_the_terminal_as_osc8() {
+        let (mut a, _rx) = app(&["~/work/api"]);
+        a.reconcile(0);
+        a.sel = a.rows.len() - 1;
+        a.panes
+            .get_mut(&(0, "s0".to_string()))
+            .unwrap()
+            .process(b"see https://x.dev/p done");
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+
+        term.draw(|f| draw(f, &mut a)).unwrap();
+
+        let buf = term.backend().buffer();
+        let (x, y) = a.pane_org;
+        assert_eq!(buf[(x, y)].symbol(), "s", "plain text is left alone");
+        // "see " is four cells, so the URL opens at the fifth and ends before " done".
+        let first = buf[(x + 4, y)].symbol();
+        assert_eq!(first, "\x1b]8;id=1;https://x.dev/p\x1b\\h\x1b]8;;\x1b\\");
+        assert_eq!(
+            buf[(x + 18, y)].symbol(),
+            "\x1b]8;id=1;https://x.dev/p\x1b\\p\x1b]8;;\x1b\\"
+        );
+        assert_eq!(buf[(x + 19, y)].symbol(), " ", "and closes before the space");
+        assert_eq!(
+            buf[(x + 4, y)].diff_option,
+            CellDiffOption::ForcedWidth(NonZeroU16::MIN),
+            "an escape-carrying cell must not be measured as a wide grapheme"
+        );
     }
 
     #[test]
