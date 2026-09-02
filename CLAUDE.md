@@ -61,7 +61,7 @@ Inside `src/tui/`, the split is by *who is allowed to mutate what*:
 | `render.rs` | the **only** thing that paints it; writes back just the geometry clicks need |
 | `link.rs` | one reconnecting task per VM, local socket or SSH pipe |
 | `tree.rs` | cwds → the folder tree, pure |
-| `input.rs` | crossterm event → guest bytes, and click → cell hit-testing, pure |
+| `input.rs` | crossterm event → guest bytes, and click → cell hit-testing / the URL under it, pure |
 | `clipboard.rs` | OSC 52 from the guest, `pbcopy` locally |
 
 `tree.rs`, `input.rs` and `clipboard.rs` know nothing about `App`, so their tests are

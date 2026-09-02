@@ -173,7 +173,6 @@ fn draw_selection(f: &mut Frame, app: &App, inner: Rect, vi: usize, id: &str) {
 }
 
 fn draw_pane(f: &mut Frame, app: &mut App, area: Rect) {
-    let side_focused = app.focus == Focus::Sidebar;
     let sel = app.cur().map(|(vi, s)| (vi, s.clone()));
     let pane_title = match &sel {
         Some((vi, s)) => {
@@ -190,10 +189,10 @@ fn draw_pane(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if side_focused {
-            Color::DarkGray
-        } else {
-            Color::Cyan
+        .border_style(Style::default().fg(match app.focus {
+            Focus::Sidebar => Color::DarkGray,
+            Focus::Terminal => Color::Cyan,
+            Focus::Scrollback => Color::Yellow,
         }))
         .title(pane_title);
     let inner = block.inner(area);
@@ -251,22 +250,39 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let live = app
         .cur()
         .is_some_and(|(vi, s)| s.status == Status::Running && app.vms[vi].online);
-    let hint = match (app.focus == Focus::Terminal, live) {
+    let hint = match (&app.focus, live) {
+        (Focus::Scrollback, _) => {
+            "  SCROLLBACK · j/k ↑↓ line · PgUp/PgDn page · g/G ends · q/esc live"
+        }
         // Never let keystrokes vanish into a dead pane without saying so.
-        (true, false) => "  ^] back to list · session is not running — press r to restart",
-        (true, true) => "  ^] back to list · keys go to the session",
-        (false, _) => "  n new  d kill  r restart  ⏎ attach  / filter  ? help  q quit",
+        (Focus::Terminal, false) => {
+            "  ^] back to list · session is not running — press r to restart"
+        }
+        (Focus::Terminal, true) => "  ^] back to list · keys go to the session",
+        (Focus::Sidebar, _) => {
+            "  [ scrollback  n new  d kill  r restart  ⏎ attach  / filter  ? help  q quit"
+        }
     };
     let bar = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(10), Constraint::Length(34)])
         .split(area);
+    let alternate = app.focus == Focus::Scrollback
+        && app
+            .cur()
+            .and_then(|(vi, s)| app.panes.get(&(vi, s.id.clone())))
+            .is_some_and(|p| p.screen().alternate_screen());
+    let status = if alternate {
+        "full-screen app owns scrolling"
+    } else {
+        &app.status
+    };
     f.render_widget(
         Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
         bar[0],
     );
     f.render_widget(
-        Paragraph::new(app.status.clone())
+        Paragraph::new(status)
             .right_aligned()
             .style(Style::default().fg(Color::DarkGray)),
         bar[1],
@@ -292,10 +308,12 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
                 Line::from("  j/k ↑↓   move            n   new session"),
                 Line::from("  ⏎ / l    focus terminal  d   kill session"),
                 Line::from("  ^]       back to list    r   restart stopped"),
+                Line::from("  ^] then [ local scrollback; q / esc returns live"),
                 Line::from("  /        filter          q   quit"),
                 Line::from("  space    fold a folder's middle away into …"),
                 Line::from("  mouse    click a row to switch · drag the split to resize"),
                 Line::from("           click pane controls · drag pane text to copy"),
+                Line::from("           click a link in the pane to open it"),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  folders come from each session's cwd; n starts one there",
@@ -303,7 +321,7 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
                 )),
             ],
             62,
-            11,
+            13,
         ),
         Modal::Kill { label, .. } => (
             " kill session ",
@@ -428,5 +446,60 @@ mod tests {
             .collect();
         assert!(text.contains("local"), "the VM group is always listed");
         assert!(text.contains("api"), "and the session under it");
+    }
+
+    #[test]
+    fn scrollback_mode_is_visible_while_guest_input_is_paused() {
+        let (mut a, _rx) = app(&["~/work/api"]);
+        a.reconcile(0);
+        a.sel = a.rows.len() - 1;
+        a.focus = Focus::Scrollback;
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+
+        term.draw(|f| draw(f, &mut a)).unwrap();
+
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("SCROLLBACK"));
+    }
+
+    #[test]
+    fn alternate_screen_notice_tracks_the_live_parser_state() {
+        let (mut a, _rx) = app(&["~/work/api"]);
+        a.reconcile(0);
+        a.sel = a.rows.len() - 1;
+        a.focus = Focus::Scrollback;
+        let pane = (0, "s0".to_string());
+        a.panes.get_mut(&pane).unwrap().process(b"primary\r\n");
+        a.panes.get_mut(&pane).unwrap().process(b"\x1b[?1049h");
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+
+        term.draw(|f| draw(f, &mut a)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("full-screen app owns scrolling"));
+
+        a.panes.get_mut(&pane).unwrap().process(b"\x1b[?1049l");
+        term.draw(|f| draw(f, &mut a)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!text.contains("full-screen app owns scrolling"));
     }
 }

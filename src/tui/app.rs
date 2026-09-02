@@ -47,6 +47,7 @@ pub struct Folder {
 pub enum Focus {
     Sidebar,
     Terminal,
+    Scrollback,
 }
 
 pub enum Modal {

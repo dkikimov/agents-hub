@@ -84,6 +84,15 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+pub fn scroll_screen(screen: &mut vt100::Screen, up: bool, rows: usize) {
+    let at = screen.scrollback();
+    screen.set_scrollback(if up {
+        at.saturating_add(rows)
+    } else {
+        at.saturating_sub(rows)
+    });
+}
+
 /// Screen coordinates → a cell inside the pane. `clamp` is for a drag in progress,
 /// which should follow the pointer out of the pane instead of stopping dead.
 pub fn pane_cell(
@@ -123,6 +132,52 @@ pub fn selected_text(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16))
     };
     let text = screen.contents_between(start.1, start.0, end.1, end.0.saturating_add(1).min(cols));
     (!text.is_empty()).then_some(text)
+}
+
+const TRIM: [char; 12] = ['(', ')', '[', ']', '{', '}', '<', '>', '\'', '"', '`', ','];
+
+/// The URL under a cell, joined across the pane's own wrapping so a link that ran off the
+/// right edge still opens whole. The scheme is found inside the clicked word rather than at
+/// its start, so `[docs](https://x)` and `"https://x"` both resolve.
+pub fn url_at(screen: &vt100::Screen, (col, row): (u16, u16)) -> Option<String> {
+    let (rows, cols) = screen.size();
+    if col >= cols || row >= rows {
+        return None;
+    }
+    let (mut first, mut last) = (row, row);
+    while first > 0 && screen.row_wrapped(first - 1) {
+        first -= 1;
+    }
+    while last + 1 < rows && screen.row_wrapped(last) {
+        last += 1;
+    }
+    let cells: Vec<&str> = (first..=last)
+        .flat_map(|r| (0..cols).map(move |c| (r, c)))
+        .map(|(r, c)| screen.cell(r, c).map_or("", vt100::Cell::contents))
+        .collect();
+
+    let blank = |s: &&str| s.is_empty() || s.chars().all(char::is_whitespace);
+    let at = usize::from(row - first) * usize::from(cols) + usize::from(col);
+    if blank(&cells[at]) {
+        return None;
+    }
+    let start = cells[..at].iter().rposition(blank).map_or(0, |i| i + 1);
+    let end = cells[at..]
+        .iter()
+        .position(blank)
+        .map_or(cells.len(), |i| at + i);
+    let word = cells[start..end].concat();
+
+    let scheme_end = word.find("://")?;
+    let scheme_start = word[..scheme_end]
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || "+-.".contains(c)))
+        .map_or(0, |i| i + 1);
+    let scheme = &word[scheme_start..scheme_end];
+    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let url = word[scheme_start..].trim_end_matches(TRIM);
+    (url.len() > scheme_end - scheme_start + 3).then(|| url.to_string())
 }
 
 /// crossterm mouse event → the bytes a real terminal would send, in whatever protocol
@@ -293,6 +348,33 @@ mod tests {
         assert_eq!(pane_cell((10, 5), (20, 4), (12, 6), false), Some((2, 1)));
         assert_eq!(pane_cell((10, 5), (20, 4), (2, 99), false), None);
         assert_eq!(pane_cell((10, 5), (20, 4), (2, 99), true), Some((0, 3)));
+    }
+
+    #[test]
+    fn a_url_is_found_under_the_click_even_when_the_pane_wrapped_it() {
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process(b"see https://example.com/a/long/path now\r\nnope");
+        let url = "https://example.com/a/long/path";
+
+        assert_eq!(url_at(parser.screen(), (6, 0)).as_deref(), Some(url));
+        assert_eq!(url_at(parser.screen(), (2, 1)).as_deref(), Some(url));
+        assert_eq!(url_at(parser.screen(), (1, 0)), None); // "see"
+        assert_eq!(url_at(parser.screen(), (17, 1)), None); // "now"
+        assert_eq!(url_at(parser.screen(), (1, 2)), None); // "nope", past the wrap
+        assert_eq!(url_at(parser.screen(), (0, 3)), None); // blank
+        assert_eq!(url_at(parser.screen(), (40, 0)), None); // off-screen
+
+        let mut parser = vt100::Parser::new(2, 40, 0);
+        parser.process(b"[docs](https://x.dev/p), ftp://h/f, a://b");
+        assert_eq!(
+            url_at(parser.screen(), (10, 0)).as_deref(),
+            Some("https://x.dev/p")
+        );
+        assert_eq!(
+            url_at(parser.screen(), (26, 0)).as_deref(),
+            Some("ftp://h/f")
+        );
+        assert_eq!(url_at(parser.screen(), (37, 0)).as_deref(), Some("a://b"));
     }
 
     #[test]

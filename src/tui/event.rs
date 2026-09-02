@@ -5,7 +5,8 @@
 use super::app::{default_name, App, Focus, Modal, Row, Selection};
 use super::clipboard::copy_local;
 use super::input::{
-    click_bytes, key_bytes, mouse_bytes, pane_cell, paste_bytes, row_at, on_split, selected_text,
+    click_bytes, key_bytes, mouse_bytes, pane_cell, paste_bytes, row_at, on_split, scroll_screen,
+    selected_text, url_at,
 };
 use super::WHEEL;
 use crate::proto::{b64, unb64, Req, Resp, Status};
@@ -15,6 +16,18 @@ use ratatui::crossterm::event::{
 use std::time::Instant;
 
 // ── keys ──────────────────────────────────────────────────────────────────────
+
+fn leave_scrollback(app: &mut App, focus: Focus) {
+    if app.focus != Focus::Scrollback {
+        return;
+    }
+    if let Some((vi, id, _)) = app.cur_live() {
+        if let Some(p) = app.panes.get_mut(&(vi, id)) {
+            p.screen_mut().set_scrollback(0);
+        }
+    }
+    app.focus = focus;
+}
 
 /// Returns false when the app should quit.
 pub fn on_key(app: &mut App, k: KeyEvent) -> bool {
@@ -42,6 +55,33 @@ pub fn on_key(app: &mut App, k: KeyEvent) -> bool {
         return true;
     }
 
+    if app.focus == Focus::Scrollback {
+        if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) {
+            leave_scrollback(app, Focus::Terminal);
+            return true;
+        }
+        let Some((vi, id, _)) = app.cur_live() else {
+            return true;
+        };
+        let rows = usize::from(app.pane.1);
+        if let Some(p) = app.panes.get_mut(&(vi, id)) {
+            match k.code {
+                KeyCode::Char('k') | KeyCode::Up => scroll_screen(p.screen_mut(), true, 1),
+                KeyCode::Char('j') | KeyCode::Down => scroll_screen(p.screen_mut(), false, 1),
+                KeyCode::PageUp => scroll_screen(p.screen_mut(), true, rows),
+                KeyCode::PageDown => scroll_screen(p.screen_mut(), false, rows),
+                KeyCode::Char('g') | KeyCode::Home => {
+                    scroll_screen(p.screen_mut(), true, usize::MAX)
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    scroll_screen(p.screen_mut(), false, usize::MAX)
+                }
+                _ => {}
+            }
+        }
+        return true;
+    }
+
     if app.focus == Focus::Terminal {
         // Ctrl-] is the one key the pane doesn't get: it's the way back out.
         // Byte 0x1d reaches us as Ctrl+'5' on terminals without the kitty protocol.
@@ -64,6 +104,13 @@ pub fn on_key(app: &mut App, k: KeyEvent) -> bool {
     }
 
     match k.code {
+        KeyCode::Char('[') => {
+            if let Some((vi, id, _)) = app.cur_live() {
+                if app.panes.contains_key(&(vi, id)) {
+                    app.focus = Focus::Scrollback;
+                }
+            }
+        }
         KeyCode::Char('q') => return false,
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return false,
         KeyCode::Char('j') | KeyCode::Down => app.step(true),
@@ -273,6 +320,15 @@ fn finish_drag(app: &mut App, m: MouseEvent, left_up: bool) {
         app.status = copy_status(&text.clone().into_bytes());
         selection.down = None;
         app.selection = Some(selection);
+    } else if let Some(url) = app
+        .panes
+        .get(&(selection.vm, selection.id.clone()))
+        .and_then(|p| url_at(p.screen(), selection.start))
+    {
+        // The host terminal's own cmd-click can't see this pane: mouse capture takes the
+        // click first, and cmd isn't encodable in any mouse protocol, so we open it.
+        open_link(&url);
+        app.status = "opened link".into();
     } else {
         let running = app.vms[selection.vm]
             .sessions
@@ -291,7 +347,7 @@ fn finish_drag(app: &mut App, m: MouseEvent, left_up: bool) {
                 )
             })
             .unwrap_or_default();
-        if running {
+        if running && app.focus != Focus::Scrollback {
             app.focus = Focus::Terminal;
             if !bytes.is_empty() {
                 app.send(
@@ -350,6 +406,7 @@ pub fn on_mouse(app: &mut App, m: MouseEvent) {
             app.selection = None;
         }
         if let Some(up) = wheel {
+            leave_scrollback(app, Focus::Sidebar);
             app.dirty = true;
             app.step(!up);
         }
@@ -357,6 +414,7 @@ pub fn on_mouse(app: &mut App, m: MouseEvent) {
             .then(|| row_at(&app.rows, app.side_off, app.side_org.1, m.row))
             .flatten()
         {
+            leave_scrollback(app, Focus::Sidebar);
             // A click on a session keeps terminal focus, so switching chats mid-typing
             // doesn't cost a second keypress; anything else has nothing to type into.
             app.sel = i;
@@ -390,6 +448,14 @@ pub fn on_mouse(app: &mut App, m: MouseEvent) {
         app.selection = None;
     }
 
+    if app.focus == Focus::Scrollback {
+        if let (Some(up), Some(p)) = (wheel, app.panes.get_mut(&(vi, id))) {
+            scroll_screen(p.screen_mut(), up, WHEEL);
+            app.dirty = true;
+        }
+        return;
+    }
+
     let bytes = app
         .panes
         .get(&(vi, id.clone()))
@@ -409,13 +475,21 @@ pub fn on_mouse(app: &mut App, m: MouseEvent) {
     // wheel is ours: walk the scrollback. set_scrollback clamps to what's buffered.
     if let (Some(up), Some(p)) = (wheel, app.panes.get_mut(&(vi, id))) {
         app.dirty = true;
-        let at = p.screen().scrollback();
-        p.screen_mut()
-            .set_scrollback(if up { at + WHEEL } else { at.saturating_sub(WHEEL) });
+        scroll_screen(p.screen_mut(), up, WHEEL);
     }
 }
 
 // ── frames from a daemon ──────────────────────────────────────────────────────
+
+/// Off the UI thread: `open` waits for a cold browser to finish launching, and reaping the
+/// child here is what keeps a session's worth of clicks from piling up as zombies.
+fn open_link(url: &str) {
+    if cfg!(test) {
+        return; // no browser windows out of `cargo test`
+    }
+    let url = url.to_string();
+    std::thread::spawn(move || std::process::Command::new("/usr/bin/open").arg(url).status());
+}
 
 fn copy_status(data: &[u8]) -> String {
     match copy_local(data) {
@@ -513,6 +587,93 @@ mod tests {
             assert!(a.focus == Focus::Sidebar, "ctrl-{c} should leave the pane");
         }
         assert!(sent(&mut rx).is_empty(), "the escape key never reaches the guest");
+    }
+
+    #[test]
+    fn ctrl_bracket_then_open_bracket_enters_local_scrollback() {
+        let (mut a, mut rx) = app(&["~/a"]);
+        a.reconcile(0);
+        sent(&mut rx);
+        a.sel = a.rows.len() - 1;
+        a.focus = Focus::Terminal;
+        let pane = (0, "s0".to_string());
+        for i in 0..60 {
+            a.panes
+                .get_mut(&pane)
+                .unwrap()
+                .process(format!("line {i}\r\n").as_bytes());
+        }
+
+        on_key(&mut a, ctrl(']'));
+        on_key(&mut a, key('['));
+        on_key(&mut a, key('k'));
+
+        assert_eq!(a.panes[&pane].screen().scrollback(), 1);
+        assert!(sent(&mut rx).is_empty(), "scrollback keys stay local");
+    }
+
+    #[test]
+    fn scrollback_keys_navigate_and_q_returns_to_the_live_guest() {
+        let (mut a, mut rx) = app(&["~/a"]);
+        a.reconcile(0);
+        sent(&mut rx);
+        a.sel = a.rows.len() - 1;
+        let pane = (0, "s0".to_string());
+        for i in 0..60 {
+            a.panes
+                .get_mut(&pane)
+                .unwrap()
+                .process(format!("line {i}\r\n").as_bytes());
+        }
+        a.focus = Focus::Terminal;
+        on_key(&mut a, ctrl(']'));
+        on_key(&mut a, key('['));
+
+        on_key(&mut a, code(KeyCode::PageUp));
+        assert_eq!(a.panes[&pane].screen().scrollback(), 24);
+        on_key(&mut a, code(KeyCode::PageDown));
+        assert_eq!(a.panes[&pane].screen().scrollback(), 0);
+        on_key(&mut a, key('g'));
+        assert_eq!(a.panes[&pane].screen().scrollback(), 37);
+        on_key(&mut a, key('G'));
+        assert_eq!(a.panes[&pane].screen().scrollback(), 0);
+
+        on_key(&mut a, key('k'));
+        on_key(&mut a, key('q'));
+        assert_eq!(a.panes[&pane].screen().scrollback(), 0);
+        on_key(&mut a, key('x'));
+        assert_eq!(
+            sent(&mut rx),
+            [Req::Input {
+                id: "s0".into(),
+                data: b64(b"x")
+            }]
+        );
+    }
+
+    #[test]
+    fn alternate_screen_keeps_primary_history_out_of_local_scrollback() {
+        let (mut a, mut rx) = app(&["~/a"]);
+        a.reconcile(0);
+        sent(&mut rx);
+        a.sel = a.rows.len() - 1;
+        let pane = (0, "s0".to_string());
+        for i in 0..60 {
+            a.panes
+                .get_mut(&pane)
+                .unwrap()
+                .process(format!("line {i}\r\n").as_bytes());
+        }
+        a.panes.get_mut(&pane).unwrap().process(b"\x1b[?1049h");
+        a.focus = Focus::Terminal;
+
+        on_key(&mut a, ctrl(']'));
+        on_key(&mut a, key('['));
+        on_key(&mut a, key('g'));
+
+        assert_eq!(a.panes[&pane].screen().scrollback(), 0);
+        assert!(a.status.is_empty());
+        assert!(sent(&mut rx).is_empty());
     }
 
     #[test]
@@ -740,6 +901,169 @@ mod tests {
                 data: b64(b"\x1b[<64;10;5M")
             }]
         );
+    }
+
+    #[test]
+    fn clicking_a_link_opens_it_and_anything_else_still_reaches_the_guest() {
+        let (mut a, mut rx) = app(&["~/a"]);
+        a.reconcile(0);
+        sent(&mut rx);
+        a.sel = a.rows.len() - 1;
+        a.pane_org = (31, 1);
+        let pane = (0, "s0".to_string());
+        a.panes
+            .get_mut(&pane)
+            .unwrap()
+            .process(b"see https://x.dev/p done\x1b[?1000h\x1b[?1006h");
+        let click = |column| {
+            [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ]
+            .map(|kind| MouseEvent {
+                kind,
+                column,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        for m in click(39) {
+            on_mouse(&mut a, m);
+        }
+        assert_eq!(a.status, "opened link");
+        assert!(sent(&mut rx).is_empty(), "a link click never reaches the guest");
+
+        for m in click(32) {
+            on_mouse(&mut a, m);
+        }
+        assert_eq!(
+            sent(&mut rx),
+            [Req::Input {
+                id: "s0".into(),
+                data: b64(b"\x1b[<0;2;1M\x1b[<0;2;1m")
+            }]
+        );
+    }
+
+    #[test]
+    fn scrollback_mode_keeps_mouse_local_when_the_guest_requested_it() {
+        let (mut a, mut rx) = app(&["~/a"]);
+        a.reconcile(0);
+        sent(&mut rx);
+        a.sel = a.rows.len() - 1;
+        a.pane_org = (31, 1);
+        let pane = (0, "s0".to_string());
+        for i in 0..60 {
+            a.panes
+                .get_mut(&pane)
+                .unwrap()
+                .process(format!("line {i}\r\n").as_bytes());
+        }
+        a.panes
+            .get_mut(&pane)
+            .unwrap()
+            .process(b"\x1b[?1000h\x1b[?1006h");
+        a.focus = Focus::Terminal;
+        on_key(&mut a, ctrl(']'));
+        on_key(&mut a, key('['));
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 40,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        on_mouse(&mut a, mouse(MouseEventKind::ScrollUp));
+        on_mouse(
+            &mut a,
+            mouse(MouseEventKind::Down(MouseButton::Right)),
+        );
+
+        assert_eq!(a.panes[&pane].screen().scrollback(), WHEEL);
+        assert!(sent(&mut rx).is_empty(), "scrollback mode pauses guest mouse input");
+    }
+
+    #[test]
+    fn clicking_the_sidebar_leaves_scrollback_and_resets_the_old_pane() {
+        let (mut a, mut rx) = app(&["~/a", "~/b"]);
+        a.reconcile(0);
+        sent(&mut rx);
+        a.side_org = (1, 1);
+        let first = a
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Session(0, 0, _)))
+            .unwrap();
+        let second = a
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Session(0, 1, _)))
+            .unwrap();
+        let pane = (0, "s0".to_string());
+        for i in 0..60 {
+            a.panes
+                .get_mut(&pane)
+                .unwrap()
+                .process(format!("line {i}\r\n").as_bytes());
+        }
+        a.sel = first;
+        a.focus = Focus::Terminal;
+        on_key(&mut a, ctrl(']'));
+        on_key(&mut a, key('['));
+        on_key(&mut a, key('k'));
+        let second_row = a.side_org.1 + second as u16;
+
+        on_mouse(
+            &mut a,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: second_row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(a.sel, second);
+        assert!(a.focus == Focus::Sidebar);
+        assert_eq!(a.panes[&pane].screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn wheeling_the_sidebar_leaves_scrollback_and_resets_the_old_pane() {
+        let (mut a, mut rx) = app(&["~/a", "~/b"]);
+        a.reconcile(0);
+        sent(&mut rx);
+        let first = a
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Session(0, 0, _)))
+            .unwrap();
+        let pane = (0, "s0".to_string());
+        for i in 0..60 {
+            a.panes
+                .get_mut(&pane)
+                .unwrap()
+                .process(format!("line {i}\r\n").as_bytes());
+        }
+        a.sel = first;
+        a.focus = Focus::Terminal;
+        on_key(&mut a, ctrl(']'));
+        on_key(&mut a, key('['));
+        on_key(&mut a, key('k'));
+
+        on_mouse(
+            &mut a,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 3,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert!(a.focus == Focus::Sidebar);
+        assert_eq!(a.panes[&pane].screen().scrollback(), 0);
     }
 
     #[test]
