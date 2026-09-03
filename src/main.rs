@@ -93,6 +93,7 @@ agents-hub — manage Claude Code / Codex / shell sessions across machines
                                     also load/start it now
   agents-hub add-vm <ssh> [name]   install on a remote over SSH and add it to this config
                                     (run from the repo root; bootstraps rustup if needed)
+                                    re-run it on a known host to put it on this build
 
 config: ~/.config/agents-hub/config.toml
 state:  ~/.local/state/agents-hub/

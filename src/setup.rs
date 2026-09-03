@@ -65,13 +65,21 @@ pub fn install_service(enable: bool) -> Result<()> {
     println!("wrote {}", path.display());
 
     match (cfg!(target_os = "macos"), enable) {
-        (true, true) => run("launchctl", &["load", "-w", &path.display().to_string()]),
+        // Unload first: loading an already-loaded job is a no-op, so a freshly built
+        // binary would keep serving from the old process until the next reboot.
+        (true, true) => {
+            let _ = run("launchctl", &["unload", &path.display().to_string()]);
+            run("launchctl", &["load", "-w", &path.display().to_string()])
+        }
         (true, false) => {
             println!("enable with:  launchctl load -w {}", path.display());
             Ok(())
         }
         (false, true) => {
-            run("systemctl", &["--user", "enable", "--now", "agents-hub"])?;
+            run("systemctl", &["--user", "daemon-reload"])?;
+            run("systemctl", &["--user", "enable", "agents-hub"])?;
+            // `enable --now` leaves a running daemon on its old binary; restart doesn't.
+            run("systemctl", &["--user", "restart", "agents-hub"])?;
             // Headless VMs kill the user's systemd instance on logout without this.
             let user = std::env::var("USER").context("$USER not set")?;
             run("loginctl", &["enable-linger", &user])
@@ -105,7 +113,9 @@ fn remote_install_script(dir: &str) -> String {
 }
 
 /// SSHes to `host`, bootstraps rustup if cargo isn't there, builds this checkout,
-/// installs it as a service, and registers it in the local config.
+/// installs it as a service, and registers it in the local config. Re-running it on a
+/// known host is how a VM gets the current build — the protocol is not versioned, so a
+/// remote left behind answers anything new with "bad frame".
 pub fn add_vm(host: &str, name: Option<&str>) -> Result<()> {
     if !Path::new("Cargo.toml").exists() {
         bail!("run this from the agents-hub repo root (no Cargo.toml in the current directory)");
@@ -113,9 +123,7 @@ pub fn add_vm(host: &str, name: Option<&str>) -> Result<()> {
     let name = name.unwrap_or(host);
 
     let cfg = Config::load(&config_path())?;
-    if cfg.vm.iter().any(|v| v.ssh.as_deref() == Some(host)) {
-        bail!("'{host}' is already configured in {}", config_path().display());
-    }
+    let known = cfg.vm.iter().any(|v| v.ssh.as_deref() == Some(host));
 
     let remote_dir = "agents-hub-src";
     println!("→ copying source to {host}:~/{remote_dir}/");
@@ -123,6 +131,10 @@ pub fn add_vm(host: &str, name: Option<&str>) -> Result<()> {
         "rsync",
         &[
             "-a",
+            // Without this a file deleted here lingers there: the tui.rs → tui/mod.rs
+            // split left both on the remote and rustc refused to build either.
+            // Excludes are protected from it, so the remote's target/ still survives.
+            "--delete",
             "--exclude-from=.gitignore",
             "--exclude",
             ".git",
@@ -135,6 +147,10 @@ pub fn add_vm(host: &str, name: Option<&str>) -> Result<()> {
     run("ssh", &[host, &remote_install_script(remote_dir)])?;
 
     let path = config_path();
+    if known {
+        println!("→ {host} was already in {}, now on this build", path.display());
+        return Ok(());
+    }
     let mut text = std::fs::read_to_string(&path)?;
     if !text.ends_with('\n') {
         text.push('\n');
