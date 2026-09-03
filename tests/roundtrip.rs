@@ -116,6 +116,14 @@ fn session_survives_a_daemon_restart() {
         "PTY output should reach the client, got: {decoded:?}"
     );
 
+    // cwd completion is answered by the machine that would host the session, which is
+    // what makes it work for a VM the client can't see the filesystem of
+    std::fs::create_dir_all(dir.join("subdir")).unwrap();
+    send(&mut s, &format!(r#"{{"t":"ListDir","path":"{}"}}"#, dir.display()));
+    let dirs = wait_for(&mut r, |l| l.contains("\"Dirs\""));
+    assert!(dirs.contains("\"subdir\""), "expected subdir in {dirs}");
+    assert!(!dirs.contains("config.toml"), "files are not completions");
+
     // metadata hit the disk, not just memory
     let state = std::fs::read_to_string(dir.join("state.json")).unwrap();
     assert!(state.contains(&id) && state.contains("smoke"));

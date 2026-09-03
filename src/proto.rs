@@ -38,6 +38,10 @@ pub enum Req {
         cols: u16,
         rows: u16,
     },
+    /// Subdirectories of `path` on *that* machine, for cwd completion in the client.
+    ListDir {
+        path: String,
+    },
 }
 
 /// Struct variants only: serde's internally-tagged repr cannot serialize a newtype
@@ -55,6 +59,8 @@ pub enum Resp {
         live: bool,
     },
     Exited { id: String, code: i32 },
+    /// Answer to `ListDir`, echoing the path so a late reply lands in the right place.
+    Dirs { path: String, names: Vec<String> },
     Error { msg: String },
 }
 
@@ -103,6 +109,7 @@ mod tests {
                 id: "x".into(),
                 data: b64(b"hi\x1b[0m"),
             },
+            Req::ListDir { path: "~".into() },
         ];
         for r in reqs {
             let line = serde_json::to_string(&r).unwrap();
@@ -132,6 +139,14 @@ mod tests {
             Resp::Exited {
                 id: "x".into(),
                 code: -1,
+            },
+            Resp::Dirs {
+                path: "~".into(),
+                names: vec!["src".into()],
+            },
+            Resp::Dirs {
+                path: "/".into(),
+                names: vec![],
             },
             Resp::Error { msg: "boom".into() },
         ];

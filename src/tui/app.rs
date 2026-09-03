@@ -7,6 +7,7 @@ use super::tree::{tree, Node};
 use super::SIDE_W;
 use crate::proto::{Req, SessionInfo};
 use ratatui::crossterm::event::MouseEvent;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
@@ -57,6 +58,8 @@ pub enum Modal {
         name: String,
         cwd: String,
         field: u8,
+        /// The cwd completion menu: which candidate is highlighted, or closed.
+        menu: Option<usize>,
     },
     Kill {
         vm: usize,
@@ -89,6 +92,9 @@ pub struct App {
     pub panes: HashMap<Pane, vt100::Parser<Clipboard>>,
     pub attached: HashSet<Pane>,
     pub activity: HashMap<Pane, Instant>,
+    /// (vm, directory) → its subdirectories, as the daemon on that machine reported them.
+    /// Emptied whenever the new-session modal opens, so a listing can't go stale for long.
+    pub dirs: HashMap<(usize, String), Vec<String>>,
     pub modal: Option<Modal>,
     pub filter: String,
     pub editing_filter: bool,
@@ -119,6 +125,7 @@ impl App {
             panes: HashMap::new(),
             attached: HashSet::new(),
             activity: HashMap::new(),
+            dirs: HashMap::new(),
             modal: None,
             filter: String::new(),
             editing_filter: false,
@@ -239,6 +246,28 @@ impl App {
         }
     }
 
+    /// Completion candidates for a half-typed cwd in the new-session modal — whatever
+    /// `request_dirs` has heard back about, narrowed to what has been typed since.
+    pub fn cwd_matches(&self, vm: usize, cwd: &str) -> Vec<String> {
+        let (dir, typed) = split_cwd(cwd).unwrap_or_default();
+        match self.dirs.get(&(vm, dir)) {
+            Some(names) => filter_dirs(names, typed),
+            None => Vec::new(),
+        }
+    }
+
+    /// Asks the VM that would host the session what lives in the directory being typed.
+    /// Only the first ask per directory goes out; the reply serves every later keystroke.
+    pub fn request_dirs(&mut self, vm: usize, cwd: &str) {
+        let Some((dir, _)) = split_cwd(cwd) else {
+            return;
+        };
+        if let Entry::Vacant(slot) = self.dirs.entry((vm, dir.clone())) {
+            slot.insert(Vec::new());
+            self.send(vm, Req::ListDir { path: dir });
+        }
+    }
+
     pub fn send(&mut self, vm: usize, req: Req) {
         if let Some(v) = self.vms.get(vm) {
             if v.tx.send(req).is_err() {
@@ -293,6 +322,31 @@ impl App {
             self.send(vi, Req::Resize { id, cols, rows });
         }
     }
+}
+
+/// A cwd being typed, split into the directory to list and the segment to filter by.
+/// `None` until the user has typed a `/`, since before that there is no parent to list.
+pub fn split_cwd(cwd: &str) -> Option<(String, &str)> {
+    let (dir, typed) = cwd.rsplit_once('/')?;
+    Some((if dir.is_empty() { "/" } else { dir }.to_string(), typed))
+}
+
+/// A directory listing narrowed to what the user has typed. Dotdirs stay hidden until
+/// the segment asks for them.
+pub fn filter_dirs(names: &[String], typed: &str) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| n.starts_with(typed) && (typed.starts_with('.') || !n.starts_with('.')))
+        .cloned()
+        .collect()
+}
+
+/// Swaps the half-typed last segment of `cwd` for `name`, ending on `/` so the menu then
+/// offers that directory's own children.
+pub fn complete_dir(cwd: &mut String, name: &str) {
+    cwd.truncate(cwd.rfind('/').map_or(0, |i| i + 1));
+    cwd.push_str(name);
+    cwd.push('/');
 }
 
 /// "~/Documents/agents-hub" → "agents-hub", so a session gets a useful name for free.
@@ -383,6 +437,49 @@ mod tests {
         assert_eq!(default_name("~", "claude"), "claude");
         assert_eq!(default_name("/", "claude"), "claude");
         assert_eq!(default_name("", "claude"), "claude");
+    }
+
+    #[test]
+    fn a_cwd_splits_into_the_directory_to_list_and_the_segment_to_match() {
+        assert_eq!(split_cwd("~/Doc"), Some(("~".into(), "Doc")));
+        assert_eq!(split_cwd("~/Documents/"), Some(("~/Documents".into(), "")));
+        assert_eq!(split_cwd("/etc"), Some(("/".into(), "etc")));
+        assert_eq!(split_cwd("~"), None); // no parent typed yet, nothing to ask for
+
+        let names: Vec<String> = ["alpha", "alpine", "beta", ".hidden"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(filter_dirs(&names, "al"), ["alpha", "alpine"]);
+        assert_eq!(filter_dirs(&names, "alph"), ["alpha"]);
+        assert_eq!(filter_dirs(&names, ""), ["alpha", "alpine", "beta"]);
+        assert_eq!(filter_dirs(&names, "."), [".hidden"]); // dotdirs only when asked for
+        assert!(filter_dirs(&names, "zz").is_empty());
+    }
+
+    #[test]
+    fn a_directory_is_only_asked_for_once_however_much_is_typed_after_it() {
+        let (mut app, mut rx) = app(&["~/work/api"]);
+        app.request_dirs(0, "~/wo");
+        app.request_dirs(0, "~/work");
+        assert_eq!(sent(&mut rx), [Req::ListDir { path: "~".into() }]);
+        assert!(app.cwd_matches(0, "~/wo").is_empty()); // nothing until the reply lands
+
+        app.dirs.insert((0, "~".into()), vec!["work".into(), "play".into()]);
+        assert_eq!(app.cwd_matches(0, "~/wo"), ["work"]);
+
+        // Descending is a different directory, so that one is asked for.
+        app.request_dirs(0, "~/work/a");
+        assert_eq!(sent(&mut rx), [Req::ListDir { path: "~/work".into() }]);
+    }
+
+    #[test]
+    fn complete_dir_replaces_the_typed_segment_and_descends() {
+        let mut cwd = "~/Doc".to_string();
+        complete_dir(&mut cwd, "Documents");
+        assert_eq!(cwd, "~/Documents/");
+        complete_dir(&mut cwd, "agents-hub");
+        assert_eq!(cwd, "~/Documents/agents-hub/");
     }
 
     #[test]

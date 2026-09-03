@@ -4,7 +4,7 @@
 
 use super::app::{default_name, App, Focus, Modal, Row};
 use super::input::links;
-use super::{ACTIVITY_WINDOW, PANE_MIN, SIDE_MIN};
+use super::{ACTIVITY_WINDOW, CWD_MENU, PANE_MIN, SIDE_MIN};
 use crate::proto::Status;
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -345,6 +345,17 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
+const MODAL_W: u16 = 60;
+
+/// A deep cwd clipped from the *front*: the end you are typing is the part worth seeing.
+fn tail(s: &str, width: u16) -> String {
+    let width = width as usize;
+    match s.chars().count().checked_sub(width) {
+        Some(over) if over > 0 => format!("…{}", s.chars().skip(over + 1).collect::<String>()),
+        _ => s.to_string(),
+    }
+}
+
 fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
     let (title, lines, w, h) = match m {
         Modal::Help => (
@@ -387,9 +398,31 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
             name,
             cwd,
             field,
+            menu,
         } => {
             let mark = |i: u8| if *field == i { "▸" } else { " " };
             let agent_name = app.agents.get(*agent).map(String::as_str).unwrap_or("—");
+            let picks = match menu {
+                Some(_) => app.cwd_matches(*vm, cwd),
+                None => Vec::new(),
+            };
+            let pick = menu.unwrap_or(0).min(picks.len().saturating_sub(1));
+            let first = pick
+                .saturating_sub(CWD_MENU - 1)
+                .min(picks.len().saturating_sub(CWD_MENU));
+            let menu_lines = picks.iter().enumerate().skip(first).take(CWD_MENU).map(
+                |(i, dir)| {
+                    let style = if i == pick {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    Line::from(vec![
+                        Span::raw("         "),
+                        Span::styled(format!("{dir}/"), style),
+                    ])
+                },
+            );
             (
                 " new session ",
                 vec![
@@ -408,15 +441,20 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
                             Span::raw(name.clone())
                         },
                     ]),
-                    Line::from(format!("{} cwd    {}", mark(2), cwd)),
+                    Line::from(format!("{} cwd    {}", mark(2), tail(cwd, MODAL_W - 12))),
+                ]
+                .into_iter()
+                .chain(menu_lines)
+                .chain([
                     Line::from(""),
                     Line::from(Span::styled(
-                        "  tab next field · ⏎ create · esc cancel",
+                        "  ↑↓ pick · tab complete · ⏎ create · esc cancel",
                         Style::default().fg(Color::DarkGray),
                     )),
-                ],
-                60,
-                10,
+                ])
+                .collect(),
+                MODAL_W,
+                10 + picks.len().min(CWD_MENU) as u16,
             )
         }
     };

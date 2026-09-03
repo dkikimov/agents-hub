@@ -76,6 +76,21 @@ fn expand_home(cwd: &str) -> PathBuf {
     }
 }
 
+/// Subdirectory names of `path`, sorted; empty if it isn't a readable directory. The
+/// client filters this by what the user has typed, so one listing serves every keystroke.
+fn subdirs(path: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(expand_home(path)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
 fn read_tail(path: &Path, max: u64) -> Vec<u8> {
     let Ok(mut f) = std::fs::File::open(path) else {
         return Vec::new();
@@ -300,6 +315,13 @@ impl Hub {
         match req {
             Req::List => {
                 let _ = tx.send(Resp::Sessions { sessions: self.list() });
+            }
+
+            Req::ListDir { path } => {
+                let _ = tx.send(Resp::Dirs {
+                    names: subdirs(&path),
+                    path,
+                });
             }
 
             Req::Create {

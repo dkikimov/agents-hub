@@ -2,7 +2,7 @@
 //! Handlers only ever read pure helpers out of `input` and `tree`, which is what
 //! makes them testable without a terminal.
 
-use super::app::{default_name, App, Focus, Modal, Row, Selection};
+use super::app::{complete_dir, default_name, App, Focus, Modal, Row, Selection};
 use super::clipboard::copy_local;
 use super::input::{
     click_bytes, key_bytes, mouse_bytes, pane_cell, paste_bytes, row_at, on_split, scroll_screen,
@@ -141,12 +141,14 @@ pub fn on_key(app: &mut App, k: KeyEvent) -> bool {
             }
         }
         KeyCode::Char('n') => {
+            app.dirs.clear();
             app.modal = Some(Modal::New {
                 vm: app.cur_vm(),
                 agent: 0,
                 name: String::new(),
                 cwd: app.new_cwd(),
                 field: 0,
+                menu: None,
             });
         }
         KeyCode::Char('d') => {
@@ -190,10 +192,16 @@ fn modal_key(app: &mut App, modal: Modal, k: KeyEvent) -> bool {
             mut name,
             mut cwd,
             mut field,
+            mut menu,
         } => {
             let mut keep = true;
+            let picks = match menu {
+                Some(_) => app.cwd_matches(vm, &cwd),
+                None => Vec::new(),
+            };
             match k.code {
-                KeyCode::Esc => keep = false,
+                // Esc dismisses the completion menu before it dismisses the modal.
+                KeyCode::Esc => keep = menu.take().is_some() && !picks.is_empty(),
                 KeyCode::Enter => {
                     let (cols, rows) = app.pane;
                     let agent_name = app.agents.get(agent).cloned().unwrap_or_default();
@@ -218,8 +226,25 @@ fn modal_key(app: &mut App, modal: Modal, k: KeyEvent) -> bool {
                     }
                     keep = false;
                 }
-                KeyCode::Tab | KeyCode::Down => field = (field + 1) % 3,
-                KeyCode::BackTab | KeyCode::Up => field = (field + 2) % 3,
+                KeyCode::Tab | KeyCode::Right if !picks.is_empty() => {
+                    let pick = menu.unwrap_or(0).min(picks.len() - 1);
+                    complete_dir(&mut cwd, &picks[pick]);
+                    menu = Some(0);
+                }
+                KeyCode::Down if !picks.is_empty() => {
+                    menu = Some((menu.unwrap_or(0) + 1).min(picks.len() - 1));
+                }
+                KeyCode::Up if !picks.is_empty() => {
+                    menu = Some(menu.unwrap_or(0).saturating_sub(1));
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    field = (field + 1) % 3;
+                    menu = (field == 2).then_some(0);
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    field = (field + 2) % 3;
+                    menu = (field == 2).then_some(0);
+                }
                 KeyCode::Left if field == 0 => {
                     agent = agent
                         .checked_sub(1)
@@ -237,6 +262,7 @@ fn modal_key(app: &mut App, modal: Modal, k: KeyEvent) -> bool {
                         name.pop();
                     } else if field == 2 {
                         cwd.pop();
+                        menu = Some(0);
                     }
                 }
                 KeyCode::Char(c) => {
@@ -244,9 +270,13 @@ fn modal_key(app: &mut App, modal: Modal, k: KeyEvent) -> bool {
                         name.push(c);
                     } else if field == 2 {
                         cwd.push(c);
+                        menu = Some(0);
                     }
                 }
                 _ => {}
+            }
+            if menu.is_some() {
+                app.request_dirs(vm, &cwd);
             }
             if keep {
                 app.modal = Some(Modal::New {
@@ -255,6 +285,7 @@ fn modal_key(app: &mut App, modal: Modal, k: KeyEvent) -> bool {
                     name,
                     cwd,
                     field,
+                    menu,
                 });
             }
         }
@@ -560,6 +591,9 @@ pub fn on_msg(app: &mut App, vi: usize, resp: Resp) {
                 app.focus = Focus::Sidebar;
             }
         }
+        Resp::Dirs { path, names } => {
+            app.dirs.insert((vi, path), names);
+        }
         Resp::Error { msg } => app.status = format!("{}: {msg}", app.vms[vi].name),
     }
     app.dirty = true;
@@ -799,6 +833,54 @@ mod tests {
         on_key(&mut a, key('n'));
         on_key(&mut a, code(KeyCode::Esc));
         assert!(a.modal.is_none() && sent(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn the_cwd_menu_scrolls_and_tab_takes_the_highlighted_directory() {
+        let (mut a, mut rx) = app(&["~/work/api"]);
+        a.sel = 2; // the "work/" folder, so the modal seeds cwd with "~/work"
+
+        // Tabbing into the cwd field asks the VM hosting the session what is in "~".
+        on_key(&mut a, key('n'));
+        on_key(&mut a, code(KeyCode::Tab)); // → name
+        on_key(&mut a, code(KeyCode::Tab)); // → cwd
+        assert_eq!(sent(&mut rx), [Req::ListDir { path: "~".into() }]);
+        on_msg(
+            &mut a,
+            0,
+            Resp::Dirs {
+                path: "~".into(),
+                names: vec!["work".into(), "workshop".into()],
+            },
+        );
+
+        // Both fit "~/work"; ↓ moves off the first, tab takes what's under it.
+        on_key(&mut a, code(KeyCode::Down));
+        on_key(&mut a, code(KeyCode::Down)); // and stops at the end rather than wrapping
+        on_key(&mut a, code(KeyCode::Tab));
+        on_key(&mut a, code(KeyCode::Enter));
+        let Some(Req::Create { cwd, .. }) = sent(&mut rx).pop() else {
+            panic!("expected a Create")
+        };
+        assert_eq!(cwd, "~/workshop/");
+
+        // Esc closes the menu first, and only then the modal.
+        on_key(&mut a, key('n'));
+        on_key(&mut a, code(KeyCode::Tab));
+        on_key(&mut a, code(KeyCode::Tab)); // → cwd
+        on_msg(
+            &mut a,
+            0,
+            Resp::Dirs {
+                path: "~".into(),
+                names: vec!["work".into()],
+            },
+        );
+        on_key(&mut a, code(KeyCode::Esc));
+        assert!(a.modal.is_some());
+        on_key(&mut a, code(KeyCode::Esc));
+        assert!(a.modal.is_none());
+        assert!(!sent(&mut rx).iter().any(|r| matches!(r, Req::Create { .. })));
     }
 
     #[test]

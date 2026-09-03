@@ -36,6 +36,9 @@ const PANE_MIN: u16 = 20;
 /// Lines per wheel tick.
 const WHEEL: usize = 3;
 
+/// Directories the new-session cwd menu shows at once; the rest scroll past.
+const CWD_MENU: usize = 6;
+
 /// Everything the run loop can wake up for, from any of its sources.
 enum Ui {
     Input(Event),
