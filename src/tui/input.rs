@@ -114,23 +114,60 @@ pub fn pane_cell(
     (col < cols && row < rows).then_some((col, row))
 }
 
-pub fn selected_text(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16)) -> Option<String> {
+/// The text a drag covered. `contents_between` can only read the rows currently on
+/// screen, so a selection taller than the pane is collected one screenful at a time,
+/// scrolling the parser and putting it back. Rows older than the buffer are dropped.
+pub fn selected_text(
+    screen: &mut vt100::Screen,
+    start: (u16, i32),
+    end: (u16, u16),
+) -> Option<String> {
+    let end = (end.0, i32::from(end.1));
     if start == end {
         return None;
     }
     let (rows, cols) = screen.size();
-    if [start, end]
-        .into_iter()
-        .any(|(col, row)| col >= cols || row >= rows)
-    {
+    if start.0 >= cols || end.0 >= cols || rows == 0 {
         return None;
     }
-    let (start, end) = if (start.1, start.0) <= (end.1, end.0) {
+    let ((first_col, top), (last_col, bottom)) = if (start.1, start.0) <= (end.1, end.0) {
         (start, end)
     } else {
         (end, start)
     };
-    let text = screen.contents_between(start.1, start.0, end.1, end.0.saturating_add(1).min(cols));
+
+    let saved = screen.scrollback() as i32;
+    let mut text = String::new();
+    let mut row = top;
+    let mut joins = false;
+    while row <= bottom {
+        screen.set_scrollback((saved - row).max(0) as usize);
+        let shift = screen.scrollback() as i32 - saved;
+        let (mut a, b) = (row + shift, (bottom + shift).min(i32::from(rows) - 1));
+        if a < 0 {
+            row -= a; // scrolled out of the buffer entirely
+            a = 0;
+        }
+        if b < a {
+            break;
+        }
+        let (a, b) = (a as u16, b as u16);
+        let head = if row == top { first_col } else { 0 };
+        let tail = if bottom + shift <= b.into() {
+            last_col.saturating_add(1).min(cols)
+        } else {
+            cols
+        };
+        if joins {
+            text.push('\n');
+        }
+        text.push_str(&screen.contents_between(a, head, b, tail));
+        // contents_between omits the newline after its last row, so the next window
+        // has to supply it unless that row was a soft wrap.
+        joins = !screen.row_wrapped(b);
+        row += i32::from(b - a) + 1;
+    }
+    screen.set_scrollback(saved.max(0) as usize);
     (!text.is_empty()).then_some(text)
 }
 
@@ -337,14 +374,14 @@ mod tests {
         parser.process(b"alpha\r\nbeta");
 
         assert_eq!(
-            selected_text(parser.screen(), (1, 0), (1, 1)),
+            selected_text(parser.screen_mut(),(1, 0), (1, 1)),
             Some("lpha\nbe".into())
         );
         assert_eq!(
-            selected_text(parser.screen(), (1, 1), (1, 0)),
+            selected_text(parser.screen_mut(),(1, 1), (1, 0)),
             Some("lpha\nbe".into())
         );
-        assert_eq!(selected_text(parser.screen(), (1, 0), (1, 0)), None);
+        assert_eq!(selected_text(parser.screen_mut(), (1, 0), (1, 0)), None);
     }
 
     #[test]
@@ -366,6 +403,33 @@ mod tests {
                 (2, 3),
             ),
             b"\x1b[<0;3;4M\x1b[<0;3;4m"
+        );
+    }
+
+    #[test]
+    fn a_selection_taller_than_the_pane_copies_every_row_it_covers() {
+        let mut parser = vt100::Parser::new(4, 10, 100);
+        for n in 1..=20 {
+            parser.process(format!("line{n}\r\n").as_bytes());
+        }
+        parser.screen_mut().set_scrollback(6); // shows line12..line15
+
+        // Anchor six rows above the top of the view, pointer on the last visible row.
+        let text = selected_text(parser.screen_mut(), (0, -6), (5, 3)).expect("selection");
+        assert_eq!(
+            text,
+            (6..=15)
+                .map(|n| format!("line{n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(parser.screen().scrollback(), 6, "the view is put back");
+
+        // The same span dragged the other way, so the anchor is below the viewport.
+        parser.screen_mut().set_scrollback(12); // shows line6..line9
+        assert_eq!(
+            selected_text(parser.screen_mut(), (5, 9), (0, 0)),
+            Some(text)
         );
     }
 

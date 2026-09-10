@@ -327,6 +327,39 @@ pub fn on_paste(app: &mut App, text: &str) {
 
 // ── mouse ─────────────────────────────────────────────────────────────────────
 
+/// How far past the pane's top (negative) or bottom (positive) edge a row sits.
+fn pane_overshoot(org: u16, rows: u16, row: u16) -> i16 {
+    let (top, bottom) = (i32::from(org), i32::from(org) + i32::from(rows) - 1);
+    let over = i32::from(row) - i32::from(row).clamp(top, bottom);
+    over.clamp(i16::MIN.into(), i16::MAX.into()) as i16
+}
+
+/// Scrolls the pane while a drag is parked past its edge. Driven by the frame tick
+/// because crossterm reports a motionless pointer not at all.
+pub fn autoscroll(app: &mut App) {
+    let Some(sel) = app.selection.as_ref() else {
+        return;
+    };
+    if sel.down.is_none() || sel.edge == 0 {
+        return;
+    }
+    // ponytail: 3 rows a frame ≈ 190 rows/s. Raise the cap if long jumps feel slow.
+    let (vm, id, up) = (sel.vm, sel.id.clone(), sel.edge < 0);
+    let rows = usize::from(sel.edge.unsigned_abs().min(3));
+    let Some(p) = app.panes.get_mut(&(vm, id)) else {
+        return;
+    };
+    let before = p.screen().scrollback() as i32;
+    scroll_screen(p.screen_mut(), up, rows);
+    let moved = p.screen().scrollback() as i32 - before;
+    if moved == 0 {
+        return; // hit the end of the buffer
+    }
+    app.selection.as_mut().expect("checked above").start.1 += moved;
+    app.focus = Focus::Scrollback; // the pane is no longer showing live output
+    app.dirty = true;
+}
+
 /// Finishes a drag over the pane: copy what it covered, or — if it never moved —
 /// replay it to the guest as a click.
 fn finish_drag(app: &mut App, m: MouseEvent, left_up: bool) {
@@ -336,6 +369,7 @@ fn finish_drag(app: &mut App, m: MouseEvent, left_up: bool) {
     if !left_up {
         if let Some(selection) = app.selection.as_mut() {
             selection.end = cell;
+            selection.edge = pane_overshoot(app.pane_org.1, app.pane.1, m.row);
         }
         app.dirty = true;
         return;
@@ -345,17 +379,22 @@ fn finish_drag(app: &mut App, m: MouseEvent, left_up: bool) {
     selection.end = cell;
     let text = app
         .panes
-        .get(&(selection.vm, selection.id.clone()))
-        .and_then(|p| selected_text(p.screen(), selection.start, selection.end));
+        .get_mut(&(selection.vm, selection.id.clone()))
+        .and_then(|p| selected_text(p.screen_mut(), selection.start, selection.end));
+    // Only a drag that never moved reaches the link and click paths, so its anchor is
+    // still the cell that was pressed.
+    let pressed = u16::try_from(selection.start.1)
+        .ok()
+        .map(|row| (selection.start.0, row));
     if let Some(text) = text {
         app.status = copy_status(&text.clone().into_bytes());
         selection.down = None;
         app.selection = Some(selection);
-    } else if let Some(url) = app
-        .panes
-        .get(&(selection.vm, selection.id.clone()))
-        .and_then(|p| url_at(p.screen(), selection.start))
-    {
+    } else if let Some(url) = pressed.and_then(|at| {
+        app.panes
+            .get(&(selection.vm, selection.id.clone()))
+            .and_then(|p| url_at(p.screen(), at))
+    }) {
         // The host terminal's own cmd-click can't see this pane: mouse capture takes the
         // click first, and cmd isn't encodable in any mouse protocol, so we open it.
         open_link(&url);
@@ -366,16 +405,10 @@ fn finish_drag(app: &mut App, m: MouseEvent, left_up: bool) {
             .iter()
             .find(|s| s.id == selection.id)
             .is_some_and(|s| s.status == Status::Running);
-        let bytes = app
-            .panes
-            .get(&(selection.vm, selection.id.clone()))
-            .map(|p| {
-                click_bytes(
-                    selection.down.expect("active selection"),
-                    m,
-                    p.screen(),
-                    selection.start,
-                )
+        let bytes = pressed
+            .zip(app.panes.get(&(selection.vm, selection.id.clone())))
+            .map(|(at, p)| {
+                click_bytes(selection.down.expect("active selection"), m, p.screen(), at)
             })
             .unwrap_or_default();
         if running && app.focus != Focus::Scrollback {
@@ -469,8 +502,9 @@ pub fn on_mouse(app: &mut App, m: MouseEvent) {
             vm: vi,
             id,
             down: Some(m),
-            start: (col, row),
+            start: (col, i32::from(row)),
             end: (col, row),
+            edge: 0,
         });
         app.dirty = true;
         return;
@@ -1059,6 +1093,50 @@ mod tests {
                 data: b64(b"\x1b[<64;10;5M")
             }]
         );
+    }
+
+    #[test]
+    fn a_drag_parked_past_the_edge_scrolls_and_carries_its_anchor() {
+        let (mut a, mut rx) = app(&["~/a"]);
+        a.reconcile(0);
+        sent(&mut rx);
+        a.sel = a.rows.len() - 1;
+        a.pane_org = (31, 1);
+        let pane = (0, "s0".to_string());
+        for i in 0..60 {
+            a.panes.get_mut(&pane).unwrap().process(format!("line {i}\r\n").as_bytes());
+        }
+
+        let at = |kind, row| MouseEvent {
+            kind,
+            column: 40,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        on_mouse(&mut a, at(MouseEventKind::Down(MouseButton::Left), 5));
+        assert_eq!(a.selection.as_ref().unwrap().start, (9, 4));
+
+        // Still inside the pane: nothing scrolls however many frames go by.
+        on_mouse(&mut a, at(MouseEventKind::Drag(MouseButton::Left), 3));
+        autoscroll(&mut a);
+        assert_eq!(a.selection.as_ref().unwrap().edge, 0);
+        assert_eq!(a.panes[&pane].screen().scrollback(), 0);
+
+        // Parked one row above it, and the anchor follows the text down.
+        on_mouse(&mut a, at(MouseEventKind::Drag(MouseButton::Left), 0));
+        assert_eq!(a.selection.as_ref().unwrap().edge, -1);
+        autoscroll(&mut a);
+        autoscroll(&mut a);
+        assert_eq!(a.panes[&pane].screen().scrollback(), 2);
+        assert_eq!(a.selection.as_ref().unwrap().start, (9, 6));
+        assert_eq!(a.selection.as_ref().unwrap().end, (9, 0));
+        assert!(a.focus == Focus::Scrollback);
+
+        // Back inside, and it stops where it left off.
+        on_mouse(&mut a, at(MouseEventKind::Drag(MouseButton::Left), 5));
+        autoscroll(&mut a);
+        assert_eq!(a.panes[&pane].screen().scrollback(), 2);
+        assert!(sent(&mut rx).is_empty(), "a drag is ours, not the guest's");
     }
 
     #[test]

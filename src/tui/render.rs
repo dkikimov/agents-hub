@@ -190,19 +190,21 @@ fn mark_links(f: &mut Frame, inner: Rect, screen: &vt100::Screen) {
 
 /// Paints the drag highlight over the cells it covers, in whichever direction it ran.
 fn draw_selection(f: &mut Frame, app: &App, inner: Rect, vi: usize, id: &str) {
-    let Some(sel) = app
-        .selection
-        .as_ref()
-        .filter(|s| s.vm == vi && s.id == id && s.start != s.end)
-    else {
+    let Some(sel) = app.selection.as_ref().filter(|s| s.vm == vi && s.id == id) else {
         return;
     };
-    let (start, end) = if (sel.start.1, sel.start.0) <= (sel.end.1, sel.end.0) {
-        (sel.start, sel.end)
+    let end = (sel.end.0, i32::from(sel.end.1));
+    if sel.start == end {
+        return;
+    }
+    let (start, end) = if (sel.start.1, sel.start.0) <= (end.1, end.0) {
+        (sel.start, end)
     } else {
-        (sel.end, sel.start)
+        (end, sel.start)
     };
-    for row in start.1..=end.1 {
+    // An anchor dragged past an edge sits outside the pane; paint the part still on it.
+    let last_row = i32::from(inner.height) - 1;
+    for row in start.1.max(0)..=end.1.min(last_row) {
         let first = if row == start.1 { start.0 } else { 0 };
         let last = if row == end.1 {
             end.0
@@ -210,7 +212,7 @@ fn draw_selection(f: &mut Frame, app: &App, inner: Rect, vi: usize, id: &str) {
             inner.width.saturating_sub(1)
         };
         for col in first..=last {
-            f.buffer_mut()[(inner.x + col, inner.y + row)]
+            f.buffer_mut()[(inner.x + col, inner.y + row as u16)]
                 .set_style(Style::default().add_modifier(Modifier::REVERSED));
         }
     }

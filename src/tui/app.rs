@@ -75,8 +75,13 @@ pub struct Selection {
     pub vm: usize,
     pub id: String,
     pub down: Option<MouseEvent>,
-    pub start: (u16, u16),
+    /// Anchored to the text rather than the screen, so scrolling moves it and it can
+    /// leave the viewport in either direction. Larger row is newer.
+    pub start: (u16, i32),
     pub end: (u16, u16),
+    /// Rows the pointer sits outside the pane, signed; 0 while it's inside. Latched,
+    /// because a pointer held still at the edge emits no further events.
+    pub edge: i16,
 }
 
 pub struct App {

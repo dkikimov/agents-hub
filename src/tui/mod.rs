@@ -121,6 +121,7 @@ pub async fn run() -> Result<()> {
                 let now = Instant::now();
                 app.activity.retain(|_, last| now.duration_since(*last) < ACTIVITY_WINDOW);
                 app.dirty |= app.activity.len() != before;
+                event::autoscroll(&mut app);
                 if app.dirty {
                     app.dirty = false;
                     if let Err(e) = term.draw(|f| render::draw(f, &mut app)) { break Err(e.into()) }
