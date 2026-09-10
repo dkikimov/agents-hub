@@ -68,30 +68,38 @@ struct SidebarView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            List(selection: $model.selection) {
-                ForEach(model.vms.indices, id: \.self) { vi in
-                    Section {
-                        ForEach(model.rowsByVM[safe: vi] ?? []) { row in
-                            rowView(row).tag(row.id)
-                        }
-                    } header: {
-                        HStack(spacing: 6) {
-                            Text(model.vms[vi].name)
-                                .font(Ghostty.ui(Ghostty.fontSize - 1, weight: .bold))
-                                .foregroundStyle(.cyan)
-                            if !model.vms[vi].online {
-                                Text("offline")
-                                    .font(Ghostty.ui(Ghostty.fontSize - 3))
-                                    .foregroundStyle(.yellow)
+            // j/k move the selection in the model, and a List only follows the mouse on
+            // its own — without this the cursor walks off the visible rows.
+            ScrollViewReader { proxy in
+                List(selection: $model.selection) {
+                    ForEach(model.vms.indices, id: \.self) { vi in
+                        Section {
+                            ForEach(model.rowsByVM[safe: vi] ?? []) { row in
+                                rowView(row).tag(row.id).id(row.id)
+                            }
+                        } header: {
+                            HStack(spacing: 6) {
+                                Text(model.vms[vi].name)
+                                    .font(Ghostty.ui(Ghostty.fontSize - 1, weight: .bold))
+                                    .foregroundStyle(.cyan)
+                                if !model.vms[vi].online {
+                                    Text("offline")
+                                        .font(Ghostty.ui(Ghostty.fontSize - 3))
+                                        .foregroundStyle(.yellow)
+                                }
                             }
                         }
                     }
                 }
+                .listStyle(.sidebar)
+                .focused($focus, equals: .sidebar)
+                .onChange(of: model.selection) { _, id in
+                    model.selectionChanged()
+                    guard let id else { return }
+                    proxy.scrollTo(id)
+                }
+                .modifier(VimKeys(model: model, focus: $focus, filterFocused: $filterFocused))
             }
-            .listStyle(.sidebar)
-            .focused($focus, equals: .sidebar)
-            .onChange(of: model.selection) { _, _ in model.selectionChanged() }
-            .modifier(VimKeys(model: model, focus: $focus, filterFocused: $filterFocused))
 
             Divider()
             HStack(spacing: 6) {
