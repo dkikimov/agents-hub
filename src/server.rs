@@ -268,6 +268,12 @@ impl Hub {
         cmd.cwd(expand_home(cwd));
         // Agent CLIs render badly without this.
         cmd.env("TERM", "xterm-256color");
+        // Present only once a client has connected over SSH; the daemon's own env
+        // has no agent, having been started at boot.
+        let agent = self.dir.join("agent.sock");
+        if agent.symlink_metadata().is_ok() {
+            cmd.env("SSH_AUTH_SOCK", agent);
+        }
 
         let child = pair
             .slave

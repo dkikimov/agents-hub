@@ -11,7 +11,7 @@ mod tui;
 
 use anyhow::{bail, Context, Result};
 use config::Config;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::net::UnixStream;
 
@@ -35,6 +35,29 @@ pub fn config_path() -> PathBuf {
 
 pub fn sock_path() -> PathBuf {
     state_dir().join("sock")
+}
+
+/// Stable stand-in for the forwarded SSH agent, which lives at a different
+/// `/tmp/ssh-*/agent.<pid>` on every connection. `Hub::spawn` hands this path to
+/// sessions as `$SSH_AUTH_SOCK`.
+pub fn agent_sock_path() -> PathBuf {
+    state_dir().join("agent.sock")
+}
+
+/// ponytail: the link dangles while no client is connected, so a session running
+/// git/ssh right then still fails; have the daemon proxy the agent if that bites.
+fn relink_agent_sock(sock: &Path, link: &Path) -> Result<()> {
+    // A session's own $SSH_AUTH_SOCK is already this link; symlinking it onto
+    // itself would ELOOP the agent for every session on the box.
+    if sock == link {
+        return Ok(());
+    }
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(link);
+    std::os::unix::fs::symlink(sock, link)?;
+    Ok(())
 }
 
 /// Launches the daemon detached. `ssh host cmd` allocates no TTY, so the daemon
@@ -75,7 +98,12 @@ pub async fn connect_local() -> Result<UnixStream> {
 }
 
 /// What SSH runs on the remote: a dumb pipe between stdin/stdout and the local socket.
+/// This process is the only one on the VM that sees the forwarded agent — the daemon
+/// was started at boot by systemd — so it re-points the stable link on every connect.
 async fn stdio() -> Result<()> {
+    if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
+        let _ = relink_agent_sock(Path::new(&sock), &agent_sock_path());
+    }
     let mut sock = connect_local().await?;
     let mut pipe = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
     tokio::io::copy_bidirectional(&mut sock, &mut pipe).await?;
@@ -124,5 +152,32 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(other) => bail!("unknown command '{other}'\n\n{HELP}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_link_follows_each_new_connection_and_never_loops() {
+        let dir = std::env::temp_dir().join(format!("ah-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let link = dir.join("agent.sock");
+
+        relink_agent_sock(Path::new("/tmp/ssh-aaa/agent.1"), &link).unwrap();
+        relink_agent_sock(Path::new("/tmp/ssh-bbb/agent.2"), &link).unwrap();
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("/tmp/ssh-bbb/agent.2")
+        );
+
+        relink_agent_sock(&link.clone(), &link).unwrap();
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("/tmp/ssh-bbb/agent.2"),
+            "a session's own SSH_AUTH_SOCK must not replace the link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
