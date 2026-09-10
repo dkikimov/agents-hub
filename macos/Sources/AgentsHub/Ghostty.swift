@@ -50,6 +50,57 @@ enum Ghostty {
         // The package's ColorScheme initialiser is internal, so map it here.
         controller.setColorScheme(scheme == .dark ? .dark : .light)
     }
+
+    // MARK: - borrowing the terminal's font for the rest of the UI
+
+    /// First value for `key` in the ghostty config. Ghostty's format is one `key = value`
+    /// per line with `#` comments; repeated keys are fallbacks, so first wins.
+    ///
+    /// ponytail: does not follow `config-file` includes or resolve a theme's own font.
+    /// `ghostty +show-config` would, at the cost of shelling out to an install that may
+    /// not be there — do that only if someone's font actually goes missing.
+    private static func configValue(_ key: String) -> String? {
+        guard let path = configPath,
+              let text = try? String(contentsOfFile: path, encoding: .utf8)
+        else { return nil }
+
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { continue }
+            guard line[..<eq].trimmingCharacters(in: .whitespaces) == key else { continue }
+
+            var value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+                value = String(value.dropFirst().dropLast())
+            }
+            if !value.isEmpty { return value }
+        }
+        return nil
+    }
+
+    /// Only if AppKit can actually resolve it — a family ghostty falls back on would
+    /// otherwise leave every label silently rendering in Helvetica.
+    static let fontFamily: String? = {
+        guard let name = configValue("font-family"), NSFont(name: name, size: 13) != nil else {
+            return nil
+        }
+        return name
+    }()
+
+    /// Ghostty's own default when the config does not say.
+    static let fontSize: CGFloat = {
+        guard let raw = configValue("font-size"), let points = Double(raw) else { return 13 }
+        return CGFloat(points)
+    }()
+
+    /// The terminal's font, for the chrome around it. Falls back to the system
+    /// monospace face, which is the same shape even when the family is missing.
+    static func ui(_ size: CGFloat = fontSize, weight: Font.Weight = .regular) -> Font {
+        guard let fontFamily else {
+            return .system(size: size, weight: weight, design: .monospaced)
+        }
+        return .custom(fontFamily, fixedSize: size).weight(weight)
+    }
 }
 
 /// System / light / dark, because a terminal that follows a light system appearance

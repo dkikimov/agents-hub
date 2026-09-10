@@ -58,13 +58,17 @@ struct RootView: View {
                 .navigationSplitViewColumnWidth(min: 190, ideal: 270, max: 440)
         } detail: {
             VStack(spacing: 0) {
+                header
+                Divider()
                 TerminalPane(model: model)
                     .focused($focus, equals: .terminal)
                 Divider()
                 statusBar
             }
-            .navigationTitle(title)
-            .navigationSubtitle(subtitle)
+            // No `navigationTitle`: NavigationSplitView draws it into the toolbar in the
+            // system font, which is the one seam you notice above a monospaced UI.
+            // `header` carries the same information in the terminal's own font.
+            .withoutToolbarTitle()
         }
         .preferredColorScheme(appearance.colorScheme)
         // The terminal has its own notion of light/dark: a ghostty config using
@@ -94,7 +98,29 @@ struct RootView: View {
     private var subtitle: String {
         guard let key = model.selectedKey, let info = model.selectedInfo else { return "" }
         let vm = model.vms[safe: key.vm]?.name ?? "?"
-        return info.status == .stopped ? "\(vm) — stopped, ⇧⌘R to restart" : vm
+        return info.status == .stopped ? "— \(vm), stopped · ⇧⌘R restarts" : "— \(vm)"
+    }
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            if let key = model.selectedKey, let info = model.selectedInfo {
+                StatusDot(online: model.isOnline(key.vm),
+                          status: info.status,
+                          active: model.activeDots.contains(key))
+                Text(info.agent)
+                    .font(Ghostty.ui(weight: .bold))
+                    .foregroundStyle(.purple)
+                Text(info.name).font(Ghostty.ui())
+                Text(subtitle)
+                    .font(Ghostty.ui(Ghostty.fontSize - 2))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("agents-hub").font(Ghostty.ui(weight: .bold)).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
     }
 
     private var statusBar: some View {
@@ -107,9 +133,22 @@ struct RootView: View {
             Text(focus == .terminal ? "⌘L back to list" : "j/k move · ⏎ attach · / filter")
                 .foregroundStyle(.tertiary)
         }
-        .font(.system(size: 11))
+        .font(Ghostty.ui(Ghostty.fontSize - 2))
         .foregroundStyle(.secondary)
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
+    }
+}
+
+extension View {
+    /// The toolbar title only became removable in macOS 15; below that the system-font
+    /// label stays and `header` simply repeats it.
+    @ViewBuilder
+    func withoutToolbarTitle() -> some View {
+        if #available(macOS 15.0, *) {
+            toolbar(removing: .title)
+        } else {
+            self
+        }
     }
 }

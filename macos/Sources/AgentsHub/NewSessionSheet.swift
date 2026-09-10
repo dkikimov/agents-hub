@@ -18,7 +18,7 @@ struct NewSessionSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("New session on \(model.vms[safe: model.currentVM]?.name ?? "?")")
-                .font(.headline)
+                .font(Ghostty.ui(Ghostty.fontSize + 1, weight: .bold))
 
             Picker("Agent", selection: $agent) {
                 ForEach(model.agentNames, id: \.self) { Text($0).tag($0) }
@@ -48,7 +48,7 @@ struct NewSessionSheet: View {
 
             HStack {
                 if model.agentNames.isEmpty {
-                    Text("no [agents.*] in config.toml").foregroundStyle(.red).font(.caption)
+                    Text("no [agents.*] in config.toml").foregroundStyle(.red).font(Ghostty.ui(Ghostty.fontSize - 2))
                 }
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
@@ -59,6 +59,7 @@ struct NewSessionSheet: View {
         }
         .padding(16)
         .frame(width: 520)
+        .font(Ghostty.ui())
         .onAppear {
             agent = model.agentNames.first ?? ""
             cwd = model.newCwd
@@ -108,10 +109,10 @@ struct KillConfirm: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Kill \(label)?").font(.headline)
+            Text("Kill \(label)?").font(Ghostty.ui(Ghostty.fontSize + 1, weight: .bold))
             // The daemon deletes the log too, so this really is irreversible.
             Text("Its scrollback is deleted with it. This cannot be undone.")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(Ghostty.ui(Ghostty.fontSize - 2)).foregroundStyle(.secondary)
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
@@ -124,5 +125,6 @@ struct KillConfirm: View {
         }
         .padding(16)
         .frame(width: 380)
+        .font(Ghostty.ui())
     }
 }

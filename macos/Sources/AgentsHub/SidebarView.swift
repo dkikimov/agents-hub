@@ -46,7 +46,7 @@ struct StatusDot: View {
     let active: Bool
 
     var body: some View {
-        Text(glyph).foregroundStyle(color).font(.system(size: 11))
+        Text(glyph).foregroundStyle(color).font(Ghostty.ui(Ghostty.fontSize - 2))
     }
 
     private var glyph: String {
@@ -76,15 +76,22 @@ struct SidebarView: View {
                         }
                     } header: {
                         HStack(spacing: 6) {
-                            Text(model.vms[vi].name).bold().foregroundStyle(.cyan)
+                            Text(model.vms[vi].name)
+                                .font(Ghostty.ui(Ghostty.fontSize - 1, weight: .bold))
+                                .foregroundStyle(.cyan)
                             if !model.vms[vi].online {
-                                Text("offline").font(.caption).foregroundStyle(.yellow)
+                                Text("offline")
+                                    .font(Ghostty.ui(Ghostty.fontSize - 3))
+                                    .foregroundStyle(.yellow)
                             }
                         }
                     }
                 }
             }
             .listStyle(.sidebar)
+            // The terminal's own font, so the list beside it reads as one surface
+            // rather than two apps stapled together.
+            .font(Ghostty.ui())
             .focused($focus, equals: .sidebar)
             .onChange(of: model.selection) { _, _ in model.selectionChanged() }
             .modifier(VimKeys(model: model, focus: $focus, filterFocused: $filterFocused))
@@ -94,7 +101,7 @@ struct SidebarView: View {
                 Image(systemName: "line.3.horizontal.decrease").foregroundStyle(.secondary)
                 TextField("filter", text: $model.filter)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 11))
+                    .font(Ghostty.ui(Ghostty.fontSize - 1))
                     .focused($filterFocused)
                     .onSubmit { focus = .sidebar }
                     .onExitCommand { model.filter = ""; focus = .sidebar }
