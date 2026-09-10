@@ -479,6 +479,19 @@ pub fn on_mouse(app: &mut App, m: MouseEvent) {
         app.selection = None;
     }
 
+    // Shift+wheel is the universal "ignore mouse reporting" gesture. Without it a guest
+    // that asked for motion events — Claude Code asks for ?1003h — owns the wheel forever
+    // and the scrollback below is only reachable through the `[` chord. Focus is left
+    // alone on purpose: staying in Terminal means the next keystroke both types and snaps
+    // back to live, which is what every real terminal does.
+    if let (Some(up), true) = (wheel, m.modifiers.contains(KeyModifiers::SHIFT)) {
+        if let Some(p) = app.panes.get_mut(&(vi, id)) {
+            scroll_screen(p.screen_mut(), up, WHEEL);
+            app.dirty = true;
+        }
+        return;
+    }
+
     if app.focus == Focus::Scrollback {
         if let (Some(up), Some(p)) = (wheel, app.panes.get_mut(&(vi, id))) {
             scroll_screen(p.screen_mut(), up, WHEEL);
@@ -997,6 +1010,47 @@ mod tests {
         // Once it does, the wheel is its business and our scrollback stays put.
         a.panes.get_mut(&pane).unwrap().process(b"\x1b[?1000h\x1b[?1006h");
         on_mouse(&mut a, wheel(MouseEventKind::ScrollUp));
+        assert_eq!(a.panes[&pane].screen().scrollback(), 0);
+        assert_eq!(
+            sent(&mut rx),
+            [Req::Input {
+                id: "s0".into(),
+                data: b64(b"\x1b[<64;10;5M")
+            }]
+        );
+    }
+
+    #[test]
+    fn shift_wheel_takes_the_scrollback_back_from_a_guest_that_grabbed_the_mouse() {
+        let (mut a, mut rx) = app(&["~/a"]);
+        a.reconcile(0);
+        sent(&mut rx);
+        a.sel = a.rows.len() - 1;
+        a.pane_org = (31, 1);
+        a.focus = Focus::Terminal;
+        let pane = (0, "s0".to_string());
+        for i in 0..60 {
+            a.panes.get_mut(&pane).unwrap().process(format!("line {i}\r\n").as_bytes());
+        }
+        // What Claude Code asks for, and why the plain wheel never reaches us.
+        a.panes.get_mut(&pane).unwrap().process(b"\x1b[?1003h\x1b[?1006h");
+
+        let wheel = |kind, modifiers| MouseEvent {
+            kind,
+            column: 40,
+            row: 5,
+            modifiers,
+        };
+        on_mouse(&mut a, wheel(MouseEventKind::ScrollUp, KeyModifiers::SHIFT));
+        assert_eq!(a.panes[&pane].screen().scrollback(), WHEEL);
+        assert!(sent(&mut rx).is_empty(), "shift+wheel is ours, not the guest's");
+        assert!(a.focus == Focus::Terminal, "typing must still reach the guest");
+
+        on_mouse(&mut a, wheel(MouseEventKind::ScrollDown, KeyModifiers::SHIFT));
+        assert_eq!(a.panes[&pane].screen().scrollback(), 0);
+
+        // Unmodified, the guest still owns it.
+        on_mouse(&mut a, wheel(MouseEventKind::ScrollUp, KeyModifiers::NONE));
         assert_eq!(a.panes[&pane].screen().scrollback(), 0);
         assert_eq!(
             sent(&mut rx),
