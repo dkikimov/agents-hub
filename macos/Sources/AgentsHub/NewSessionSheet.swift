@@ -7,6 +7,7 @@ import SwiftUI
 struct NewSessionSheet: View {
     @ObservedObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("theme") private var theme = Theme.classic
 
     @State private var agent = ""
     @State private var name = ""
@@ -90,7 +91,7 @@ struct NewSessionSheet: View {
             }
         }
         .padding(.horizontal, 8).padding(.vertical, 3)
-        .background(name == agent ? Color.accentColor.opacity(0.35) : Color.secondary.opacity(0.15))
+        .background(name == agent ? theme.palette.accent.opacity(0.35) : Color.secondary.opacity(0.15))
         .cornerRadius(4)
         .contentShape(Rectangle())
     }
@@ -108,7 +109,7 @@ struct NewSessionSheet: View {
                         Text(dir)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(i == highlighted ? Color.accentColor.opacity(0.25) : .clear)
+                            .background(i == highlighted ? theme.palette.accent.opacity(0.25) : .clear)
                             .contentShape(Rectangle())
                             .onTapGesture { accept(dir) }
                             .id(dir)

@@ -45,6 +45,8 @@ struct StatusDot: View {
     let status: Status
     let active: Bool
 
+    @AppStorage("theme") private var theme = Theme.classic
+
     var body: some View {
         Text(glyph).foregroundStyle(color).font(Ghostty.ui(Ghostty.fontSize - 2))
     }
@@ -57,7 +59,7 @@ struct StatusDot: View {
 
     private var color: Color {
         if !online || status == .stopped { return .secondary }
-        return active ? .yellow : .green
+        return active ? theme.palette.attention : theme.palette.running
     }
 }
 
@@ -65,6 +67,7 @@ struct SidebarView: View {
     @ObservedObject var model: AppModel
     @FocusState.Binding var focus: FocusTarget?
     @FocusState private var filterFocused: Bool
+    @AppStorage("theme") private var theme = Theme.classic
 
     var body: some View {
         VStack(spacing: 0) {
@@ -76,22 +79,30 @@ struct SidebarView: View {
                         Section {
                             ForEach(model.rowsByVM[safe: vi] ?? []) { row in
                                 rowView(row).tag(row.id).id(row.id)
+                                    .frame(height: 22)
+                                    .listRowInsets(EdgeInsets(top: 0, leading: 6,
+                                                              bottom: 0, trailing: 6))
+                                    .listRowSeparator(.hidden)
                             }
                         } header: {
                             HStack(spacing: 6) {
                                 Text(model.vms[vi].name)
                                     .font(Ghostty.ui(Ghostty.fontSize - 1, weight: .bold))
-                                    .foregroundStyle(.cyan)
+                                    .foregroundStyle(theme.palette.vm)
                                 if !model.vms[vi].online {
                                     Text("offline")
                                         .font(Ghostty.ui(Ghostty.fontSize - 3))
-                                        .foregroundStyle(.yellow)
+                                        .foregroundStyle(theme.palette.attention)
                                 }
                             }
+                            .listRowSeparator(.hidden)
                         }
                     }
                 }
-                .listStyle(.sidebar)
+                // .sidebar pins its rows to the system's source-list height, which no
+                // inset or row-height knob gets under; .plain is what lets the tree be
+                // as dense as a terminal's own line spacing.
+                .listStyle(.plain)
                 .focused($focus, equals: .sidebar)
                 .onChange(of: model.selection) { _, id in
                     model.selectionChanged()
@@ -137,7 +148,7 @@ struct SidebarView: View {
                 } else {
                     Text("·").foregroundStyle(.secondary).font(Ghostty.ui())
                 }
-                Text(seg).foregroundStyle(.blue).font(Ghostty.ui())
+                Text(seg).foregroundStyle(theme.palette.folder).font(Ghostty.ui())
             }
 
         case let .elide(_, _, depth):
@@ -156,7 +167,7 @@ struct SidebarView: View {
                 StatusDot(online: model.isOnline(vm),
                           status: info?.status ?? .stopped,
                           active: model.activeDots.contains(key))
-                Text(info?.agent ?? "?").foregroundStyle(.purple).font(Ghostty.ui())
+                Text(info?.agent ?? "?").foregroundStyle(theme.palette.agent).font(Ghostty.ui())
                 Text(info?.name ?? id)
                     .font(Ghostty.ui())
                     .lineLimit(1).truncationMode(.tail)

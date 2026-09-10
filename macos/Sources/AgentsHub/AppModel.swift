@@ -72,6 +72,10 @@ final class AppModel: ObservableObject {
     /// than reaching into `@FocusState` from the model.
     @Published var requestSidebarFocus = false
     @Published private(set) var mounted: [SessionKey] = []
+    /// Who owns the keyboard, as ghostty sees it — SwiftUI's own `@FocusState` doesn't
+    /// notice a click landing straight in the surface, and an indicator that lies is
+    /// worse than none.
+    @Published private(set) var terminalFocused = false
     @Published private(set) var activeDots: Set<SessionKey> = []
     @Published private(set) var configError: String?
 
@@ -165,10 +169,11 @@ final class AppModel: ObservableObject {
     private func onFrame(_ index: Int, _ frame: Resp) {
         switch frame {
         case let .sessions(list):
+            let previous = allRows
             vms[index].sessions = list
             apply(registry.sessions(vm: index, list, cols: pane.cols, rows: pane.rows))
             rebuild()
-            pruneSelection()
+            pruneSelection(near: previous)
         case let .exited(id, code):
             let key = SessionKey(vm: index, id: id)
             router.finish(key, code: code)
@@ -292,10 +297,20 @@ final class AppModel: ObservableObject {
         terminals[key]?.focus()
     }
 
-    private func pruneSelection() {
+    /// A killed session hands the selection to its nearest surviving neighbour, below
+    /// first: landing back at the top of the list means scrolling down again after
+    /// every kill.
+    private func pruneSelection(near previous: [SidebarRow]) {
         if let selection, allRows.contains(where: { $0.id == selection }) { return }
-        guard let first = allRows.first(where: { $0.key != nil })?.id else { return }
-        selection = first
+        let survivors = Set(allRows.compactMap { $0.key == nil ? nil : $0.id })
+        let neighbour = selection
+            .flatMap { id in previous.firstIndex { $0.id == id } }
+            .flatMap { i in
+                previous[(i + 1)...].first { survivors.contains($0.id) }
+                    ?? previous[..<i].last { survivors.contains($0.id) }
+            }
+        guard let next = neighbour?.id ?? allRows.first(where: { $0.key != nil })?.id else { return }
+        selection = next
         selectionChanged()
     }
 
@@ -433,9 +448,14 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// ponytail: focus rides the dot timer rather than a Combine subscription per
+    /// terminal, so it can lag a quarter second. Subscribe to `state.$isFocused` if that
+    /// ever shows.
     private func refreshDots() {
         let next = router.active(within: activityWindow)
         if next != activeDots { activeDots = next }
+        let focused = selectedKey.flatMap { terminals[$0]?.state.isFocused } ?? false
+        if focused != terminalFocused { terminalFocused = focused }
     }
 
     func info(for key: SessionKey) -> SessionInfo? {
