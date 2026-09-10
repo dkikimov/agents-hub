@@ -22,8 +22,11 @@ async fn link(vm: &Vm) -> Result<(Rd, Wr, Option<tokio::process::Child>)> {
         }
         Some(host) => {
             let mut child = tokio::process::Command::new("ssh")
+                // -A so the remote `stdio` has an $SSH_AUTH_SOCK to relink agent.sock to,
+                // without depending on ForwardAgent being set for this host in
+                // ~/.ssh/config — which is where `add-vm` leaves a fresh VM.
                 // Never let a password prompt hang the TUI: keys/agent only.
-                .args(["-o", "BatchMode=yes", "-o", "ServerAliveInterval=20"])
+                .args(["-A", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=20"])
                 .arg(host)
                 .arg(&vm.remote_bin)
                 .arg("stdio")

@@ -37,15 +37,15 @@ pub fn sock_path() -> PathBuf {
     state_dir().join("sock")
 }
 
-/// Stable stand-in for the forwarded SSH agent, which lives at a different
-/// `/tmp/ssh-*/agent.<pid>` on every connection. `Hub::spawn` hands this path to
-/// sessions as `$SSH_AUTH_SOCK`.
-pub fn agent_sock_path() -> PathBuf {
-    state_dir().join("agent.sock")
+/// Where `stdio` records the forwarded agent for the daemon to find. Sessions never see
+/// this path — they get `agent.sock`, which the daemon proxies onto whatever this points
+/// at now, so a session outlives the connection that supplied the key.
+pub const AGENT_UPSTREAM: &str = "agent.upstream";
+
+pub fn agent_upstream_path() -> PathBuf {
+    state_dir().join(AGENT_UPSTREAM)
 }
 
-/// ponytail: the link dangles while no client is connected, so a session running
-/// git/ssh right then still fails; have the daemon proxy the agent if that bites.
 fn relink_agent_sock(sock: &Path, link: &Path) -> Result<()> {
     // A session's own $SSH_AUTH_SOCK is already this link; symlinking it onto
     // itself would ELOOP the agent for every session on the box.
@@ -99,10 +99,10 @@ pub async fn connect_local() -> Result<UnixStream> {
 
 /// What SSH runs on the remote: a dumb pipe between stdin/stdout and the local socket.
 /// This process is the only one on the VM that sees the forwarded agent — the daemon
-/// was started at boot by systemd — so it re-points the stable link on every connect.
+/// was started at boot by systemd — so it re-points the upstream link on every connect.
 async fn stdio() -> Result<()> {
     if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
-        let _ = relink_agent_sock(Path::new(&sock), &agent_sock_path());
+        let _ = relink_agent_sock(Path::new(&sock), &agent_upstream_path());
     }
     let mut sock = connect_local().await?;
     let mut pipe = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());

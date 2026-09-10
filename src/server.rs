@@ -268,8 +268,10 @@ impl Hub {
         cmd.cwd(expand_home(cwd));
         // Agent CLIs render badly without this.
         cmd.env("TERM", "xterm-256color");
-        // Present only once a client has connected over SSH; the daemon's own env
-        // has no agent, having been started at boot.
+        // The proxy, not the forwarded socket: this path outlives every client, so the
+        // env frozen here stays valid across reconnects instead of naming a `/tmp/ssh-*`
+        // that dies with the connection that made it. Absent only if the proxy failed
+        // to bind, in which case sessions go without rather than get a dead path.
         let agent = self.dir.join("agent.sock");
         if agent.symlink_metadata().is_ok() {
             cmd.env("SSH_AUTH_SOCK", agent);
@@ -524,9 +526,51 @@ async fn serve_conn(hub: Arc<Hub>, stream: UnixStream) {
     }
 }
 
+/// Where the forwarded agent actually is *right now*: the link the newest `stdio` left,
+/// else the daemon's own env, which is what a Mac daemon started from the client inherits.
+/// Never the proxy itself — a session's `$SSH_AUTH_SOCK` is `agent.sock`, and running
+/// `agents-hub stdio` from inside one would otherwise point the proxy at its own tail.
+fn current_agent(dir: &Path) -> Option<PathBuf> {
+    let proxy = dir.join("agent.sock");
+    std::fs::read_link(dir.join(crate::AGENT_UPSTREAM))
+        .ok()
+        .or_else(|| std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from))
+        .filter(|p| *p != proxy)
+}
+
+/// The forwarded agent lives at a different `/tmp/ssh-*/agent.<pid>` on every SSH
+/// connection and dies with it, so no session can hold that path. The daemon owns
+/// `agent.sock` for the life of the box instead and forwards each connection to whatever
+/// is live now.
+///
+/// This cannot conjure an agent while no client is connected — the keys are on the user's
+/// Mac and there is no channel to them — and such a connection is simply closed, which
+/// the guest reports as "Error connecting to agent". What it does fix is permanence:
+/// `Hub::spawn` freezes `$SSH_AUTH_SOCK` for the life of the process, so a session that
+/// started while the socket was missing previously had no agent *ever*. Now the path is
+/// always there and goes live again on the next client, with no session restart.
+async fn agent_proxy(dir: PathBuf) -> Result<()> {
+    let sock = dir.join("agent.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock)
+        .with_context(|| format!("binding {}", sock.display()))?;
+    std::fs::set_permissions(&sock, PermissionsExt::from_mode(0o600))?;
+
+    loop {
+        let (mut client, _) = listener.accept().await?;
+        let dir = dir.clone();
+        tokio::spawn(async move {
+            let Some(path) = current_agent(&dir) else { return };
+            let Ok(mut up) = UnixStream::connect(&path).await else { return };
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
+        });
+    }
+}
+
 pub async fn serve(dir: PathBuf, cfg: Config) -> Result<()> {
     std::fs::create_dir_all(dir.join("logs"))?;
     let _ = std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700));
+    let proxy_dir = dir.clone();
 
     let sock = dir.join("sock");
     if sock.exists() {
@@ -542,6 +586,14 @@ pub async fn serve(dir: PathBuf, cfg: Config) -> Result<()> {
     std::fs::set_permissions(&sock, PermissionsExt::from_mode(0o600))?;
     eprintln!("agents-hub: listening on {}", sock.display());
 
+    // Its own task: a wedged agent must never stall the frame loop, and a bind failure
+    // is survivable — `spawn` tests for the socket, so sessions just go without.
+    tokio::spawn(async move {
+        if let Err(e) = agent_proxy(proxy_dir).await {
+            eprintln!("agents-hub: ssh-agent proxy down: {e:#}");
+        }
+    });
+
     let hub = Arc::new(Hub::new(dir, cfg));
     loop {
         let (stream, _) = listener.accept().await?;
@@ -552,6 +604,7 @@ pub async fn serve(dir: PathBuf, cfg: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn read_tail_returns_only_the_tail() {
@@ -586,6 +639,87 @@ mod tests {
         // Appends still land after a rotation — a lost fd would show up as a dead log.
         log.append(b"after");
         assert!(read_tail(&path, 5) == b"after");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Echoes one payload back, standing in for `ssh-agent` on the far end.
+    async fn fake_agent(path: PathBuf) {
+        let l = UnixListener::bind(&path).unwrap();
+        while let Ok((mut c, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let mut b = [0u8; 64];
+                if let Ok(n) = c.read(&mut b).await {
+                    let _ = c.write_all(&b[..n]).await;
+                }
+            });
+        }
+    }
+
+    async fn dial(sock: &Path) -> Option<UnixStream> {
+        for _ in 0..50 {
+            if let Ok(s) = UnixStream::connect(sock).await {
+                return Some(s);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn the_agent_proxy_follows_the_live_socket_and_survives_it_dying() {
+        let dir = std::env::temp_dir().join(format!("ah-agent-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sock, upstream) = (dir.join("agent.sock"), dir.join(crate::AGENT_UPSTREAM));
+
+        // Nothing forwarded yet, and no agent in this process' env either: a session
+        // spawned now must still get a path that works *later*.
+        std::env::remove_var("SSH_AUTH_SOCK");
+        tokio::spawn(agent_proxy(dir.clone()));
+        let mut c = dial(&sock).await.expect("proxy binds before any agent exists");
+        c.write_all(b"ping").await.unwrap();
+        assert_eq!(c.read(&mut [0u8; 4]).await.unwrap(), 0, "no agent yet, so no reply");
+
+        // A client connects: `stdio` points the upstream link at its forwarded socket.
+        let first = dir.join("ssh-aaa");
+        tokio::spawn(fake_agent(first.clone()));
+        dial(&first).await.expect("fake agent came up");
+        relink(&first, &upstream);
+
+        let mut c = UnixStream::connect(&sock).await.unwrap();
+        c.write_all(b"ping").await.unwrap();
+        let mut b = [0u8; 4];
+        c.read_exact(&mut b).await.unwrap();
+        assert_eq!(&b, b"ping", "the same stable path now reaches a live agent");
+
+        // That connection drops and a new one arrives at a different /tmp path — the
+        // case that used to leave every running session signing against a dead socket.
+        std::fs::remove_file(&first).unwrap();
+        let second = dir.join("ssh-bbb");
+        tokio::spawn(fake_agent(second.clone()));
+        dial(&second).await.expect("second fake agent came up");
+        relink(&second, &upstream);
+
+        let mut c = UnixStream::connect(&sock).await.unwrap();
+        c.write_all(b"pong").await.unwrap();
+        let mut b = [0u8; 4];
+        c.read_exact(&mut b).await.unwrap();
+        assert_eq!(&b, b"pong", "sessions follow the new agent without restarting");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn relink(target: &Path, link: &Path) {
+        let _ = std::fs::remove_file(link);
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[test]
+    fn the_proxy_never_forwards_to_itself() {
+        let dir = std::env::temp_dir().join(format!("ah-loop-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // What a session sees, so `agents-hub stdio` run *inside* one records this.
+        relink(&dir.join("agent.sock"), &dir.join(crate::AGENT_UPSTREAM));
+        assert_eq!(current_agent(&dir), None, "forwarding to our own socket is a loop");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
