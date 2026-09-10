@@ -20,11 +20,7 @@ struct NewSessionSheet: View {
             Text("New session on \(model.vms[safe: model.currentVM]?.name ?? "?")")
                 .font(Ghostty.ui(Ghostty.fontSize + 1, weight: .bold))
 
-            Picker("Agent", selection: $agent) {
-                ForEach(model.agentNames, id: \.self) { Text($0).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .disabled(model.agentNames.isEmpty)
+            LabeledContent("Agent") { agentPicker }
 
             LabeledContent("Name") {
                 TextField(defaultName(cwd: cwd, agent: agent), text: $name)
@@ -40,6 +36,9 @@ struct NewSessionSheet: View {
                             highlighted = 0
                         }
                         .onSubmit(submit)
+                        .onKeyPress(.downArrow) { moveHighlight(1) }
+                        .onKeyPress(.upArrow) { moveHighlight(-1) }
+                        .onKeyPress(.tab) { acceptHighlighted() }
                     if !matches.isEmpty {
                         completionMenu
                     }
@@ -68,23 +67,77 @@ struct NewSessionSheet: View {
         }
     }
 
+    /// Command-digit rather than a segmented `Picker`: an NSSegmentedControl is reachable
+    /// only by mouse unless Full Keyboard Access is on, and this modal has to be typeable.
+    private var agentPicker: some View {
+        HStack(spacing: 4) {
+            ForEach(Array(model.agentNames.enumerated()), id: \.element) { i, name in
+                Button { agent = name } label: { segment(name, index: i) }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(shortcut(i))
+            }
+            Spacer()
+        }
+    }
+
+    private func segment(_ name: String, index: Int) -> some View {
+        HStack(spacing: 5) {
+            Text(name)
+            if shortcut(index) != nil {
+                Text("⌘\(index + 1)")
+                    .font(Ghostty.ui(Ghostty.fontSize - 3))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 8).padding(.vertical, 3)
+        .background(name == agent ? Color.accentColor.opacity(0.35) : Color.secondary.opacity(0.15))
+        .cornerRadius(4)
+        .contentShape(Rectangle())
+    }
+
+    private func shortcut(_ index: Int) -> KeyboardShortcut? {
+        guard index < 9 else { return nil }
+        return KeyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+    }
+
     private var completionMenu: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(matches.prefix(50).enumerated()), id: \.element) { i, dir in
-                    Text(dir)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(i == highlighted ? Color.accentColor.opacity(0.25) : .clear)
-                        .contentShape(Rectangle())
-                        .onTapGesture { accept(dir) }
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(displayed.enumerated()), id: \.element) { i, dir in
+                        Text(dir)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(i == highlighted ? Color.accentColor.opacity(0.25) : .clear)
+                            .contentShape(Rectangle())
+                            .onTapGesture { accept(dir) }
+                            .id(dir)
+                    }
                 }
+            }
+            .onChange(of: highlighted) { _, i in
+                guard let dir = displayed[safe: i] else { return }
+                proxy.scrollTo(dir)
             }
         }
         // Six rows, as CWD_MENU was.
         .frame(maxHeight: 120)
         .background(.quaternary)
         .cornerRadius(4)
+    }
+
+    private var displayed: [String] { Array(matches.prefix(50)) }
+
+    private func moveHighlight(_ delta: Int) -> KeyPress.Result {
+        guard !displayed.isEmpty else { return .ignored }
+        highlighted = min(max(highlighted + delta, 0), displayed.count - 1)
+        return .handled
+    }
+
+    private func acceptHighlighted() -> KeyPress.Result {
+        guard let dir = displayed[safe: highlighted] else { return .ignored }
+        accept(dir)
+        return .handled
     }
 
     /// Ends on `/` so the menu immediately offers that directory's own children.
