@@ -89,9 +89,6 @@ struct SidebarView: View {
                 }
             }
             .listStyle(.sidebar)
-            // The terminal's own font, so the list beside it reads as one surface
-            // rather than two apps stapled together.
-            .font(Ghostty.ui())
             .focused($focus, equals: .sidebar)
             .onChange(of: model.selection) { _, _ in model.selectionChanged() }
             .modifier(VimKeys(model: model, focus: $focus, filterFocused: $filterFocused))
@@ -130,15 +127,15 @@ struct SidebarView: View {
                     }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
                 } else {
-                    Text("·").foregroundStyle(.secondary).font(.system(size: 11))
+                    Text("·").foregroundStyle(.secondary).font(Ghostty.ui())
                 }
-                Text(seg).foregroundStyle(.blue)
+                Text(seg).foregroundStyle(.blue).font(Ghostty.ui())
             }
 
         case let .elide(_, _, depth):
             HStack(spacing: 4) {
                 indent(depth)
-                Text("…").foregroundStyle(.secondary)
+                Text("…").foregroundStyle(.secondary).font(Ghostty.ui())
             }
             // Deletes App::step's skip-the-inert-row loop: the list just won't land here.
             .selectionDisabled()
@@ -151,8 +148,10 @@ struct SidebarView: View {
                 StatusDot(online: model.isOnline(vm),
                           status: info?.status ?? .stopped,
                           active: model.activeDots.contains(key))
-                Text(info?.agent ?? "?").foregroundStyle(.purple)
-                Text(info?.name ?? id).lineLimit(1).truncationMode(.tail)
+                Text(info?.agent ?? "?").foregroundStyle(.purple).font(Ghostty.ui())
+                Text(info?.name ?? id)
+                    .font(Ghostty.ui())
+                    .lineLimit(1).truncationMode(.tail)
             }
         }
     }

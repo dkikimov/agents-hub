@@ -11,6 +11,11 @@ import SwiftUI
 struct TerminalPane: View {
     @ObservedObject var model: AppModel
 
+    /// Ghostty's own `window-padding-*` is left alone: it comes from the user's config
+    /// and applies inside the surface, so adding to it there would double whatever they
+    /// chose. This is the app's own breathing room around the grid.
+    private let inset = EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10)
+
     var body: some View {
         ZStack {
             if model.mounted.isEmpty {
@@ -25,7 +30,11 @@ struct TerminalPane: View {
                 }
             }
         }
+        .padding(inset)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // The terminal's own colour, so the inset reads as part of the terminal rather
+        // than a frame drawn around it.
+        .background(Ghostty.background)
     }
 
     private var placeholder: some View {

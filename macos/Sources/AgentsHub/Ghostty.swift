@@ -101,6 +101,35 @@ enum Ghostty {
         }
         return .custom(fontFamily, fixedSize: size).weight(weight)
     }
+
+    /// The terminal's own background, so the padding around the surface reads as part of
+    /// the terminal instead of a border around it. `nil` leaves the window's own
+    /// material showing, which is the right answer when there is no config to match.
+    static let background: Color? = {
+        guard let raw = configValue("background"), let color = Color(ghosttyHex: raw) else {
+            return nil
+        }
+        // Ghostty draws its surface at this opacity; an opaque pad beside it would
+        // show as a visible rectangle over a wallpaper.
+        let opacity = configValue("background-opacity").flatMap(Double.init) ?? 1
+        return color.opacity(max(0, min(1, opacity)))
+    }()
+}
+
+extension Color {
+    /// `#1e1e1e`, `1e1e1e` or the three-digit short form. Named colours are left to the
+    /// caller's fallback — ghostty knows hundreds and this only needs the common case.
+    init?(ghosttyHex raw: String) {
+        var hex = raw.trimmingCharacters(in: .whitespaces)
+        if hex.hasPrefix("#") { hex.removeFirst() }
+        if hex.count == 3 { hex = hex.map { "\($0)\($0)" }.joined() }
+        guard hex.count == 6, let value = UInt32(hex, radix: 16) else { return nil }
+        self.init(
+            red: Double((value >> 16) & 0xFF) / 255,
+            green: Double((value >> 8) & 0xFF) / 255,
+            blue: Double(value & 0xFF) / 255
+        )
+    }
 }
 
 /// System / light / dark, because a terminal that follows a light system appearance
