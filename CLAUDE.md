@@ -9,14 +9,26 @@ remote VMs from one TUI, grouped by VM name. Sessions and their scrollback survi
 
 ## Commands
 
+`make` on its own lists every target. The common ones:
+
 ```bash
-cargo build
-cargo test                                     # 49 unit + 1 integration
+make tui                                       # the Rust binary (TUI + serve + stdio)
+make app                                       # AgentsHub.app, the native macOS client
+make test                                      # cargo test + swift test
+make run DEBUG=1                               # build unoptimised and launch the app
+make vm HOST=buildbox                          # provision a remote over SSH
+```
+
+Underneath, and for anything narrower than a whole suite:
+
+```bash
+cargo test                                     # 71 unit + 1 integration
 cargo test --test roundtrip                    # integration only (spawns real daemons + PTYs)
 cargo test tui::event::                        # one module's tests
 cargo test key_bytes_match_a_real_terminal     # single test by name
 cargo clippy --all-targets                     # kept clean
 cargo install --path . --locked                # --locked matters, see "vt100" below
+cd macos && swift test                         # the Swift client's pure half, ~0.3s
 ```
 
 `AGENTS_HUB_DIR` and `AGENTS_HUB_CONFIG` override the state dir and config path. Always set
@@ -50,6 +62,17 @@ One binary, three roles (`src/main.rs` dispatches on `argv[1]`):
 
 `src/setup.rs` is the `install-service` / `add-vm` provisioning, which runs once and
 never during normal operation — keep it out of the runtime files.
+
+`macos/` is a second client for the same daemon, speaking the same protocol over the same
+`agents-hub stdio` transport — local VMs included, so it has no AF_UNIX path of its own.
+`AgentsHubCore` is the pure half (codec, framing, cwd tree, the attach-set rules) and
+tests in ~0.3s with no GPU; `Sources/AgentsHub` is SwiftUI plus libghostty, which it
+touches in exactly two files so an unstable API stays a two-file diff. Terminals load the
+user's own ghostty config, so a change to font or theme belongs there, not here.
+
+**Any protocol change now has two clients to update.** `src/proto.rs` and
+`macos/Sources/AgentsHubCore/Proto.swift` are the same contract written twice, and each
+has a round-trip test that fails loudly rather than dropping frames.
 
 Inside `src/tui/`, the split is by *who is allowed to mutate what*:
 
