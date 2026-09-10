@@ -20,6 +20,8 @@ struct AgentsHubApp: App {
                 .onDisappear { model.stop() }
         }
         .defaultSize(width: 1280, height: 820)
+        // One short band instead of titlebar-plus-toolbar; the header is a line of text.
+        .windowToolbarStyle(.unifiedCompact)
         .commands {
             CommandGroup(after: .newItem) {
                 Button("New Session…") { model.sheet = .newSession }
@@ -91,28 +93,34 @@ struct RootView: View {
     @Environment(\.colorScheme) private var systemScheme
     @FocusState private var focus: FocusTarget?
     @AppStorage("theme") private var theme = Theme.classic
+    @AppStorage("sidebarWidth") private var sidebarWidth = 270.0
+    @State private var widthAtDragStart: Double?
 
     private var scheme: ColorScheme { appearance.colorScheme ?? systemScheme }
 
     var body: some View {
-        NavigationSplitView {
+        // Neither split view fits: NavigationSplitView draws its sidebar column as an inset
+        // rounded card with a hairline outline that no list style or background gets under,
+        // and HSplitView's divider is a hardcoded black NSSplitView draws itself. Two panes
+        // and a `Divider` is the whole requirement, so it is the whole implementation.
+        HStack(spacing: 0) {
             SidebarView(model: model, focus: $focus)
-                .navigationSplitViewColumnWidth(min: 190, ideal: 270, max: 440)
-        } detail: {
+                .frame(width: sidebarWidth)
+            splitHandle
             VStack(spacing: 0) {
-                header
-                Divider()
                 TerminalPane(model: model)
                     .focused($focus, equals: .terminal)
                     .focusRing(model.terminalFocused ? theme.palette.accent : .clear)
                 Divider()
                 statusBar
             }
-            // No `navigationTitle`: NavigationSplitView draws it into the toolbar in the
-            // system font, which is the one seam you notice above a monospaced UI.
-            // `header` carries the same information in the terminal's own font.
-            .withoutToolbarTitle()
+            .frame(maxWidth: .infinity)
         }
+        // No `navigationTitle`: the window would draw it in the system font, which is the
+        // one seam you notice above a monospaced UI. `header` carries the same information
+        // in the terminal's own font, in the titlebar the window already reserves.
+        .withoutToolbarTitle()
+        .toolbar { headerItem }
         .preferredColorScheme(appearance.colorScheme)
         // The terminal has its own notion of light/dark: a ghostty config using
         // `theme = "light:…,dark:…"` needs telling, and so does "Apple System Colors".
@@ -133,15 +141,43 @@ struct RootView: View {
         }
     }
 
-    private var title: String {
-        guard let info = model.selectedInfo else { return "agents-hub" }
-        return "\(info.agent) · \(info.name)"
+    /// The `Divider` is the visible pane edge; the clear strip over it is the grab area,
+    /// wider than a hairline because a 1pt drag target is a 1pt drag target.
+    private var splitHandle: some View {
+        Divider()
+            .overlay {
+                Color.clear
+                    .frame(width: 9)
+                    .contentShape(.rect)
+                    .onHover { $0 ? NSCursor.resizeLeftRight.push() : NSCursor.pop() }
+                    .gesture(
+                        DragGesture(minimumDistance: 1)
+                            .onChanged { drag in
+                                let start = widthAtDragStart ?? sidebarWidth
+                                widthAtDragStart = start
+                                sidebarWidth = min(440, max(190, start + drag.translation.width))
+                            }
+                            .onEnded { _ in widthAtDragStart = nil }
+                    )
+            }
     }
 
     private var subtitle: String {
         guard let key = model.selectedKey, let info = model.selectedInfo else { return "" }
         let vm = model.vms[safe: key.vm]?.name ?? "?"
         return info.status == .stopped ? "— \(vm), stopped · ⇧⌘R restarts" : "— \(vm)"
+    }
+
+    /// Tahoe gives every toolbar item a glass capsule, which reads as a button the header
+    /// is not; without it the item also stops being clipped to a control's width.
+    @ToolbarContentBuilder
+    private var headerItem: some ToolbarContent {
+        if #available(macOS 26.0, *) {
+            ToolbarItem(placement: .navigation) { header }
+                .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .navigation) { header }
+        }
     }
 
     private var header: some View {
@@ -160,10 +196,8 @@ struct RootView: View {
             } else {
                 Text("agents-hub").font(Ghostty.ui(weight: .bold)).foregroundStyle(.secondary)
             }
-            Spacer()
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .fixedSize()
     }
 
     private var statusBar: some View {
