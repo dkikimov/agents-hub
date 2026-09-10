@@ -20,6 +20,7 @@ SWIFT_FLAGS := -c $(PROFILE)
 RUST_BIN    := target/$(PROFILE)/agents-hub
 SWIFT_BIN   := macos/.build/$(PROFILE)/AgentsHub
 APP         := macos/.build/AgentsHub.app
+ICNS        := macos/.build/AppIcon.icns
 
 .DEFAULT_GOAL := help
 
@@ -73,12 +74,21 @@ app: $(APP)
 $(SWIFT_BIN):
 	cd macos && swift build $(SWIFT_FLAGS)
 
+# Not phony: the icon only changes when its generator does, and rendering ten
+# bitmaps on every build is a second nobody asked for.
+$(ICNS): macos/icon.swift
+	@mkdir -p macos/.build
+	@rm -rf macos/.build/AppIcon.iconset
+	swift macos/icon.swift macos/.build/AppIcon.iconset
+	iconutil -c icns macos/.build/AppIcon.iconset -o $(ICNS)
+
 # The bundle is not optional: a bare SwiftPM executable has no bundle identity,
 # and without one the terminal surface never takes keyboard focus.
 .PHONY: $(APP)
-$(APP): $(SWIFT_BIN) $(RUST_BIN) macos/Info.plist
+$(APP): $(SWIFT_BIN) $(RUST_BIN) $(ICNS) macos/Info.plist
 	@rm -rf $(APP)
-	@mkdir -p $(APP)/Contents/MacOS
+	@mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
+	@cp $(ICNS) $(APP)/Contents/Resources/AppIcon.icns
 	@cp $(SWIFT_BIN) $(APP)/Contents/MacOS/AgentsHub
 # Shipped inside the bundle so Bundle.main.url(forAuxiliaryExecutable:) finds it:
 # a GUI app launched from Finder gets the minimal launchd PATH and would never
