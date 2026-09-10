@@ -116,6 +116,7 @@ agents-hub — manage Claude Code / Codex / shell sessions across machines
   agents-hub                       launch the TUI
   agents-hub serve                 run the daemon (owns the PTYs)
   agents-hub stdio                 pipe stdin/stdout to the local daemon (used over SSH)
+  agents-hub config --json         print the parsed config (the macOS client reads this)
   agents-hub install-service       install launchd/systemd unit so the daemon survives reboot
   agents-hub install-service --enable
                                     also load/start it now
@@ -136,6 +137,13 @@ async fn main() -> Result<()> {
             server::serve(state_dir(), cfg).await
         }
         Some("stdio") => stdio().await,
+        // So the macOS client doesn't need a TOML parser of its own — one parser stays
+        // authoritative, and the client can never disagree with the daemon about a VM.
+        Some("config") if std::env::args().nth(2).as_deref() == Some("--json") => {
+            let cfg = Config::load(&config_path())?;
+            println!("{}", serde_json::to_string(&cfg)?);
+            Ok(())
+        }
         Some("install-service") => {
             let enable = std::env::args().nth(2).as_deref() == Some("--enable");
             setup::install_service(enable)

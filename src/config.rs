@@ -2,11 +2,11 @@
 //! machine reads `[agents]` to know how to launch things there.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub vm: Vec<Vm>,
@@ -14,7 +14,7 @@ pub struct Config {
     pub agents: BTreeMap<String, Agent>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Vm {
     /// Display name of the group. Rename freely; nothing else depends on it.
     pub name: String,
@@ -25,7 +25,7 @@ pub struct Vm {
     pub remote_bin: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Agent {
     pub command: Vec<String>,
     /// Used by `r` on a stopped session, so Claude Code can pick its thread back up.
