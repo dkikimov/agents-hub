@@ -25,6 +25,7 @@ public final class VMLink: @unchecked Sendable {
 
     private var proc: Process?
     private var io: DispatchIO?
+    private var errIO: DispatchIO?
     private var inPipe: Pipe?
     private var reader = LineReader()
     private var backoff: UInt64 = 1
@@ -151,17 +152,25 @@ public final class VMLink: @unchecked Sendable {
 
     /// ssh writes its diagnostics here and then usually exits; surfacing it is the
     /// difference between "offline" and "Permission denied (publickey)".
+    ///
+    /// Same `DispatchIO` as stdout rather than a thread blocked in `read`: that thread
+    /// parked for the life of the process, one per VM, to carry a line of text that
+    /// arrives once per connection.
     private func drainStderr(_ pipe: Pipe) {
-        let handle = pipe.fileHandleForReading
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            while let chunk = try? handle.read(upToCount: 4096), !chunk.isEmpty {
-                let text = String(decoding: chunk, as: UTF8.self)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard let self, !text.isEmpty else { continue }
-                self.queue.async { self.lastStderr = text }
-                NSLog("agents-hub: %@: %@", self.vm.name, text)
-            }
+        let io = DispatchIO(type: .stream,
+                            fileDescriptor: pipe.fileHandleForReading.fileDescriptor,
+                            queue: queue,
+                            cleanupHandler: { _ in })
+        io.setLimit(lowWater: 1)
+        io.read(offset: 0, length: Int.max, queue: queue) { [weak self] _, data, _ in
+            guard let self, let data, !data.isEmpty else { return }
+            let text = String(decoding: data, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return }
+            lastStderr = text
+            NSLog("agents-hub: %@: %@", vm.name, text)
         }
+        errIO = io
     }
 
     private var lastStderr: String?
@@ -173,8 +182,12 @@ public final class VMLink: @unchecked Sendable {
     }
 
     private func teardown(reason: String?, notify: Bool) {
+        // Both channels go before `proc`: the pipes die with the Process, and their fds
+        // with them, so a reader still holding one would be reading a reused descriptor.
         io?.close(flags: .stop)
         io = nil
+        errIO?.close(flags: .stop)
+        errIO = nil
         inPipe = nil
         if let p = proc, p.isRunning { p.terminate() }
         proc = nil
