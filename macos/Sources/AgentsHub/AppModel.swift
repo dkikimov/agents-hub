@@ -89,6 +89,8 @@ final class AppModel: ObservableObject {
     private var registry = SessionRegistry()
     private var links: [VMLink] = []
     private let router = TerminalRouter()
+    private var bells = BellWatch()
+    private let notifier = Notifier()
     private var collapsed: Set<FoldKey> = []
     private var pane: (cols: UInt16, rows: UInt16) = (80, 24)
     private var dotTimer: Timer?
@@ -115,6 +117,7 @@ final class AppModel: ObservableObject {
         vms = config.vm.map { VMState(config: $0) }
         collapsed = Self.loadFolds()
         rebuild()
+        notifier.start { [weak self] reason in self?.status = reason }
 
         links = config.vm.enumerated().map { index, vm in
             let link = VMLink(index: index, vm: vm)
@@ -201,6 +204,7 @@ final class AppModel: ObservableObject {
             case let .forget(key):
                 router.set(key, nil)
                 terminals[key] = nil
+                bells.forget(key)
                 mounted.removeAll { $0 == key }
             }
         }
@@ -456,6 +460,28 @@ final class AppModel: ObservableObject {
         if next != activeDots { activeDots = next }
         let focused = selectedKey.flatMap { terminals[$0]?.state.isFocused } ?? false
         if focused != terminalFocused { terminalFocused = focused }
+        notifyBells()
+    }
+
+    /// An agent rings the bell when it wants you, and ghostty's parser is what tells a real
+    /// BEL from the `ESC]0;…BEL` window title Claude Code sets on every turn.
+    ///
+    /// Every terminal is counted whether or not it will notify, so a bell you watched
+    /// arrive is spent rather than waiting to fire the moment you look away.
+    ///
+    /// ponytail: a session never selected since launch has no surface, so nothing parses
+    /// its bytes and it cannot ring — mounting is lazy and `pendingWrites` just accrues.
+    /// The fix is mounting every session at startup, at one GPU surface each; do it only
+    /// if the gap actually bites.
+    private func notifyBells() {
+        let watching = NSApp.isActive ? selectedKey : nil
+        for (key, terminal) in terminals {
+            guard bells.rang(key, count: terminal.liveBells), key != watching else { continue }
+            guard let session = info(for: key), let vm = vms[safe: key.vm] else { continue }
+            notifier.post(key,
+                          title: "\(session.agent) · \(session.name)",
+                          body: "\(vm.name) · \(session.cwd)")
+        }
     }
 
     func info(for key: SessionKey) -> SessionInfo? {

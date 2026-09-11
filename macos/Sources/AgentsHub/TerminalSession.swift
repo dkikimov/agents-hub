@@ -86,6 +86,18 @@ final class TerminalSession {
     let session: InMemoryTerminalSession
 
     private let gate = ReplayGate()
+    private var bellsAtReplayEnd: Int?
+
+    /// Bells rung since the attach replay finished.
+    ///
+    /// Replay is real scrollback fed to a real emulator, so a bell buried in it rings
+    /// exactly like a live one — counting from zero would fire a notification for every
+    /// answer already read, on every reconnect and every restart. Same hazard as
+    /// `ReplayGate`, so it is drawn from the same line.
+    var liveBells: Int {
+        guard let bellsAtReplayEnd else { return 0 }
+        return max(0, state.bellCount - bellsAtReplayEnd)
+    }
 
     /// `onGrid` reports the *real* grid ghostty laid out. It is the only trustworthy
     /// source: the cell size depends on the user's font, which comes from their own
@@ -138,6 +150,14 @@ final class TerminalSession {
             let held = gate.openUp()
             if held > 0 {
                 NSLog("agents-hub: held %d bytes of replay writeback for %@", held, name)
+            }
+            // A turn late, deliberately. Replay's bells are parsed by the time
+            // `waitForPendingOutput` returns but publish through
+            // `terminalRunOnMainNextTurn`, so they are sitting on the main queue ahead of
+            // this — which is FIFO, so reading the count here counts all of them.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                MainActor.assumeIsolated { self.bellsAtReplayEnd = self.state.bellCount }
             }
         }
     }
