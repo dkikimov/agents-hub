@@ -516,7 +516,10 @@ async fn serve_conn(hub: Arc<Hub>, stream: UnixStream) {
         match serde_json::from_str::<Req>(&line) {
             Ok(req) => {
                 if let Err(e) = hub.handle(req, &tx).await {
-                    let _ = tx.send(Resp::Error { msg: e.to_string() });
+                    // `{e:#}` not `{e}`: the cause is the whole message. A bare
+                    // "launching claude" hides the "No such file or directory" that
+                    // says it is a PATH problem.
+                    let _ = tx.send(Resp::Error { msg: format!("{e:#}") });
                 }
             }
             Err(e) => {

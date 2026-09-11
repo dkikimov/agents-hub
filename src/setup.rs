@@ -7,13 +7,20 @@ use crate::{config_path, home, state_dir};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
-fn launchd_plist(exe: &str, log: &str) -> String {
+/// Started through a login shell so the daemon sees the same PATH the agents need:
+/// launchd hands a job only `/usr/bin:/bin:/usr/sbin:/sbin`, so an agent installed in
+/// `~/.local/bin` or `~/.cargo/bin` fails to spawn with "launching claude: No such file".
+///
+/// `-i` as well as `-l`, unlike the systemd unit: a non-interactive zsh skips `.zshrc`,
+/// which is where a Mac's PATH usually gets set. The cost is whatever an interactive
+/// rc prints on a non-tty, which lands in `daemon.log` and is harmless.
+fn launchd_plist(exe: &str, log: &str, shell: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.agents-hub</string>
-  <key>ProgramArguments</key><array><string>{exe}</string><string>serve</string></array>
+  <key>ProgramArguments</key><array><string>{shell}</string><string>-lic</string><string>exec "$0" serve</string><string>{exe}</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardErrorPath</key><string>{log}</string>
@@ -48,13 +55,14 @@ pub fn install_service(enable: bool) -> Result<()> {
     let log = state_dir().join("daemon.log");
     let log = log.display().to_string();
 
+    let shell = std::env::var("SHELL").context("$SHELL not set")?;
+
     let (path, body) = if cfg!(target_os = "macos") {
         (
             home().join("Library/LaunchAgents/com.agents-hub.plist"),
-            launchd_plist(&exe, &log),
+            launchd_plist(&exe, &log, &shell),
         )
     } else {
-        let shell = std::env::var("SHELL").context("$SHELL not set")?;
         (
             home().join(".config/systemd/user/agents-hub.service"),
             systemd_unit(&exe, &shell),
@@ -185,9 +193,12 @@ mod tests {
     }
 
     #[test]
-    fn macos_service_names_the_binary_and_its_log() {
-        let plist = launchd_plist("/opt/bin/agents-hub", "/tmp/daemon.log");
-        assert!(plist.contains("<string>/opt/bin/agents-hub</string><string>serve</string>"));
+    fn macos_service_starts_daemon_from_login_shell() {
+        let plist = launchd_plist("/opt/bin/agents-hub", "/tmp/daemon.log", "/bin/zsh");
+        assert!(plist.contains(
+            "<string>/bin/zsh</string><string>-lic</string>\
+             <string>exec \"$0\" serve</string><string>/opt/bin/agents-hub</string>"
+        ));
         assert!(plist.contains("<key>StandardErrorPath</key><string>/tmp/daemon.log</string>"));
     }
 
