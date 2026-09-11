@@ -95,6 +95,8 @@ final class AppModel: ObservableObject {
     private var pane: (cols: UInt16, rows: UInt16) = (80, 24)
     private var dotTimer: Timer?
     private var requestedDirs: Set<String> = []
+    private var windowVisible = true
+    private weak var paneWindow: NSWindow?
 
     /// Matches `mod.rs`'s ACTIVITY_WINDOW.
     private let activityWindow: TimeInterval = 1
@@ -134,6 +136,9 @@ final class AppModel: ObservableObject {
         dotTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshDots() }
         }
+        // Nothing here is deadline work, so let the OS coalesce the wakeup with whatever
+        // else it was going to run — four exact timer fires a second is pure idle energy.
+        dotTimer?.tolerance = 0.1
     }
 
     func stop() {
@@ -226,9 +231,7 @@ final class AppModel: ObservableObject {
         router.set(key, terminal.session)
         // A restarted session keeps its slot in the ZStack, so the surface is rebuilt in
         // place rather than the pane going blank.
-        if mounted.contains(key) {
-            terminal.state.isSurfaceVisible = (key == selectedKey)
-        }
+        if mounted.contains(key) { applySurfaceVisibility() }
     }
 
     // MARK: - selection and mounting
@@ -255,8 +258,38 @@ final class AppModel: ObservableObject {
     func selectionChanged() {
         guard let key = selectedKey else { return }
         if !mounted.contains(key) { mounted.append(key) }
-        for (k, t) in terminals {
-            t.state.isSurfaceVisible = (k == key)
+        applySurfaceVisibility()
+    }
+
+    func trackWindow(_ window: NSWindow?) {
+        paneWindow = window
+        refreshWindowVisibility()
+    }
+
+    /// Occlusion, not app activation: an agent you watch while typing in another app has
+    /// to keep drawing. Only a window that is genuinely off-screen — minimized, fully
+    /// covered, on another Space — stops its surfaces, and nothing else on macOS does it:
+    /// the package's `setApplicationActive` has a UIKit caller only, so without this the
+    /// display link runs at up to 120 Hz for a pane nobody can see.
+    ///
+    /// Polled rather than driven by `didChangeOcclusionState` alone, because AppKit posts
+    /// nothing when the window is first ordered in: the only reading available when the
+    /// view attaches is the one from before the window was on screen, and trusting it
+    /// leaves every pane dark for the session. No window yet means draw — a surface with
+    /// nowhere to draw is already the package's own stop condition.
+    private func refreshWindowVisibility() {
+        let visible = paneWindow.map { $0.occlusionState.contains(.visible) } ?? true
+        guard windowVisible != visible else { return }
+        windowVisible = visible
+        applySurfaceVisibility()
+    }
+
+    /// Exactly one surface draws, and only while it is on screen. Hidden surfaces keep
+    /// parsing — that is what still rings their bells.
+    private func applySurfaceVisibility() {
+        let drawing = windowVisible ? selectedKey : nil
+        for (key, terminal) in terminals where terminal.state.isSurfaceVisible != (key == drawing) {
+            terminal.state.isSurfaceVisible = (key == drawing)
         }
     }
 
@@ -456,6 +489,7 @@ final class AppModel: ObservableObject {
     /// terminal, so it can lag a quarter second. Subscribe to `state.$isFocused` if that
     /// ever shows.
     private func refreshDots() {
+        refreshWindowVisibility()
         let next = router.active(within: activityWindow)
         if next != activeDots { activeDots = next }
         let focused = selectedKey.flatMap { terminals[$0]?.state.isFocused } ?? false

@@ -35,6 +35,7 @@ struct TerminalPane: View {
         // The terminal's own colour, so the inset reads as part of the terminal rather
         // than a frame drawn around it.
         .background(Ghostty.background)
+        .background(WindowTracker { model.trackWindow($0) })
     }
 
     private var placeholder: some View {
@@ -47,4 +48,49 @@ struct TerminalPane: View {
         }
     }
 
+}
+
+/// Hands the model the window holding the panes, so it can ask whether that window is on
+/// screen. Sits in the pane's own background rather than the root view so it can only ever
+/// answer for the window the surfaces are in — the Settings window is one too.
+///
+/// The occlusion notification is a hint, not the source of truth: a view attaches before
+/// its window is ordered in, and AppKit posts nothing for that first appearance, so the
+/// state read here is always the one from before the window reached the screen. The model
+/// re-reads `occlusionState` on its own tick; the notification only makes coming back from
+/// hidden immediate rather than a tick late.
+private struct WindowTracker: NSViewRepresentable {
+    let onWindow: (NSWindow?) -> Void
+
+    func makeNSView(context _: Context) -> Tracker {
+        let tracker = Tracker()
+        tracker.onWindow = onWindow
+        return tracker
+    }
+
+    func updateNSView(_ tracker: Tracker, context _: Context) {
+        tracker.onWindow = onWindow
+    }
+
+    final class Tracker: NSView {
+        var onWindow: ((NSWindow?) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            NotificationCenter.default.removeObserver(self)
+            if let window {
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(report),
+                    name: NSWindow.didChangeOcclusionStateNotification,
+                    object: window
+                )
+            }
+            report()
+        }
+
+        @objc private func report() {
+            onWindow?(window)
+        }
+    }
 }
