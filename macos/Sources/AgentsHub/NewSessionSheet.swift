@@ -66,6 +66,9 @@ struct NewSessionSheet: View {
             model.forgetDirCache()
             model.requestDirs(cwd)
         }
+        // Both Start and Cancel land here, and `submit` has already read the dropped VM by
+        // the time it dismisses.
+        .onDisappear { model.clearDrop() }
     }
 
     /// Command-digit rather than a segmented `Picker`: an NSSegmentedControl is reachable

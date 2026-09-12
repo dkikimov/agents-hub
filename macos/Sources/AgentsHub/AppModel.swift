@@ -98,6 +98,12 @@ final class AppModel: ObservableObject {
     private var windowVisible = true
     private weak var paneWindow: NSWindow?
 
+    /// Set only while the New Session sheet is showing a dropped folder, and cleared when it
+    /// closes. It overrides the VM the selection implies, so cwd completion and `create` both
+    /// target the machine the path is actually on — every reader of `currentVM` is
+    /// sheet-scoped, which is what makes overriding it safe.
+    private var drop: (cwd: String, vm: Int?)?
+
     /// Matches `mod.rs`'s ACTIVITY_WINDOW.
     private let activityWindow: TimeInterval = 1
 
@@ -129,6 +135,12 @@ final class AppModel: ObservableObject {
             return link
         }
         links.forEach { $0.start() }
+
+        // Claimed here rather than from the scene's `.task`, so a folder can never arrive
+        // before there are VMs to route it to.
+        AppDelegate.onOpen = { [weak self] paths in self?.openFolders(paths) }
+        openFolders(AppDelegate.pending)
+        AppDelegate.pending = []
 
         // One timer for every dot, at a quarter of the Rust client's 16 ms frame rate:
         // SwiftUI redraws only what changed, so this only has to be fast enough to look
@@ -379,6 +391,21 @@ final class AppModel: ObservableObject {
         status = "starting \(agent) · \(name)…"
     }
 
+    /// A dropped folder is a path on *this* machine, so it goes to the local VM whatever the
+    /// sidebar selection is on — a remote would get a directory that does not exist there.
+    /// An all-remote config has no local VM, and then the selection decides as before.
+    func openFolders(_ paths: [String]) {
+        guard let path = paths.last else { return }
+        drop = (cwd: path, vm: vms.firstIndex { $0.config.isLocal })
+        forgetDirCache()
+        NSApp.activate()
+        // A turn later, not now: a cold-launched open lands while the scene is still coming
+        // up, and a sheet set before the window exists is dropped without a trace.
+        Task { @MainActor in sheet = .newSession }
+    }
+
+    func clearDrop() { drop = nil }
+
     func kill(_ key: SessionKey) {
         links[safe: key.vm]?.send(.kill(id: key.id))
         status = "killed \(key.id)"
@@ -395,8 +422,10 @@ final class AppModel: ObservableObject {
         sheet = .confirmKill(key, label: "\(info.agent) · \(info.name)")
     }
 
-    /// The VM a new session would land on: the one holding the selection, else the first.
+    /// The VM a new session would land on: the one a dropped folder lives on, else the one
+    /// holding the selection, else the first.
     var currentVM: Int {
+        if let vm = drop?.vm { return vm }
         if let selection, let row = allRows.first(where: { $0.id == selection }) {
             switch row {
             case let .folder(vm, _, _, _, _), let .elide(vm, _, _), let .session(vm, _, _):
@@ -406,9 +435,10 @@ final class AppModel: ObservableObject {
         return 0
     }
 
-    /// cwd to seed a new session with: the folder you are standing in, the one the
-    /// selected session runs in, else this VM's default.
+    /// cwd to seed a new session with: a dropped folder, the folder you are standing in, the
+    /// one the selected session runs in, else this VM's default.
     var newCwd: String {
+        if let cwd = drop?.cwd { return cwd }
         if let selection, let row = allRows.first(where: { $0.id == selection }) {
             switch row {
             case let .folder(_, path, _, _, _): return path

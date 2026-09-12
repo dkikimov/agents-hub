@@ -4,6 +4,15 @@
   <key>CFBundleExecutable</key><string>AgentsHub</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIdentifier</key><string>com.agents-hub.app</string>
+  <!-- What makes the Dock icon a drop target and lets `open -b` hand over a path.
+       Alternate rank keeps Finder the default handler for a double-clicked folder. -->
+  <key>CFBundleDocumentTypes</key>
+  <array><dict>
+    <key>CFBundleTypeName</key><string>Folder</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>LSItemContentTypes</key><array><string>public.folder</string></array>
+  </dict></array>
   <key>CFBundleName</key><string>agents-hub</string>
   <key>CFBundleDisplayName</key><string>agents-hub</string>
   <key>CFBundlePackageType</key><string>APPL</string>

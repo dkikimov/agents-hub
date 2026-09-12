@@ -1,9 +1,28 @@
 import AgentsHubCore
 import SwiftUI
 
+/// Folders arrive here from a Dock drop, Finder's Open With, and `agents-hub open`.
+/// `.onOpenURL` is not an option: it fires for URL schemes, not for a `CFBundleDocumentTypes`
+/// file open, which only AppKit's delegate sees.
+///
+/// A cold launch delivers the drop before the scene's `.task` has run `AppModel.start`, so an
+/// open with nobody yet to take it waits in `pending` until there is.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    @MainActor static var onOpen: (([String]) -> Void)?
+    @MainActor static var pending: [String] = []
+
+    func application(_ sender: NSApplication, open urls: [URL]) {
+        let paths = urls.filter(\.hasDirectoryPath).map(\.path)
+        Task { @MainActor in
+            if let onOpen = Self.onOpen { onOpen(paths) } else { Self.pending += paths }
+        }
+    }
+}
+
 @main
 struct AgentsHubApp: App {
     @StateObject private var model = AppModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @AppStorage("appearance") private var appearance = AppAppearance.dark
     @AppStorage("theme") private var theme = Theme.classic
 

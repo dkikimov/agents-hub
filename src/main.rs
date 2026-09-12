@@ -114,6 +114,8 @@ const HELP: &str = "\
 agents-hub — manage Claude Code / Codex / shell sessions across machines
 
   agents-hub                       launch the TUI
+  agents-hub --app gui             launch the macOS app instead
+  agents-hub open [path]           open a folder in the macOS app (default: .)
   agents-hub serve                 run the daemon (owns the PTYs)
   agents-hub stdio                 pipe stdin/stdout to the local daemon (used over SSH)
   agents-hub config --json         print the parsed config (the macOS client reads this)
@@ -128,10 +130,47 @@ config: ~/.config/agents-hub/config.toml
 state:  ~/.local/state/agents-hub/
 ";
 
+/// `--app tui|gui` wherever it appears, plus the leftover positional. Takes the arguments
+/// rather than reading argv so it stays a plain function call under test.
+fn app_args<I: Iterator<Item = String>>(
+    args: I,
+    gui_default: bool,
+) -> Result<(bool, Option<String>)> {
+    let (mut gui, mut path) = (gui_default, None);
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        if arg == "--app" {
+            gui = match args.next().as_deref() {
+                Some("gui") => true,
+                Some("tui") => false,
+                other => bail!("--app takes tui or gui, got '{}'", other.unwrap_or("nothing")),
+            };
+        } else {
+            path = Some(arg);
+        }
+    }
+    Ok((gui, path))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         None => tui::run().await,
+        Some("--app") => {
+            let (gui, _) = app_args(std::env::args().skip(1), false)?;
+            if gui {
+                setup::open_app(None)
+            } else {
+                tui::run().await
+            }
+        }
+        Some("open") => {
+            let (gui, path) = app_args(std::env::args().skip(2), true)?;
+            if !gui {
+                bail!("open targets the macOS app — a running TUI has no channel to receive a folder");
+            }
+            setup::open_app(Some(path.as_deref().unwrap_or(".")))
+        }
         Some("serve") => {
             let cfg = Config::load(&config_path())?;
             server::serve(state_dir(), cfg).await
@@ -187,5 +226,21 @@ mod tests {
             "a session's own SSH_AUTH_SOCK must not replace the link"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_flag_parses() {
+        let parse = |argv: &[&str], gui_default| {
+            app_args(argv.iter().map(|s| s.to_string()), gui_default)
+        };
+        assert_eq!(parse(&[], true).unwrap(), (true, None));
+        assert_eq!(parse(&["."], true).unwrap(), (true, Some(".".into())));
+        assert_eq!(
+            parse(&[".", "--app", "tui"], true).unwrap(),
+            (false, Some(".".into()))
+        );
+        assert_eq!(parse(&["--app", "gui"], false).unwrap(), (true, None));
+        assert!(parse(&["--app", "nonsense"], false).is_err());
+        assert!(parse(&["--app"], false).is_err());
     }
 }

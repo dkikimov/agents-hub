@@ -101,6 +101,25 @@ pub fn install_service(enable: bool) -> Result<()> {
     }
 }
 
+/// Hands a folder to AgentsHub.app through LaunchServices, which foregrounds an already
+/// running instance rather than starting a second one. `None` just launches it.
+///
+/// The path is canonicalized because `open` resolves a relative one against its own cwd,
+/// not ours — `agents-hub open .` would otherwise hand over `/`.
+pub fn open_app(path: Option<&str>) -> Result<()> {
+    let mut args = vec!["-b".to_string(), "com.agents-hub.app".to_string()];
+    if let Some(p) = path {
+        let abs = std::fs::canonicalize(p).with_context(|| format!("no such path: {p}"))?;
+        if !abs.is_dir() {
+            bail!("not a directory: {p}");
+        }
+        args.push(abs.display().to_string());
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run("/usr/bin/open", &argv)
+        .context("AgentsHub.app is not registered — run `make app`, then open it once")
+}
+
 /// The `[[vm]]` block appended to the local config by `add-vm`.
 fn vm_toml_block(name: &str, host: &str) -> String {
     format!("\n[[vm]]\nname = \"{name}\"\nssh  = \"{host}\"\n")
