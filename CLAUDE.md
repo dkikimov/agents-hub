@@ -142,6 +142,14 @@ work. `Run`'s fields are `Arc<Mutex<..>>` specifically to make that possible.
   the package pins `GHOSTTY_RESOURCES_DIR` to a bundle that ships no `themes/`, and it reads that
   env once at `ghostty_init`, so setting it later and reloading does nothing. `Ghostty.swift`
   retries without the `theme` line and feeds the colours back from `GhosttyThemeCatalog`.
+- **A ghostty keybind matches the character, not the key.** With a Cyrillic layout active ⌘V
+  is `cmd+м`, so ghostty's paste binding never fires — and typing still works, which makes it
+  read as "paste is flaky" rather than "bindings are layout-dependent". A dictation app that
+  inserts text by posting a synthetic ⌘V (MacWhisper) is dead in the water for the same
+  reason. `Ghostty.layoutProofBindings` adds `super+key_v` / `super+key_c` over the user's
+  config; physical triggers outrank character ones. The `physical:`-prefixed spelling
+  ghostty's own docs mention is rejected as `InvalidFormat` by the shipped build — use the
+  bare W3C code.
 - **A client's emulator only knows what the daemon replayed.** A mode the guest set once at
   startup is gone as soon as the log outgrows `REPLAY_BYTES`, so `Req::Attach` prepends
   `mode_prelude` — without it ⌘V arrives unbracketed and every newline submits. Anything else

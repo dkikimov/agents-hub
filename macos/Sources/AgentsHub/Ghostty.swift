@@ -13,7 +13,8 @@ import SwiftUI
 enum Ghostty {
     /// Ghostty's *own* config file, so a terminal in this app is the same terminal the
     /// user already configured — font, theme, colours, keybinds, opacity, all of it.
-    /// Anything set here instead would silently override it, so nothing is set here.
+    /// Anything set here instead would silently override it, so nothing is set here
+    /// beyond `layoutProofBindings`, which exists to keep ⌘V working at all.
     ///
     /// The macOS app support path wins because that is where Ghostty itself writes; the
     /// XDG path is the documented alternative. Note the `.ghostty` extension — the
@@ -56,9 +57,13 @@ enum Ghostty {
             return TerminalController { b in
                 b.withFontFamily("SF Mono")
                 b.withFontSize(13)
+                layoutProofBindings(&b)
             }
         }
-        let controller = TerminalController(configFilePath: path)
+        let controller = TerminalController(
+            configSource: .file(path),
+            terminalConfiguration: TerminalConfiguration(configure: layoutProofBindings)
+        )
         if controller.lastConfigurationIssue != nil,
            let text = try? String(contentsOfFile: path, encoding: .utf8) {
             if let theme = configValue("theme").flatMap(catalogTheme) {
@@ -71,6 +76,18 @@ enum Ghostty {
         }
         return controller
     }()
+
+    /// Ghostty matches a keybind against the *character* a layout produces, so with a
+    /// Cyrillic layout active ⌘V is `cmd+м` and nothing pastes — including the synthetic ⌘V
+    /// a dictation app sends, which is how this surfaced. A `physical:` trigger matches the
+    /// key itself on any layout and, per ghostty's docs, always outranks a character one, so
+    /// these two sit on top of whatever the user's own config binds. `key_v` is the W3C
+    /// `KeyV` spelling; the `physical:` prefix the docs also mention is rejected as
+    /// `InvalidFormat` by the shipped build.
+    private static func layoutProofBindings(_ b: inout TerminalConfiguration.Builder) {
+        b.withCustom("keybind", "super+key_v=paste_from_clipboard")
+        b.withCustom("keybind", "super+key_c=copy_to_clipboard")
+    }
 
     /// `theme = Dracula`, or ghostty's `theme = dark:Dracula,light:Alabaster`.
     private static func catalogTheme(_ value: String) -> TerminalTheme? {
