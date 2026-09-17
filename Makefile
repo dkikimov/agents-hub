@@ -90,6 +90,11 @@ $(APP): $(SWIFT_BIN) $(RUST_BIN) $(ICNS) macos/Info.plist
 	@mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	@cp $(ICNS) $(APP)/Contents/Resources/AppIcon.icns
 	@cp $(SWIFT_BIN) $(APP)/Contents/MacOS/AgentsHub
+# SwiftPM keeps a package's resources in a sibling .bundle rather than in the
+# executable, and `Bundle.module` traps rather than degrades when it is missing —
+# libghostty's terminfo and shell integration live in one, so a copy without it
+# dies before the first window.
+	@cp -R macos/.build/$(PROFILE)/*.bundle $(APP)/Contents/Resources/
 # Shipped inside the bundle so Bundle.main.url(forAuxiliaryExecutable:) finds it:
 # a GUI app launched from Finder gets the minimal launchd PATH and would never
 # see ~/.cargo/bin. It also makes client/daemon version skew impossible.
