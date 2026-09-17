@@ -29,21 +29,24 @@ struct NewSessionSheet: View {
             }
 
             LabeledContent("Directory") {
-                VStack(alignment: .leading, spacing: 0) {
-                    TextField("~/path", text: $cwd)
-                        .textFieldStyle(.roundedBorder)
-                        .onChange(of: cwd) { _, new in
-                            model.requestDirs(new)
-                            highlighted = 0
-                        }
-                        .onSubmit(submit)
-                        .onKeyPress(.downArrow) { moveHighlight(1) }
-                        .onKeyPress(.upArrow) { moveHighlight(-1) }
-                        .onKeyPress(.tab) { acceptHighlighted() }
-                    if !matches.isEmpty {
-                        completionMenu
+                TextField("~/path", text: $cwd)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: cwd) { _, new in
+                        model.requestDirs(new)
+                        highlighted = 0
                     }
-                }
+                    .onSubmit(submit)
+                    .onKeyPress(.downArrow) { moveHighlight(1) }
+                    .onKeyPress(.upArrow) { moveHighlight(-1) }
+                    .onKeyPress(.tab) { acceptHighlighted() }
+            }
+
+            // A row of its own, not part of the `LabeledContent` above: that row proposes a
+            // single line's height to its value view, and a `ScrollView` handed that
+            // collapses to nothing — the menu was in the view tree the whole time, zero
+            // points tall, which is why Tab completed against a list nobody could see.
+            if !matches.isEmpty {
+                completionMenu
             }
 
             HStack {
@@ -124,7 +127,9 @@ struct NewSessionSheet: View {
                 proxy.scrollTo(dir)
             }
         }
-        // Six rows, as CWD_MENU was.
+        // Six rows, as CWD_MENU was — but sized to the rows it actually has first, or the
+        // ScrollView has no height of its own to clamp.
+        .fixedSize(horizontal: false, vertical: true)
         .frame(maxHeight: 120)
         .background(.quaternary)
         .cornerRadius(4)
