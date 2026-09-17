@@ -223,6 +223,11 @@ struct RootView: View {
         HStack(spacing: 10) {
             Text(model.status).lineLimit(1).truncationMode(.middle)
             Spacer()
+            // Permanent rather than a status message: a config the terminal silently
+            // fell back from is wrong for the whole session, not for a moment.
+            if let issue = Ghostty.configIssue {
+                Text("ghostty config ignored").foregroundStyle(.orange).help(issue)
+            }
             if let info = model.selectedInfo, info.status == .stopped {
                 Button("Restart") { model.restartSelected() }.controlSize(.small)
             }

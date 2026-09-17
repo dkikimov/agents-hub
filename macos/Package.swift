@@ -26,6 +26,9 @@ let package = Package(
             dependencies: [
                 "AgentsHubCore",
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
+                // The ghostty theme catalog as Swift data, which is the only way to
+                // honour a `theme =` line: see Ghostty.swift.
+                .product(name: "GhosttyTheme", package: "libghostty-spm"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

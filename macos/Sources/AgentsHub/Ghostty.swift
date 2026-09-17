@@ -1,4 +1,5 @@
 import GhosttyTerminal
+import GhosttyTheme
 import SwiftUI
 
 /// The one shared `TerminalController`, and the only file besides `TerminalSession` that
@@ -34,6 +35,20 @@ enum Ghostty {
         return candidates.first { fm.fileExists(atPath: $0) }
     }()
 
+    /// Why the user's config was ignored, if it was. `nil` is the normal case. Reading it
+    /// builds the controller, which is what decides the answer.
+    static var configIssue: String? { controller.lastConfigurationIssue }
+
+    /// The user's config as written, and — when ghostty rejects that — the same config
+    /// with the one line it cannot satisfy here taken out.
+    ///
+    /// Ghostty resolves `theme = …` against `GHOSTTY_RESOURCES_DIR`, which the terminal
+    /// package pins to its own bundle: shell-integration and terminfo, no themes. A theme
+    /// it cannot find is a config diagnostic, *one* diagnostic makes it throw the whole
+    /// file away, and the user silently loses their font, their keybinds and
+    /// `copy-on-select` over a colour scheme. Pointing the env elsewhere does not help —
+    /// ghostty reads it once, before any of this runs — but the package ships the same
+    /// theme catalog as Swift data, so the colours survive the detour.
     static let controller: TerminalController = {
         guard let path = configPath else {
             // No Ghostty install to borrow from: a readable default rather than
@@ -43,8 +58,42 @@ enum Ghostty {
                 b.withFontSize(13)
             }
         }
-        return TerminalController(configFilePath: path)
+        let controller = TerminalController(configFilePath: path)
+        if controller.lastConfigurationIssue != nil,
+           let text = try? String(contentsOfFile: path, encoding: .utf8) {
+            if let theme = configValue("theme").flatMap(catalogTheme) {
+                controller.setTheme(theme)
+            }
+            controller.updateConfigSource(.generated(withoutTheme(text)))
+        }
+        if let issue = controller.lastConfigurationIssue {
+            NSLog("agents-hub: ghostty config ignored, using defaults: %@", issue)
+        }
+        return controller
     }()
+
+    /// `theme = Dracula`, or ghostty's `theme = dark:Dracula,light:Alabaster`.
+    private static func catalogTheme(_ value: String) -> TerminalTheme? {
+        var light: TerminalConfiguration?
+        var dark: TerminalConfiguration?
+        for part in value.split(separator: ",") {
+            let bits = part.split(separator: ":", maxSplits: 1)
+            let scheme = bits.count == 2 ? bits[0].trimmingCharacters(in: .whitespaces) : ""
+            let name = bits[bits.count - 1].trimmingCharacters(in: .whitespaces)
+            guard let config = GhosttyThemeCatalog.theme(named: name)?.toTerminalConfiguration()
+            else { continue }
+            if scheme != "light" { dark = config }
+            if scheme != "dark" { light = config }
+        }
+        guard let fallback = light ?? dark else { return nil }
+        return TerminalTheme(light: light ?? fallback, dark: dark ?? fallback)
+    }
+
+    private static func withoutTheme(_ text: String) -> String {
+        text.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { setting($0)?.key != "theme" }
+            .joined(separator: "\n")
+    }
 
     static func apply(_ scheme: ColorScheme) {
         // The package's ColorScheme initialiser is internal, so map it here.
@@ -65,17 +114,21 @@ enum Ghostty {
         else { return nil }
 
         for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { continue }
-            guard line[..<eq].trimmingCharacters(in: .whitespaces) == key else { continue }
-
-            var value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
-            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
-                value = String(value.dropFirst().dropLast())
-            }
-            if !value.isEmpty { return value }
+            guard let line = setting(raw), line.key == key, !line.value.isEmpty else { continue }
+            return line.value
         }
         return nil
+    }
+
+    /// One config line as ghostty reads it, or `nil` for a comment or a blank.
+    private static func setting(_ raw: Substring) -> (key: String, value: String)? {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { return nil }
+        var value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+            value = String(value.dropFirst().dropLast())
+        }
+        return (line[..<eq].trimmingCharacters(in: .whitespaces), value)
     }
 
     /// Only if AppKit can actually resolve it — a family ghostty falls back on would
