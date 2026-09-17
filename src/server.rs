@@ -104,6 +104,54 @@ fn read_tail(path: &Path, max: u64) -> Vec<u8> {
     buf
 }
 
+/// The bytes of `path` that `read_tail(path, tail)` would leave behind.
+fn read_head_before(path: &Path, tail: u64) -> Vec<u8> {
+    let Ok(f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut buf = Vec::new();
+    let _ = f.take(len.saturating_sub(tail)).read_to_end(&mut buf);
+    buf
+}
+
+/// The DEC private modes the guest turned on or off before the last `tail` bytes, written
+/// back out as the escape sequences that restore them.
+///
+/// A client builds its emulator purely from what we replay, so a mode set once at startup
+/// is simply gone the moment the log outgrows the replay window. Bracketed paste is the
+/// one that bites: without `ESC[?2004h` the client sends a paste unwrapped, and every
+/// newline in it submits the prompt. Alt-screen and focus reporting ride along for free,
+/// which is why this restores whatever it finds rather than a list of modes someone has
+/// to remember to extend.
+fn mode_prelude(path: &Path, tail: u64) -> Vec<u8> {
+    let head = read_head_before(path, tail);
+    let mut modes: std::collections::BTreeMap<u32, u8> = std::collections::BTreeMap::new();
+
+    let mut i = 0;
+    while let Some(off) = head.get(i..).and_then(|r| r.windows(3).position(|w| w == b"\x1b[?")) {
+        let params = i + off + 3;
+        let mut j = params;
+        while matches!(head.get(j), Some(b'0'..=b'9' | b';')) {
+            j += 1;
+        }
+        i = j + 1;
+        let Some(&final_byte @ (b'h' | b'l')) = head.get(j) else {
+            continue;
+        };
+        for p in head[params..j].split(|&b| b == b';') {
+            if let Some(n) = std::str::from_utf8(p).ok().and_then(|s| s.parse::<u32>().ok()) {
+                modes.insert(n, final_byte);
+            }
+        }
+    }
+
+    modes
+        .iter()
+        .flat_map(|(n, set)| format!("\x1b[?{n}{}", *set as char).into_bytes())
+        .collect()
+}
+
 /// One session's append-only log, which trims its own head once it outgrows `LOG_MAX`.
 /// Every write is best-effort: a full disk must not take the session down with it.
 struct SessionLog {
@@ -149,7 +197,10 @@ impl SessionLog {
         if len <= LOG_MAX {
             return;
         }
-        let tail = read_tail(&self.path, LOG_KEEP);
+        // Modes set before the part we keep would otherwise be unrecoverable — the bytes
+        // that carried them are about to be deleted, so `Attach` could never find them.
+        let mut tail = mode_prelude(&self.path, LOG_KEEP);
+        tail.extend_from_slice(&read_tail(&self.path, LOG_KEEP));
         let tmp = self.path.with_extension("trim");
         if std::fs::write(&tmp, &tail).is_ok() {
             let _ = std::fs::rename(&tmp, &self.path);
@@ -379,7 +430,8 @@ impl Hub {
             }
 
             Req::Attach { id, cols, rows } => {
-                let replay = read_tail(&self.log_path(&id), REPLAY_BYTES);
+                let mut replay = mode_prelude(&self.log_path(&id), REPLAY_BYTES);
+                replay.extend_from_slice(&read_tail(&self.log_path(&id), REPLAY_BYTES));
                 if !replay.is_empty() {
                     let _ = tx.send(Resp::Output {
                         id: id.clone(),
@@ -618,6 +670,33 @@ mod tests {
         assert_eq!(read_tail(&p, 4), b"6789");
         assert_eq!(read_tail(&p, 100), b"0123456789");
         assert!(read_tail(&dir.join("missing"), 10).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_prelude_restores_modes_the_replay_window_cut_off() {
+        let dir = std::env::temp_dir().join(format!("ah-modes-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.log");
+
+        // Claude Code's real preamble: bracketed paste, alt screen and focus reporting
+        // set once at startup, then a megabyte of output nobody replays.
+        let head = b"\x1b[?1049h\x1b[?2004h\x1b[?1004h\x1b[?25l\x1b[?25h";
+        let mut log = head.to_vec();
+        log.extend(std::iter::repeat_n(b'x', 100));
+        log.extend_from_slice(b"\x1b[?1000;1006h");
+        std::fs::write(&p, &log).unwrap();
+
+        // 1000/1006 are absent because they sit inside the window, where the replay
+        // itself carries them; 25 is `h` because the guest's last word wins.
+        assert_eq!(mode_prelude(&p, 20), b"\x1b[?25h\x1b[?1004h\x1b[?1049h\x1b[?2004h");
+
+        // Last value wins: a mode the guest turned back off must not come back on.
+        std::fs::write(&p, b"\x1b[?2004h\x1b[?2004l").unwrap();
+        assert_eq!(mode_prelude(&p, 0), b"\x1b[?2004l");
+
+        // Nothing to restore when the whole log is inside the window.
+        assert!(mode_prelude(&p, 1024).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

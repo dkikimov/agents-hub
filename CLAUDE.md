@@ -136,6 +136,11 @@ work. `Run`'s fields are `Arc<Mutex<..>>` specifically to make that possible.
 - **Never add `vt100` as a direct dependency.** Use `tui_term::vt100`. A separate version pin
   drifts on re-resolve (`cargo install` ignores `Cargo.lock` by default) and yields two vt100
   crates, at which point `PseudoTerminal::new` rejects your `Screen` with a confusing trait error.
+- **A client's emulator only knows what the daemon replayed.** A mode the guest set once at
+  startup is gone as soon as the log outgrows `REPLAY_BYTES`, so `Req::Attach` prepends
+  `mode_prelude` — without it ⌘V arrives unbracketed and every newline submits. Anything else
+  sticky and one-shot (alt screen, focus reporting) has the same shape; the prelude restores
+  whatever it finds rather than a list someone has to remember to extend.
 
 ## Conventions
 
