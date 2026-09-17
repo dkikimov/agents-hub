@@ -323,7 +323,7 @@ impl Hub {
         // env frozen here stays valid across reconnects instead of naming a `/tmp/ssh-*`
         // that dies with the connection that made it. Absent only if the proxy failed
         // to bind, in which case sessions go without rather than get a dead path.
-        let agent = self.dir.join("agent.sock");
+        let agent = self.dir.join(crate::AGENT_PROXY);
         if agent.symlink_metadata().is_ok() {
             cmd.env("SSH_AUTH_SOCK", agent);
         }
@@ -583,14 +583,17 @@ async fn serve_conn(hub: Arc<Hub>, stream: UnixStream) {
 
 /// Where the forwarded agent actually is *right now*: the link the newest `stdio` left,
 /// else the daemon's own env, which is what a Mac daemon started from the client inherits.
-/// Never the proxy itself — a session's `$SSH_AUTH_SOCK` is `agent.sock`, and running
-/// `agents-hub stdio` from inside one would otherwise point the proxy at its own tail.
-fn current_agent(dir: &Path) -> Option<PathBuf> {
-    let proxy = dir.join("agent.sock");
-    std::fs::read_link(dir.join(crate::AGENT_UPSTREAM))
+/// Never the proxy itself — a session's `$SSH_AUTH_SOCK` is the proxy, so a client run from
+/// inside one can leave a link pointing at our own tail. Such a link counts as *absent*
+/// rather than final: the env behind it is still a real agent, and a daemon that answers
+/// nothing takes the keys away from every session at once.
+fn current_agent(proxy: &Path, env: Option<PathBuf>) -> Option<PathBuf> {
+    let ours = |p: &PathBuf| !crate::same_socket(p, proxy);
+    std::fs::read_link(proxy.with_file_name(crate::AGENT_UPSTREAM))
         .ok()
-        .or_else(|| std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from))
-        .filter(|p| *p != proxy)
+        .filter(ours)
+        .or(env)
+        .filter(ours)
 }
 
 /// The forwarded agent lives at a different `/tmp/ssh-*/agent.<pid>` on every SSH
@@ -605,7 +608,7 @@ fn current_agent(dir: &Path) -> Option<PathBuf> {
 /// started while the socket was missing previously had no agent *ever*. Now the path is
 /// always there and goes live again on the next client, with no session restart.
 async fn agent_proxy(dir: PathBuf) -> Result<()> {
-    let sock = dir.join("agent.sock");
+    let sock = dir.join(crate::AGENT_PROXY);
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)
         .with_context(|| format!("binding {}", sock.display()))?;
@@ -613,9 +616,10 @@ async fn agent_proxy(dir: PathBuf) -> Result<()> {
 
     loop {
         let (mut client, _) = listener.accept().await?;
-        let dir = dir.clone();
+        let sock = sock.clone();
         tokio::spawn(async move {
-            let Some(path) = current_agent(&dir) else { return };
+            let env = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
+            let Some(path) = current_agent(&sock, env) else { return };
             let Ok(mut up) = UnixStream::connect(&path).await else { return };
             let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
         });
@@ -751,7 +755,7 @@ mod tests {
     async fn the_agent_proxy_follows_the_live_socket_and_survives_it_dying() {
         let dir = std::env::temp_dir().join(format!("ah-agent-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let (sock, upstream) = (dir.join("agent.sock"), dir.join(crate::AGENT_UPSTREAM));
+        let (sock, upstream) = (dir.join(crate::AGENT_PROXY), dir.join(crate::AGENT_UPSTREAM));
 
         // Nothing forwarded yet, and no agent in this process' env either: a session
         // spawned now must still get a path that works *later*.
@@ -796,12 +800,30 @@ mod tests {
     }
 
     #[test]
-    fn the_proxy_never_forwards_to_itself() {
+    fn a_link_back_at_our_own_tail_falls_through_to_the_env() {
         let dir = std::env::temp_dir().join(format!("ah-loop-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // What a session sees, so `agents-hub stdio` run *inside* one records this.
-        relink(&dir.join("agent.sock"), &dir.join(crate::AGENT_UPSTREAM));
-        assert_eq!(current_agent(&dir), None, "forwarding to our own socket is a loop");
+        let proxy = dir.join(crate::AGENT_PROXY);
+        let real = dir.join("skotty.sock");
+        std::fs::File::create(&proxy).unwrap();
+        std::fs::File::create(&real).unwrap();
+
+        // What a session sees, so `agents-hub stdio` run *inside* one records this — here
+        // under a second name, since the spelling a client passes is not ours to predict.
+        let alias = dir.join("elsewhere.sock");
+        relink(&proxy, &alias);
+        relink(&alias, &dir.join(crate::AGENT_UPSTREAM));
+
+        assert_eq!(
+            current_agent(&proxy, Some(real.clone())),
+            Some(real),
+            "a loop is an absent link, not a dead daemon: the env is still a real agent"
+        );
+        assert_eq!(
+            current_agent(&proxy, Some(alias)),
+            None,
+            "and with the env pointing at us too there is nothing left to forward to"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

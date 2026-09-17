@@ -42,14 +42,31 @@ pub fn sock_path() -> PathBuf {
 /// at now, so a session outlives the connection that supplied the key.
 pub const AGENT_UPSTREAM: &str = "agent.upstream";
 
+/// The socket the daemon proxies, and the only agent path a session ever sees.
+pub const AGENT_PROXY: &str = "agent.sock";
+
 pub fn agent_upstream_path() -> PathBuf {
     state_dir().join(AGENT_UPSTREAM)
 }
 
+/// Whether two paths name the same socket, however each is spelled. Compared by identity
+/// rather than text because every side of this hands around a different spelling of the
+/// same file: a symlink, a `/tmp` that is really `/private/tmp`, a relative `$SSH_AUTH_SOCK`.
+/// A path that does not resolve is nobody, so a dangling link never matches.
+pub fn same_socket(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    }
+}
+
 fn relink_agent_sock(sock: &Path, link: &Path) -> Result<()> {
-    // A session's own $SSH_AUTH_SOCK is already this link; symlinking it onto
-    // itself would ELOOP the agent for every session on the box.
-    if sock == link {
+    // A `stdio` started inside a session gets the daemon's own proxy as $SSH_AUTH_SOCK —
+    // recording that aims the proxy at its own tail, and the daemon reads the loop back as
+    // no agent at all. Pointing the link at itself would ELOOP the same way.
+    if sock == link || same_socket(sock, link) || same_socket(sock, &link.with_file_name(AGENT_PROXY))
+    {
         return Ok(());
     }
     if let Some(parent) = link.parent() {
@@ -210,7 +227,8 @@ mod tests {
     fn agent_link_follows_each_new_connection_and_never_loops() {
         let dir = std::env::temp_dir().join(format!("ah-agent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let link = dir.join("agent.sock");
+        let link = dir.join(AGENT_UPSTREAM);
+        let proxy = dir.join(AGENT_PROXY);
 
         relink_agent_sock(Path::new("/tmp/ssh-aaa/agent.1"), &link).unwrap();
         relink_agent_sock(Path::new("/tmp/ssh-bbb/agent.2"), &link).unwrap();
@@ -219,11 +237,18 @@ mod tests {
             Path::new("/tmp/ssh-bbb/agent.2")
         );
 
+        // A client run from inside a session: its $SSH_AUTH_SOCK is the daemon's proxy,
+        // and it reaches us under whatever name it was given.
+        std::fs::File::create(&proxy).unwrap();
+        let alias = dir.join("elsewhere.sock");
+        std::os::unix::fs::symlink(&proxy, &alias).unwrap();
+        relink_agent_sock(&proxy, &link).unwrap();
+        relink_agent_sock(&alias, &link).unwrap();
         relink_agent_sock(&link.clone(), &link).unwrap();
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
             Path::new("/tmp/ssh-bbb/agent.2"),
-            "a session's own SSH_AUTH_SOCK must not replace the link"
+            "a session's own SSH_AUTH_SOCK must not replace a live agent with a loop"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
