@@ -110,7 +110,10 @@ final class AppModel: ObservableObject {
 
     // MARK: - lifecycle
 
+    /// Reopening a closed window runs the scene's `.task` again against the same model,
+    /// so this has to be a no-op the second time rather than a second set of links.
     func start() {
+        guard links.isEmpty else { return }
         let config: HubConfig
         do {
             config = try loadConfig()
@@ -153,11 +156,6 @@ final class AppModel: ObservableObject {
         // Nothing here is deadline work, so let the OS coalesce the wakeup with whatever
         // else it was going to run — four exact timer fires a second is pure idle energy.
         dotTimer?.tolerance = 0.1
-    }
-
-    func stop() {
-        dotTimer?.invalidate()
-        links.forEach { $0.stop() }
     }
 
     /// `nonisolated` so the link queues can call it; hops to main itself.

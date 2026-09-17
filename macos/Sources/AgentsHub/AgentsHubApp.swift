@@ -11,6 +11,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor static var onOpen: (([String]) -> Void)?
     @MainActor static var pending: [String] = []
 
+    /// SwiftUI does not rebuild a `WindowGroup` window once the last one is closed, so a Dock
+    /// click on the still-running app does nothing at all. The scene hands its `openWindow`
+    /// over here for exactly that case.
+    @MainActor static var reopen: (() -> Void)?
+
+    /// A miniaturized window counts as not visible too, but AppKit restores that one itself —
+    /// opening on top of it would leave the user with two.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows, !sender.windows.contains(where: { $0.isMiniaturized }) {
+            Task { @MainActor in Self.reopen?() }
+        }
+        return true
+    }
+
     func application(_ sender: NSApplication, open urls: [URL]) {
         let paths = urls.filter(\.hasDirectoryPath).map(\.path)
         Task { @MainActor in
@@ -21,13 +35,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 @main
 struct AgentsHubApp: App {
+    static let mainWindow = "main"
+
     @StateObject private var model = AppModel()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @AppStorage("appearance") private var appearance = AppAppearance.dark
     @AppStorage("theme") private var theme = Theme.classic
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: Self.mainWindow) {
             RootView(model: model, appearance: appearance)
                 .task {
                     // Launched from a shell rather than Finder, the app otherwise opens
@@ -36,7 +52,6 @@ struct AgentsHubApp: App {
                     NSApp.activate()
                     model.start()
                 }
-                .onDisappear { model.stop() }
         }
         .defaultSize(width: 1280, height: 820)
         // One short band instead of titlebar-plus-toolbar; the header is a line of text.
@@ -110,6 +125,7 @@ struct RootView: View {
     let appearance: AppAppearance
 
     @Environment(\.colorScheme) private var systemScheme
+    @Environment(\.openWindow) private var openWindow
     @FocusState private var focus: FocusTarget?
     @AppStorage("theme") private var theme = Theme.classic
     @AppStorage("sidebarWidth") private var sidebarWidth = 270.0
@@ -146,6 +162,7 @@ struct RootView: View {
             Ghostty.apply(scheme)
             // Start in the list, so j/k work without clicking first.
             focus = .sidebar
+            AppDelegate.reopen = { openWindow(id: AgentsHubApp.mainWindow) }
         }
         .onChange(of: scheme) { _, new in Ghostty.apply(new) }
         .onChange(of: model.requestSidebarFocus) { _, _ in focus = .sidebar }
