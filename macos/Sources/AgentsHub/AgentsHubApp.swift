@@ -129,7 +129,6 @@ struct RootView: View {
             VStack(spacing: 0) {
                 TerminalPane(model: model)
                     .focused($focus, equals: .terminal)
-                    .focusRing(model.terminalFocused ? theme.palette.accent : .clear)
                 Divider()
                 statusBar
             }
@@ -247,17 +246,6 @@ struct RootView: View {
 }
 
 extension View {
-    /// Only the terminal is outlined, and only while it holds the keyboard: the sidebar
-    /// already says so with its own selection highlight, and its column runs into the
-    /// window's rounded corners, where a square stroke looks wrong.
-    func focusRing(_ color: Color) -> some View {
-        overlay(
-            Rectangle()
-                .strokeBorder(color, lineWidth: 2)
-                .allowsHitTesting(false)
-        )
-    }
-
     /// The toolbar title only became removable in macOS 15; below that the system-font
     /// label stays and `header` simply repeats it.
     @ViewBuilder
