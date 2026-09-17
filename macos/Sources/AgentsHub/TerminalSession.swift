@@ -41,20 +41,26 @@ final class ReplayGate: @unchecked Sendable {
 final class TerminalRouter: @unchecked Sendable {
     private let lock = NSLock()
     private var sinks: [SessionKey: InMemoryTerminalSession] = [:]
-    private var lastOutput: [SessionKey: Date] = [:]
+    private var watch = ActivityWatch()
 
     func set(_ key: SessionKey, _ sink: InMemoryTerminalSession?) {
         lock.lock()
         defer { lock.unlock() }
         sinks[key] = sink
-        if sink == nil { lastOutput[key] = nil }
+        if sink == nil { watch.forget(key) }
+    }
+
+    func poked(_ key: SessionKey) {
+        lock.lock()
+        defer { lock.unlock() }
+        watch.poked(key)
     }
 
     func deliver(_ key: SessionKey, _ data: Data, live: Bool) {
         lock.lock()
         let sink = sinks[key]
         // Replay is history, not activity — a reconnect must not light up every dot.
-        if live { lastOutput[key] = Date() }
+        if live { watch.output(key) }
         lock.unlock()
         sink?.receive(data)
     }
@@ -66,12 +72,11 @@ final class TerminalRouter: @unchecked Sendable {
         sink?.finish(exitCode: UInt32(bitPattern: code), runtimeMilliseconds: 0)
     }
 
-    /// Keys that produced output within `window`.
+    /// Keys that produced output of their own within `window`.
     func active(within window: TimeInterval) -> Set<SessionKey> {
         lock.lock()
         defer { lock.unlock() }
-        let cutoff = Date().addingTimeInterval(-window)
-        return Set(lastOutput.filter { $0.value > cutoff }.keys)
+        return watch.active(within: window)
     }
 }
 

@@ -28,6 +28,15 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 const FRAME: Duration = Duration::from_millis(16);
 const ACTIVITY_WINDOW: Duration = Duration::from_secs(1);
 
+/// How long after a request at a session its output stops counting as that session's own.
+/// `Req::Attach` resizes the PTY server-side and `reconcile` attaches everything at once, so
+/// without this every dot lights together on each reconnect — a redraw we asked for, read
+/// back as work the agent chose to do.
+///
+/// ponytail: one fixed window rather than pairing each request with its reply. A dot is
+/// decoration, and a repaint slower than this costs a stray blink.
+const POKE_GRACE: Duration = Duration::from_millis(500);
+
 /// Sidebar width: start, and the bounds the drag handle clamps to.
 const SIDE_W: u16 = 30;
 const SIDE_MIN: u16 = 14;

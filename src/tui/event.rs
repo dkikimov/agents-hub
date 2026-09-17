@@ -8,7 +8,7 @@ use super::input::{
     click_bytes, key_bytes, mouse_bytes, pane_cell, paste_bytes, row_at, on_split, scroll_screen,
     selected_text, url_at,
 };
-use super::WHEEL;
+use super::{POKE_GRACE, WHEEL};
 use crate::proto::{b64, unb64, Req, Resp, Status};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -620,8 +620,13 @@ pub fn on_msg(app: &mut App, vi: usize, resp: Resp) {
             if let (Ok(bytes), Some(p)) = (unb64(&data), app.panes.get_mut(&(vi, id.clone()))) {
                 p.process(&bytes);
                 copy = p.callbacks_mut().take_if(live && selected).pop();
-                if live {
-                    app.activity.insert((vi, id.clone()), Instant::now());
+                let now = Instant::now();
+                let ours = app
+                    .poked
+                    .get(&(vi, id.clone()))
+                    .is_some_and(|last| now.duration_since(*last) <= POKE_GRACE);
+                if live && !ours {
+                    app.activity.insert((vi, id.clone()), now);
                 }
             }
             if let Some(copy) = copy {
@@ -1361,6 +1366,8 @@ mod tests {
         let (mut a, mut rx) = app(&["~/a"]);
         a.reconcile(0);
         sent(&mut rx);
+        // The attach it just sent would swallow the live line below; that rule is next.
+        a.poked.clear();
 
         on_msg(
             &mut a,
@@ -1387,5 +1394,41 @@ mod tests {
             .screen()
             .contents()
             .starts_with("replayed now"));
+    }
+
+    /// `Attach` resizes the pty server-side, and `reconcile` attaches every session at
+    /// once — so without the grace a reconnect lights every dot in the sidebar.
+    #[test]
+    fn a_redraw_we_asked_for_is_not_the_agent_working() {
+        let (mut a, mut rx) = app(&["~/a"]);
+        a.reconcile(0);
+        sent(&mut rx);
+
+        on_msg(
+            &mut a,
+            0,
+            Resp::Output {
+                id: "s0".into(),
+                data: b64(b"repaint"),
+                live: true,
+            },
+        );
+        assert!(a.activity.is_empty(), "the attach asked for this");
+
+        a.poked
+            .insert((0, "s0".into()), Instant::now() - POKE_GRACE * 2);
+        on_msg(
+            &mut a,
+            0,
+            Resp::Output {
+                id: "s0".into(),
+                data: b64(b" and keeps going"),
+                live: true,
+            },
+        );
+        assert!(
+            a.activity.contains_key(&(0, "s0".to_string())),
+            "past the grace it is the agent's own"
+        );
     }
 }

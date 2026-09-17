@@ -97,6 +97,8 @@ pub struct App {
     pub panes: HashMap<Pane, vt100::Parser<Clipboard>>,
     pub attached: HashSet<Pane>,
     pub activity: HashMap<Pane, Instant>,
+    /// When we last sent something at a pane. See `POKE_GRACE`.
+    pub poked: HashMap<Pane, Instant>,
     /// (vm, directory) → its subdirectories, as the daemon on that machine reported them.
     /// Emptied whenever the new-session modal opens, so a listing can't go stale for long.
     pub dirs: HashMap<(usize, String), Vec<String>>,
@@ -130,6 +132,7 @@ impl App {
             panes: HashMap::new(),
             attached: HashSet::new(),
             activity: HashMap::new(),
+            poked: HashMap::new(),
             dirs: HashMap::new(),
             modal: None,
             filter: String::new(),
@@ -274,6 +277,15 @@ impl App {
     }
 
     pub fn send(&mut self, vm: usize, req: Req) {
+        // Whatever comes back next is a reply to this, not the agent working of its own
+        // accord: `Attach` and `Resize` both SIGWINCH the PTY, `Input` echoes.
+        if let Req::Input { id, .. }
+        | Req::Resize { id, .. }
+        | Req::Attach { id, .. }
+        | Req::Restart { id, .. } = &req
+        {
+            self.poked.insert((vm, id.clone()), Instant::now());
+        }
         if let Some(v) = self.vms.get(vm) {
             if v.tx.send(req).is_err() {
                 self.status = format!("{}: link closed", v.name);
@@ -290,6 +302,7 @@ impl App {
         self.panes.retain(|(v, id), _| *v != vi || live.contains(id));
         self.attached.retain(|(v, id)| *v != vi || live.contains(id));
         self.activity.retain(|(v, id), _| *v != vi || live.contains(id));
+        self.poked.retain(|(v, id), _| *v != vi || live.contains(id));
         if self
             .selection
             .as_ref()

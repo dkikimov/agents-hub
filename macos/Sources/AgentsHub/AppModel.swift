@@ -211,11 +211,26 @@ final class AppModel: ObservableObject {
 
     // MARK: - effects
 
+    /// The one way out. Every request aimed at a session is also a poke that will make the
+    /// agent print — a focus report, a SIGWINCH from `attach` or `resize`, an echoed
+    /// keystroke — and `ActivityWatch` needs to know so it doesn't read our own nudge as
+    /// the agent working. A second exit would be a dot that lies again.
+    private func send(_ vm: Int, _ req: Req) {
+        switch req {
+        case let .input(id, _), let .resize(id, _, _),
+             let .attach(id, _, _), let .restart(id, _, _):
+            router.poked(SessionKey(vm: vm, id: id))
+        default:
+            break
+        }
+        links[safe: vm]?.send(req)
+    }
+
     private func apply(_ effects: [Effect]) {
         for effect in effects {
             switch effect {
             case let .send(vm, req):
-                links[vm].send(req)
+                send(vm, req)
             case let .teardown(key):
                 makeTerminal(key)
             case let .forget(key):
@@ -231,9 +246,13 @@ final class AppModel: ObservableObject {
         let vm = key.vm
         let terminal = TerminalSession(
             key: key,
-            send: { [weak self] req in
+            send: { [weak self, router] req in
                 // Off the main actor: this is ghostty's write callback, at keystroke rate.
-                Task { @MainActor in self?.links[safe: vm]?.send(req) }
+                // The poke is taken here rather than after the hop, because a main actor
+                // busy with a window drag is exactly when this fires and the dot has to
+                // know about the nudge before the reply to it lands.
+                router.poked(key)
+                Task { @MainActor in self?.send(vm, req) }
             },
             onGrid: { [weak self] cols, rows in
                 Task { @MainActor in self?.gridChanged(key, cols: cols, rows: rows) }
@@ -386,8 +405,8 @@ final class AppModel: ObservableObject {
     func create(agent: String, name: String, cwd: String) {
         let vm = currentVM
         let name = name.isEmpty ? defaultName(cwd: cwd, agent: agent) : name
-        links[safe: vm]?.send(.create(agent: agent, name: name, cwd: cwd,
-                                      cols: pane.cols, rows: pane.rows))
+        send(vm, .create(agent: agent, name: name, cwd: cwd,
+                         cols: pane.cols, rows: pane.rows))
         status = "starting \(agent) · \(name)…"
     }
 
@@ -407,13 +426,13 @@ final class AppModel: ObservableObject {
     func clearDrop() { drop = nil }
 
     func kill(_ key: SessionKey) {
-        links[safe: key.vm]?.send(.kill(id: key.id))
+        send(key.vm, .kill(id: key.id))
         status = "killed \(key.id)"
     }
 
     func restartSelected() {
         guard let info = selectedInfo, info.status == .stopped, let key = selectedKey else { return }
-        links[safe: key.vm]?.send(.restart(id: key.id, cols: pane.cols, rows: pane.rows))
+        send(key.vm, .restart(id: key.id, cols: pane.cols, rows: pane.rows))
         status = "restarting \(info.name)…"
     }
 
@@ -465,7 +484,7 @@ final class AppModel: ObservableObject {
         let key = Self.dirKey(currentVM, dir)
         guard !requestedDirs.contains(key) else { return }
         requestedDirs.insert(key)
-        links[safe: currentVM]?.send(.listDir(path: dir))
+        send(currentVM, .listDir(path: dir))
     }
 
     /// Listings go stale as soon as anything could have changed on the far end.
