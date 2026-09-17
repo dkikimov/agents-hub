@@ -66,6 +66,19 @@ import Testing
         ])
     }
 
+    @Test func aFavouriteFolderOutlivesItsLastSession() {
+        let s = [sess("~/Documents/a")]
+        #expect(shape(tree(sessions: s, idx: [], collapsed: [],
+                           favourites: ["~/Documents/a"], home: home)) == [
+            "0:~", "1:Documents", "2:a",
+        ])
+        // A collapse keeps session-bearing folders; a favourite survives it too.
+        #expect(shape(tree(sessions: s, idx: [0], collapsed: ["~"],
+                           favourites: ["~/gone"], home: home)) == [
+            "0:~", "1:…", "2:a", "3:#0", "2:gone",
+        ])
+    }
+
     /// Swift dictionaries are unordered where tree.rs leaned on BTreeMap, so a missing
     /// `.sorted()` would show up as a sidebar that reshuffles between frames.
     @Test func rowOrderIsStableAcrossRebuilds() {

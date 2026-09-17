@@ -219,6 +219,12 @@ struct RootView: View {
         .fixedSize()
     }
 
+    private var hints: String {
+        if model.terminalFocused { return "⌘L back to list" }
+        if model.selectionIsFolder { return "j/k move · space fold · f favourite · n new" }
+        return "j/k move · ⏎ attach · n new · d kill · / filter"
+    }
+
     private var statusBar: some View {
         HStack(spacing: 10) {
             Text(model.status).lineLimit(1).truncationMode(.middle)
@@ -231,8 +237,7 @@ struct RootView: View {
             if let info = model.selectedInfo, info.status == .stopped {
                 Button("Restart") { model.restartSelected() }.controlSize(.small)
             }
-            Text(model.terminalFocused ? "⌘L back to list" : "j/k move · ⏎ attach · / filter")
-                .foregroundStyle(.tertiary)
+            Text(hints).foregroundStyle(.tertiary)
         }
         .font(Ghostty.ui(Ghostty.fontSize - 2))
         .foregroundStyle(.secondary)

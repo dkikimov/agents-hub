@@ -74,20 +74,22 @@ private func trimLeading(_ s: String, _ c: Character) -> String {
 }
 
 /// One VM's sidebar rows. `idx` is the filter-surviving session indices, so a folder with
-/// nothing left in it simply never gets built.
+/// nothing left in it simply never gets built — unless it is a favourite, which is what
+/// favouriting is for: the folder outlives its last session.
 public func tree(
     sessions: [SessionInfo],
     idx: [Int],
     collapsed: Set<String>,
+    favourites: Set<String> = [],
     home: String? = ProcessInfo.processInfo.environment["HOME"]
 ) -> [TreeRow] {
     var at: [String: [Int]] = [:]
     var kids: [String: Set<String>] = [:]
     var roots: Set<String> = []
 
-    for i in idx {
+    func insert(_ cwd: String) -> String {
         var path = ""
-        for (d, seg) in segments(sessions[i].cwd, home: home).enumerated() {
+        for (d, seg) in segments(cwd, home: home).enumerated() {
             let parent = path
             path = joinPath(path, seg)
             if d == 0 {
@@ -97,13 +99,20 @@ public func tree(
             }
             if kids[path] == nil { kids[path] = [] }
         }
-        at[path, default: []].append(i)
+        return path
+    }
+
+    for i in idx {
+        at[insert(sessions[i].cwd), default: []].append(i)
+    }
+    for path in favourites {
+        _ = insert(path)
     }
 
     // Swift dictionaries are unordered where tree.rs leaned on BTreeMap/BTreeSet, so
     // every traversal below sorts explicitly or the sidebar reshuffles on every frame.
     var out: [TreeRow] = []
-    let walker = Walker(at: at, kids: kids, collapsed: collapsed)
+    let walker = Walker(at: at, kids: kids, collapsed: collapsed, favourites: favourites)
     for r in roots.sorted() {
         walker.walk(r, 0, &out)
     }
@@ -114,6 +123,7 @@ private struct Walker {
     let at: [String: [Int]]
     let kids: [String: Set<String>]
     let collapsed: Set<String>
+    let favourites: Set<String>
 
     func folder(_ path: String, _ hasSub: Bool) -> TreeNode {
         .folder(path: path, seg: segOf(path), hasSub: hasSub)
@@ -164,7 +174,7 @@ private struct Walker {
     /// was passed over on the way.
     func descend(_ path: String, _ keep: inout [String], _ elided: inout Bool) {
         for c in (kids[path] ?? []).sorted() {
-            if at[c] != nil { keep.append(c) } else { elided = true }
+            if at[c] != nil || favourites.contains(c) { keep.append(c) } else { elided = true }
             descend(c, &keep, &elided)
         }
     }

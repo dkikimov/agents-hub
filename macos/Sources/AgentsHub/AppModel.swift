@@ -37,7 +37,7 @@ enum SidebarRow: Identifiable, Hashable {
     }
 }
 
-struct FoldKey: Hashable, Codable {
+struct PathKey: Hashable, Codable {
     let vm: Int
     let path: String
 }
@@ -91,7 +91,8 @@ final class AppModel: ObservableObject {
     private let router = TerminalRouter()
     private var bells = BellWatch()
     private let notifier = Notifier()
-    private var collapsed: Set<FoldKey> = []
+    private var collapsed: Set<PathKey> = []
+    private var favourites: Set<PathKey> = []
     private var pane: (cols: UInt16, rows: UInt16) = (80, 24)
     private var dotTimer: Timer?
     private var requestedDirs: Set<String> = []
@@ -123,7 +124,8 @@ final class AppModel: ObservableObject {
         }
         agentNames = config.agentNames
         vms = config.vm.map { VMState(config: $0) }
-        collapsed = Self.loadFolds()
+        collapsed = Self.load(Self.foldsKey)
+        favourites = Self.load(Self.favouritesKey)
         rebuild()
         notifier.start { [weak self] reason in self?.status = reason }
 
@@ -278,6 +280,13 @@ final class AppModel: ObservableObject {
     }
 
     private var allRows: [SidebarRow] { rowsByVM.flatMap { $0 } }
+
+    /// Folder rows and session rows answer to different keys, so the hint line says which.
+    var selectionIsFolder: Bool {
+        guard let selection, case .folder = allRows.first(where: { $0.id == selection })
+        else { return false }
+        return true
+    }
 
     /// Mount on first selection and never unmount: unmounting destroys the grid and the
     /// scrollback with it, and the 1 MiB pending buffer only refills from that moment.
@@ -498,14 +507,34 @@ final class AppModel: ObservableObject {
     // MARK: - folds and filter
 
     func isCollapsed(vm: Int, path: String) -> Bool {
-        collapsed.contains(FoldKey(vm: vm, path: path))
+        collapsed.contains(PathKey(vm: vm, path: path))
     }
 
     func toggleFold(vm: Int, path: String) {
-        let key = FoldKey(vm: vm, path: path)
+        let key = PathKey(vm: vm, path: path)
         if collapsed.contains(key) { collapsed.remove(key) } else { collapsed.insert(key) }
-        Self.saveFolds(collapsed)
+        Self.save(collapsed, Self.foldsKey)
         rebuild()
+    }
+
+    func isFavourite(vm: Int, path: String) -> Bool {
+        favourites.contains(PathKey(vm: vm, path: path))
+    }
+
+    /// A favourite folder stays in the sidebar with no sessions left in it, so it is still
+    /// there to start the next one from.
+    func toggleFavourite(vm: Int, path: String) {
+        let key = PathKey(vm: vm, path: path)
+        if favourites.contains(key) { favourites.remove(key) } else { favourites.insert(key) }
+        Self.save(favourites, Self.favouritesKey)
+        rebuild()
+    }
+
+    func toggleFavouriteAtSelection() {
+        guard let selection,
+              case let .folder(vm, path, _, _, _) = allRows.first(where: { $0.id == selection })
+        else { return }
+        toggleFavourite(vm: vm, path: path)
     }
 
     private func matches(_ s: SessionInfo) -> Bool {
@@ -521,7 +550,10 @@ final class AppModel: ObservableObject {
             let sessions = vms[vi].sessions
             let idx = sessions.indices.filter { matches(sessions[$0]) }
             let folds = Set(collapsed.filter { $0.vm == vi }.map(\.path))
-            return tree(sessions: sessions, idx: Array(idx), collapsed: folds).map { row in
+            // A filter is a search for sessions, so an empty favourite is noise in it.
+            let favs = filter.isEmpty ? Set(favourites.filter { $0.vm == vi }.map(\.path)) : []
+            return tree(sessions: sessions, idx: Array(idx),
+                        collapsed: folds, favourites: favs).map { row in
                 switch row.node {
                 case let .folder(path, seg, hasSub):
                     return .folder(vm: vi, path: path, seg: seg, depth: row.depth, hasSub: hasSub)
@@ -573,22 +605,23 @@ final class AppModel: ObservableObject {
 
     func isOnline(_ vm: Int) -> Bool { vms[safe: vm]?.online ?? false }
 
-    // MARK: - fold persistence
+    // MARK: - persistence
 
     // Folds were in-memory only in the Rust client and reset on every launch, which was
     // marked as debt there. Two lines here.
     private static let foldsKey = "collapsedFolders"
+    private static let favouritesKey = "favouriteFolders"
 
-    private static func loadFolds() -> Set<FoldKey> {
-        guard let data = UserDefaults.standard.data(forKey: foldsKey),
-              let folds = try? JSONDecoder().decode(Set<FoldKey>.self, from: data)
+    private static func load(_ key: String) -> Set<PathKey> {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let paths = try? JSONDecoder().decode(Set<PathKey>.self, from: data)
         else { return [] }
-        return folds
+        return paths
     }
 
-    private static func saveFolds(_ folds: Set<FoldKey>) {
-        guard let data = try? JSONEncoder().encode(folds) else { return }
-        UserDefaults.standard.set(data, forKey: foldsKey)
+    private static func save(_ paths: Set<PathKey>, _ key: String) {
+        guard let data = try? JSONEncoder().encode(paths) else { return }
+        UserDefaults.standard.set(data, forKey: key)
     }
 }
 

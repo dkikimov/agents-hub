@@ -27,6 +27,7 @@ private struct VimKeys: ViewModifier {
             .onKeyPress("/") { filterFocused = true; return .handled }
             .onKeyPress("n") { model.sheet = .newSession; return .handled }
             .onKeyPress("d") { model.killSelected(); return .handled }
+            .onKeyPress("f") { model.toggleFavouriteAtSelection(); return .handled }
             .onKeyPress("r") { model.restartSelected(); return .handled }
     }
 
@@ -149,6 +150,11 @@ struct SidebarView: View {
                     Text("·").foregroundStyle(.secondary).font(Ghostty.ui())
                 }
                 Text(seg).foregroundStyle(theme.palette.folder).font(Ghostty.ui())
+                if model.isFavourite(vm: vm, path: path) {
+                    Image(systemName: "star.fill")
+                        .font(.system(size: 8))
+                        .foregroundStyle(theme.palette.attention)
+                }
             }
 
         case let .elide(_, _, depth):
