@@ -411,10 +411,11 @@ final class AppModel: ObservableObject {
 
     func create(agent: String, name: String, cwd: String) {
         let vm = currentVM
-        let name = name.isEmpty ? defaultName(cwd: cwd, agent: agent) : name
-        send(vm, .create(agent: agent, name: name, cwd: cwd,
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let display = name.isEmpty ? defaultName(cwd: cwd, agent: agent) : name
+        send(vm, .create(agent: agent, name: display, cwd: cwd,
                          cols: pane.cols, rows: pane.rows))
-        status = "starting \(agent) · \(name)…"
+        status = "starting \(agent) · \(display)…"
     }
 
     /// A dropped folder is a path on *this* machine, so it goes to the local VM whatever the
@@ -462,7 +463,8 @@ final class AppModel: ObservableObject {
     }
 
     /// cwd to seed a new session with: a dropped folder, the folder you are standing in, the
-    /// one the selected session runs in, else this VM's default.
+    /// one the selected session runs in, else home. Not the process cwd as in the TUI: an app
+    /// launched by LaunchServices stands in `/`.
     var newCwd: String {
         if let cwd = drop?.cwd { return cwd }
         if let selection, let row = allRows.first(where: { $0.id == selection }) {
@@ -473,8 +475,7 @@ final class AppModel: ObservableObject {
             case .elide: break
             }
         }
-        return vms[safe: currentVM]?.config.isLocal == true
-            ? FileManager.default.currentDirectoryPath : "~"
+        return "~"
     }
 
     // MARK: - cwd completion
