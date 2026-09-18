@@ -14,7 +14,7 @@ struct NewSessionSheet: View {
     @State private var cwd = ""
     @State private var highlighted = 0
 
-    private var matches: [String] { model.cwdMatches(cwd) }
+    private var displayed: [String] { Array(model.cwdMatches(cwd).prefix(50)) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -28,25 +28,27 @@ struct NewSessionSheet: View {
                     .textFieldStyle(.roundedBorder)
             }
 
-            LabeledContent("Directory") {
-                TextField("~/path", text: $cwd)
-                    .textFieldStyle(.roundedBorder)
-                    .onChange(of: cwd) { _, new in
-                        model.requestDirs(new)
-                        highlighted = 0
+            // Not `LabeledContent`: it centres its label against the menu too, so
+            // "Directory" would jump down the sheet whenever the menu appears.
+            HStack(alignment: .firstTextBaseline) {
+                Text("Directory")
+                VStack(alignment: .leading, spacing: 0) {
+                    TextField("~/path", text: $cwd)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: cwd) { _, new in
+                            model.requestDirs(new)
+                            highlighted = 0
+                        }
+                        .onSubmit(submit)
+                        .onKeyPress(.downArrow) { moveHighlight(1) }
+                        .onKeyPress(.upArrow) { moveHighlight(-1) }
+                        .onKeyPress(.tab, phases: .down) { press in
+                            press.modifiers.isEmpty ? acceptHighlighted() : .ignored
+                        }
+                    if !displayed.isEmpty {
+                        completionMenu
                     }
-                    .onSubmit(submit)
-                    .onKeyPress(.downArrow) { moveHighlight(1) }
-                    .onKeyPress(.upArrow) { moveHighlight(-1) }
-                    .onKeyPress(.tab) { acceptHighlighted() }
-            }
-
-            // A row of its own, not part of the `LabeledContent` above: that row proposes a
-            // single line's height to its value view, and a `ScrollView` handed that
-            // collapses to nothing — the menu was in the view tree the whole time, zero
-            // points tall, which is why Tab completed against a list nobody could see.
-            if !matches.isEmpty {
-                completionMenu
+                }
             }
 
             HStack {
@@ -126,16 +128,19 @@ struct NewSessionSheet: View {
                 guard let dir = displayed[safe: i] else { return }
                 proxy.scrollTo(dir)
             }
+            // A new list under a wheel-scrolled viewport keeps the old offset, with row 0
+            // and the highlight above the fold.
+            .onChange(of: cwd) { _, _ in
+                if let first = displayed.first { proxy.scrollTo(first) }
+            }
         }
-        // Six rows, as CWD_MENU was — but sized to the rows it actually has first, or the
-        // ScrollView has no height of its own to clamp.
-        .fixedSize(horizontal: false, vertical: true)
+        // Six rows at the default font size, as CWD_MENU. `fixedSize` last: before the cap
+        // it lays the list out at full height and the cap only clips; without it, zero height.
         .frame(maxHeight: 120)
+        .fixedSize(horizontal: false, vertical: true)
         .background(.quaternary)
         .cornerRadius(4)
     }
-
-    private var displayed: [String] { Array(matches.prefix(50)) }
 
     private func moveHighlight(_ delta: Int) -> KeyPress.Result {
         guard !displayed.isEmpty else { return .ignored }
@@ -149,11 +154,10 @@ struct NewSessionSheet: View {
         return .handled
     }
 
-    /// Ends on `/` so the menu immediately offers that directory's own children.
+    /// Ends on `/` so the menu immediately offers that directory's own children — and so
+    /// `cwd` always changes, which is what asks for that listing and resets the highlight.
     private func accept(_ dir: String) {
         cwd = completeDir(cwd, dir)
-        model.requestDirs(cwd)
-        highlighted = 0
     }
 
     private func submit() {
