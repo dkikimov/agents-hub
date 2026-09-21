@@ -16,6 +16,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// over here for exactly that case.
     @MainActor static var reopen: (() -> Void)?
 
+    /// A backgrounded tab still sizes its ghostty surface from the window it cannot see, so
+    /// tabbed panes come back at a size nothing asked for. Set before the first window exists,
+    /// which is what also removes ⌘T and the Window > Tab menu section.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
+    }
+
     /// A miniaturized window counts as not visible too, but AppKit restores that one itself —
     /// opening on top of it would leave the user with two.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
