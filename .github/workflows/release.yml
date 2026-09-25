@@ -23,9 +23,51 @@ jobs:
 
       # ditto, not zip: it keeps the bundle's symlinks and code signature intact.
       - name: Package
-        run: ditto -c -k --keepParent macos/.build/AgentsHub.app "AgentsHub-$GITHUB_REF_NAME-arm64.zip"
+        run: |
+          ditto -c -k --keepParent macos/.build/AgentsHub.app "AgentsHub-$GITHUB_REF_NAME-macos-arm64.zip"
+          tar -czf "agents-hub-$GITHUB_REF_NAME-macos-arm64.tar.gz" -C target/release agents-hub
 
-      - name: Publish
-        env:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            *.zip
+            *.tar.gz
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      # Static musl, not the runner's glibc: a binary linked against 24.04's glibc
+      # refuses to start on the older distros remote VMs tend to run.
+      - run: sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: tar -czf "agents-hub-$GITHUB_REF_NAME-linux-${{ matrix.arch }}.tar.gz" -C target/${{ matrix.target }}/release agents-hub
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: "*.tar.gz"
+
+  publish:
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" AgentsHub-*.zip --generate-notes --verify-tag
+        run: gh release create "$GITHUB_REF_NAME" * --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag
