@@ -16,7 +16,17 @@ config already allows.
 
 ## Install
 
-Needs Rust. The macOS app also needs Swift 6 and macOS 14+.
+Prebuilt `AgentsHub.app` (Apple Silicon) is on the
+[releases page](https://github.com/dkikimov/agents-hub/releases). It's ad-hoc signed, not
+notarized, so clear the quarantine flag before the first launch:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/AgentsHub.app
+```
+
+The daemon binary ships inside the bundle at `AgentsHub.app/Contents/MacOS/agents-hub`.
+
+To build from source you need Rust. The macOS app also needs Swift 6 and macOS 14+.
 
 ```bash
 make service                 # cargo install --locked, then start the daemon via launchd/systemd

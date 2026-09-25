@@ -1,0 +1,31 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    # Package.swift needs Swift 6; the older images' Xcode can lag behind what the app uses.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Stamp version
+        run: /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${GITHUB_REF_NAME#v}" macos/Info.plist
+
+      - run: make app
+
+      # ditto, not zip: it keeps the bundle's symlinks and code signature intact.
+      - name: Package
+        run: ditto -c -k --keepParent macos/.build/AgentsHub.app "AgentsHub-$GITHUB_REF_NAME-arm64.zip"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" AgentsHub-*.zip --generate-notes --verify-tag
