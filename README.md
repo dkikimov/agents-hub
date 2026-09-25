@@ -16,15 +16,16 @@ config already allows.
 
 ## Install
 
-Prebuilt `AgentsHub.app` (Apple Silicon) is on the
-[releases page](https://github.com/dkikimov/agents-hub/releases). It's ad-hoc signed, not
-notarized, so clear the quarantine flag before the first launch:
+The [releases page](https://github.com/dkikimov/agents-hub/releases) has `AgentsHub.app`
+(Apple Silicon) and the `agents-hub` binary — TUI, daemon and `stdio` in one — for macOS
+arm64 and Linux x86_64/arm64. The Linux builds are static, so any distro runs them.
+
+The app is ad-hoc signed, not notarized, so clear the quarantine flag before the first
+launch:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/AgentsHub.app
 ```
-
-The daemon binary ships inside the bundle at `AgentsHub.app/Contents/MacOS/agents-hub`.
 
 To build from source you need Rust. The macOS app also needs Swift 6 and macOS 14+.
 
