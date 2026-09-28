@@ -63,6 +63,11 @@ In the TUI, `?` lists the keys. The ones you need:
 
 Click a row to switch sessions, drag the split to resize, drag pane text to copy.
 
+In the macOS app, `⌘B` opens a shell under the selected session: a login shell in its
+folder, on its VM, run by that VM's daemon like the session itself, so it survives the app
+quitting. `⌘B` again (or `exit`) hides it. Drag its header to resize, or set its
+height in Settings (`⌘,`). Killing the session kills its shell.
+
 ### Restarts
 
 PTYs die with the daemon. The session list and logs don't: after a restart every session

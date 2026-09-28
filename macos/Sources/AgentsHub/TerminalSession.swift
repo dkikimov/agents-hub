@@ -151,7 +151,12 @@ final class TerminalSession {
             for _ in 0..<600 where self?.state.surface == nil {
                 try? await Task.sleep(for: .milliseconds(16))
             }
-            await Task.detached { session.waitForPendingOutput() }.value
+            // On the main actor, never detached: a replay dense with titles and OSC 7
+            // (any shell prompt) fills ghostty's 64-slot app mailbox, only a main-thread
+            // tick empties it, and only a main-thread caller ticks while it waits. Off
+            // main, the gate stays shut — dropping keystrokes — until something else
+            // happens to tick.
+            session.waitForPendingOutput()
             let held = gate.openUp()
             if held > 0 {
                 NSLog("agents-hub: held %d bytes of replay writeback for %@", held, name)

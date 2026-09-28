@@ -174,6 +174,7 @@ mod tests {
             cwd: cwd.into(),
             status: Status::Stopped,
             created_at: 0,
+            parent: None,
         }
     }
 

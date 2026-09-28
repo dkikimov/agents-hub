@@ -72,6 +72,12 @@ final class AppModel: ObservableObject {
     /// than reaching into `@FocusState` from the model.
     @Published var requestSidebarFocus = false
     @Published private(set) var mounted: [SessionKey] = []
+    /// Agent sessions whose ⌘B shell panel is open. Per session, so switching to one
+    /// without a shell does not open an empty panel under it.
+    @Published private(set) var shellOpen: Set<SessionKey> = []
+    /// Companion shells with a surface in the panel. Same never-unmount rule as `mounted`,
+    /// for the same reason: the surface *is* the scrollback.
+    @Published private(set) var mountedShells: [SessionKey] = []
     /// Who owns the keyboard, as ghostty sees it — SwiftUI's own `@FocusState` doesn't
     /// notice a click landing straight in the surface, and an indicator that lies is
     /// worse than none.
@@ -94,6 +100,12 @@ final class AppModel: ObservableObject {
     private var collapsed: Set<PathKey> = []
     private var favourites: Set<PathKey> = []
     private var pane: (cols: UInt16, rows: UInt16) = (80, 24)
+    /// The panel's own grid, reported by whichever shell surface laid out last. Only the
+    /// size a brand-new shell starts at; a mounted one resizes itself.
+    private var shellGrid: (cols: UInt16, rows: UInt16) = (80, 12)
+    /// The session whose shell ⌘B just asked for, so it takes the keyboard the moment it
+    /// has a live surface — which, for a first open, is a round trip to the daemon later.
+    private var shellFocusPending: SessionKey?
     private var dotTimer: Timer?
     private var requestedDirs: Set<String> = []
     private var windowVisible = true
@@ -194,16 +206,29 @@ final class AppModel: ObservableObject {
             apply(registry.sessions(vm: index, list, cols: pane.cols, rows: pane.rows))
             rebuild()
             pruneSelection(near: previous)
+            revealShell()
         case let .exited(id, code):
             let key = SessionKey(vm: index, id: id)
             router.finish(key, code: code)
             if let s = vms[index].sessions.first(where: { $0.id == id }) {
-                status = "\(s.name) exited (\(code)) — press r to restart"
+                if let parent = s.parent {
+                    // `exit` closes the panel, as in any editor's terminal; ⌘B brings the
+                    // same shell back, relaunched, with its scrollback above the prompt.
+                    closeShell(SessionKey(vm: index, id: parent))
+                    status = "shell exited (\(code)) — ⌘B starts it again"
+                } else {
+                    status = "\(s.name) exited (\(code)) — press r to restart"
+                }
             }
         case let .dirs(path, names):
             dirs[Self.dirKey(index, path)] = names
         case let .error(msg):
             status = "\(vms[index].name): \(msg)"
+            // Most likely a daemon that predates `Shell` and has no idea what we asked
+            // for. Leaving the panel open would be a blank promise that never resolves.
+            if let parent = shellFocusPending, parent.vm == index, shellKey(for: parent) == nil {
+                closeShell(parent)
+            }
         case .output:
             break  // handled off-main in `handle`
         }
@@ -238,6 +263,9 @@ final class AppModel: ObservableObject {
                 terminals[key] = nil
                 bells.forget(key)
                 mounted.removeAll { $0 == key }
+                mountedShells.removeAll { $0 == key }
+                shellOpen.remove(key)
+                if shellFocusPending == key { shellFocusPending = nil }
             }
         }
     }
@@ -262,7 +290,7 @@ final class AppModel: ObservableObject {
         router.set(key, terminal.session)
         // A restarted session keeps its slot in the ZStack, so the surface is rebuilt in
         // place rather than the pane going blank.
-        if mounted.contains(key) { applySurfaceVisibility() }
+        if mounted.contains(key) || mountedShells.contains(key) { applySurfaceVisibility() }
     }
 
     // MARK: - selection and mounting
@@ -297,6 +325,7 @@ final class AppModel: ObservableObject {
         guard let key = selectedKey else { return }
         if !mounted.contains(key) { mounted.append(key) }
         applySurfaceVisibility()
+        revealShell()
     }
 
     func trackWindow(_ window: NSWindow?) {
@@ -322,12 +351,74 @@ final class AppModel: ObservableObject {
         applySurfaceVisibility()
     }
 
-    /// Exactly one surface draws, and only while it is on screen. Hidden surfaces keep
-    /// parsing — that is what still rings their bells.
+    /// The selected session draws, plus its shell when the panel is open, and only while
+    /// the window is on screen. Hidden surfaces keep parsing — that is what still rings
+    /// their bells.
     private func applySurfaceVisibility() {
-        let drawing = windowVisible ? selectedKey : nil
-        for (key, terminal) in terminals where terminal.state.isSurfaceVisible != (key == drawing) {
-            terminal.state.isSurfaceVisible = (key == drawing)
+        let drawing: Set<SessionKey> = windowVisible
+            ? Set([selectedKey, visibleShellKey].compactMap { $0 })
+            : []
+        for (key, terminal) in terminals
+        where terminal.state.isSurfaceVisible != drawing.contains(key) {
+            terminal.state.isSurfaceVisible = drawing.contains(key)
+        }
+    }
+
+    // MARK: - companion shell
+
+    /// The shell that belongs to `parent`, once the daemon has made one.
+    func shellKey(for parent: SessionKey) -> SessionKey? {
+        vms[safe: parent.vm]?.sessions
+            .first { $0.parent == parent.id }
+            .map { SessionKey(vm: parent.vm, id: $0.id) }
+    }
+
+    var shellPanelOpen: Bool { selectedKey.map { shellOpen.contains($0) } ?? false }
+
+    var visibleShellKey: SessionKey? {
+        guard let key = selectedKey, shellOpen.contains(key) else { return nil }
+        return shellKey(for: key)
+    }
+
+    /// ⌘B. Opening always asks the daemon, which makes that one request cover every
+    /// case: no shell yet, one stopped by `exit` or a daemon restart, or one running.
+    func toggleShell() {
+        guard let key = selectedKey, info(for: key)?.isShell == false else { return }
+        if shellOpen.contains(key) {
+            closeShell(key)
+            return
+        }
+        shellOpen.insert(key)
+        shellFocusPending = key
+        send(key.vm, .shell(parent: key.id, cols: shellGrid.cols, rows: shellGrid.rows))
+        revealShell()
+    }
+
+    /// Focus goes back to the agent only if it was in the shell: ⌘B from the sidebar
+    /// closes the panel without dragging the keyboard into a session.
+    private func closeShell(_ parent: SessionKey) {
+        let hadFocus = shellKey(for: parent).flatMap { terminals[$0]?.state.isFocused } ?? false
+        shellOpen.remove(parent)
+        if shellFocusPending == parent { shellFocusPending = nil }
+        applySurfaceVisibility()
+        if hadFocus, parent == selectedKey { terminals[parent]?.focus() }
+    }
+
+    /// Mounts the selected session's shell if its panel is open, and hands it the keyboard
+    /// if ⌘B is still waiting on it. Called wherever a shell can newly exist or be shown:
+    /// a `Sessions` frame, a selection change, ⌘B itself.
+    ///
+    /// Focus waits for `.running`: a stopped shell's terminal is about to be replaced by
+    /// the relaunch, and focusing it would hand the keyboard to a surface on its way out.
+    private func revealShell() {
+        guard let key = selectedKey, shellOpen.contains(key),
+              let shell = shellKey(for: key), let terminal = terminals[shell]
+        else { return }
+        if !mountedShells.contains(shell) { mountedShells.append(shell) }
+        applySurfaceVisibility()
+        if shellFocusPending == key, info(for: shell)?.status == .running {
+            shellFocusPending = nil
+            terminal.focus()
         }
     }
 
@@ -398,7 +489,14 @@ final class AppModel: ObservableObject {
     /// The reporter already resized itself through its own callback; this is only for
     /// everyone else, who are hidden or unmounted and will never notice the window moved.
     private func gridChanged(_ reporter: SessionKey, cols: UInt16, rows: UInt16) {
-        guard cols > 0, rows > 0, (cols, rows) != (pane.cols, pane.rows) else { return }
+        guard cols > 0, rows > 0 else { return }
+        // A shell's surface already resized its own PTY; its grid is the panel's, not the
+        // pane everyone else shares.
+        if info(for: reporter)?.isShell == true {
+            shellGrid = (cols, rows)
+            return
+        }
+        guard (cols, rows) != (pane.cols, pane.rows) else { return }
         pane = (cols, rows)
         let others = registry.resized(cols: cols, rows: rows).filter { effect in
             guard case let .send(vm, .resize(id, _, _)) = effect else { return true }
@@ -547,7 +645,8 @@ final class AppModel: ObservableObject {
     private func rebuild() {
         rowsByVM = vms.indices.map { vi in
             let sessions = vms[vi].sessions
-            let idx = sessions.indices.filter { matches(sessions[$0]) }
+            // Companion shells ride along in the list but are reached with ⌘B, not a row.
+            let idx = sessions.indices.filter { !sessions[$0].isShell && matches(sessions[$0]) }
             let folds = Set(collapsed.filter { $0.vm == vi }.map(\.path))
             // A filter is a search for sessions, so an empty favourite is noise in it.
             let favs = filter.isEmpty ? Set(favourites.filter { $0.vm == vi }.map(\.path)) : []
@@ -572,7 +671,8 @@ final class AppModel: ObservableObject {
         refreshWindowVisibility()
         let next = router.active(within: activityWindow)
         if next != activeDots { activeDots = next }
-        let focused = selectedKey.flatMap { terminals[$0]?.state.isFocused } ?? false
+        let focused = [selectedKey, visibleShellKey].compactMap { $0 }
+            .contains { terminals[$0]?.state.isFocused == true }
         if focused != terminalFocused { terminalFocused = focused }
         notifyBells()
     }
@@ -591,7 +691,9 @@ final class AppModel: ObservableObject {
         let watching = NSApp.isActive ? selectedKey : nil
         for (key, terminal) in terminals {
             guard bells.rang(key, count: terminal.liveBells), key != watching else { continue }
-            guard let session = info(for: key), let vm = vms[safe: key.vm] else { continue }
+            // A shell's bell is a failed tab completion, not an agent wanting you.
+            guard let session = info(for: key), !session.isShell,
+                  let vm = vms[safe: key.vm] else { continue }
             notifier.post(key,
                           title: "\(session.agent) · \(session.name)",
                           body: "\(vm.name) · \(session.cwd)")

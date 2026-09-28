@@ -1,6 +1,7 @@
 //! End-to-end: spawn a real session through a real daemon, then prove the promise
 //! the design is built on — after a daemon restart the session is still listed,
-//! marked Stopped, with its output replayable.
+//! marked Stopped, with its output replayable. The companion shell rides the same
+//! machinery, so it is proven the same way.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -40,6 +41,8 @@ fn start(dir: &Path, cfg: &Path) -> Daemon {
             .arg("serve")
             .env("AGENTS_HUB_DIR", dir)
             .env("AGENTS_HUB_CONFIG", cfg)
+            // Companion shells launch `$SHELL`, whatever the machine running the tests uses.
+            .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -160,6 +163,105 @@ fn session_survives_a_daemon_restart() {
     send(&mut s, &format!(r#"{{"t":"Kill","id":"{id}"}}"#));
     let listed = wait_for(&mut r, |l| l.contains("\"Sessions\"") && !l.contains(&id));
     assert!(!listed.contains(&id));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every session in a `Sessions` frame, as (id, parent).
+fn sessions(frame: &str) -> Vec<(String, Option<String>)> {
+    let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+    v["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            let id = s["id"].as_str().unwrap().to_string();
+            (id, s["parent"].as_str().map(str::to_string))
+        })
+        .collect()
+}
+
+/// Output of session `id` until it contains `needle`, decoded and concatenated — a
+/// shell answers in as many chunks as it likes.
+fn wait_for_output(r: &mut impl BufRead, id: &str, needle: &str) -> String {
+    let mut seen = String::new();
+    while !seen.contains(needle) {
+        let frame = wait_for(r, |l| l.contains("\"Output\"") && l.contains(id));
+        let b64 = frame.split("\"data\":\"").nth(1).unwrap().split('"').next().unwrap();
+        seen.push_str(&String::from_utf8_lossy(&base64_decode(b64)));
+    }
+    seen
+}
+
+#[test]
+fn a_companion_shell_lives_and_dies_with_its_session() {
+    let dir = std::env::temp_dir().join(format!("agents-hub-shell-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, CONFIG).unwrap();
+
+    let d1 = start(&dir, &cfg);
+    let mut s = connect(&dir);
+    let mut r = BufReader::new(s.try_clone().unwrap());
+
+    // Canonical because the shell's $PWD is: macOS's temp dir sits behind /var → /private/var.
+    let cwd = dir.canonicalize().unwrap().display().to_string();
+    send(
+        &mut s,
+        &format!(r#"{{"t":"Create","agent":"echo","name":"host","cwd":"{cwd}","cols":80,"rows":24}}"#),
+    );
+    let listed = wait_for(&mut r, |l| l.contains("\"Sessions\"") && l.contains("host"));
+    let parent = sessions(&listed)[0].0.clone();
+
+    // ── first ask creates it, in the parent's cwd ─────────────────────────────
+    let shell_req = format!(r#"{{"t":"Shell","parent":"{parent}","cols":80,"rows":24}}"#);
+    send(&mut s, &shell_req);
+    let listed = wait_for(&mut r, |l| l.contains("\"Sessions\"") && l.contains("\"parent\""));
+    let all = sessions(&listed);
+    assert_eq!(all.len(), 2, "one agent plus its shell: {listed}");
+    let shell = all
+        .iter()
+        .find(|(_, p)| p.as_deref() == Some(parent.as_str()))
+        .expect("the shell names its parent")
+        .0
+        .clone();
+
+    send(&mut s, &format!(r#"{{"t":"Attach","id":"{shell}","cols":80,"rows":24}}"#));
+    // "echo shell-$((40+2)) $PWD\n" — the echo of the typed line never says 42.
+    send(
+        &mut s,
+        &format!(r#"{{"t":"Input","id":"{shell}","data":"ZWNobyBzaGVsbC0kKCg0MCsyKSkgJFBXRAo="}}"#),
+    );
+    let out = wait_for_output(&mut r, &shell, "shell-42");
+    assert!(out.contains(&format!("shell-42 {cwd}")), "ran in the parent's cwd: {out:?}");
+
+    // ── asking again reuses it rather than stacking a second one ──────────────
+    send(&mut s, &shell_req);
+    send(&mut s, r#"{"t":"List"}"#);
+    let listed = wait_for(&mut r, |l| l.contains("\"Sessions\""));
+    assert_eq!(sessions(&listed).len(), 2, "Shell must be idempotent: {listed}");
+
+    drop(r);
+    drop(s);
+    drop(d1);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // ── after a daemon restart the same ask relaunches it under the same id ───
+    let _d2 = start(&dir, &cfg);
+    let mut s = connect(&dir);
+    let mut r = BufReader::new(s.try_clone().unwrap());
+    send(&mut s, &shell_req);
+    let listed = wait_for(&mut r, |l| {
+        l.contains("\"Sessions\"") && l.contains(&shell) && l.contains("\"Running\"")
+    });
+    assert_eq!(sessions(&listed).len(), 2, "relaunched, not recreated: {listed}");
+
+    // ── killing the session takes its shell with it ───────────────────────────
+    send(&mut s, &format!(r#"{{"t":"Kill","id":"{parent}"}}"#));
+    let listed = wait_for(&mut r, |l| l.contains("\"Sessions\"") && !l.contains(&parent));
+    assert!(sessions(&listed).is_empty(), "the shell outlived its session: {listed}");
+    assert!(!dir.join("logs").join(format!("{shell}.log")).exists());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

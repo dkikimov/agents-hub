@@ -358,6 +358,16 @@ impl Hub {
         })
     }
 
+    /// A companion shell is the daemon's own login shell rather than a configured agent:
+    /// it has to work on a VM whose config never mentions one.
+    fn shell_argv() -> Vec<String> {
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        vec![shell, "-l".into()]
+    }
+
     fn argv_for(&self, agent: &str, resuming: bool) -> Result<Vec<String>> {
         let a = self
             .cfg
@@ -400,6 +410,7 @@ impl Hub {
                     cwd,
                     status: Status::Running,
                     created_at: now_secs(),
+                    parent: None,
                 };
                 self.sessions
                     .lock()
@@ -408,24 +419,40 @@ impl Hub {
                 self.announce();
             }
 
-            Req::Restart { id, cols, rows } => {
-                let (agent, cwd) = {
+            Req::Restart { id, cols, rows } => self.restart(&id, cols, rows)?,
+
+            Req::Shell { parent, cols, rows } => {
+                let (existing, name, cwd) = {
                     let s = self.sessions.lock().unwrap();
-                    let sess = s.get(&id).ok_or_else(|| anyhow!("no such session"))?;
-                    if sess.run.is_some() {
-                        return Ok(()); // already running, nothing to do
+                    let p = s.get(&parent).ok_or_else(|| anyhow!("no such session"))?;
+                    if p.info.parent.is_some() {
+                        return Err(anyhow!("a shell has no shell of its own"));
                     }
-                    (sess.info.agent.clone(), sess.info.cwd.clone())
+                    let child = s
+                        .values()
+                        .find(|x| x.info.parent.as_deref() == Some(&parent))
+                        .map(|x| x.info.id.clone());
+                    (child, p.info.name.clone(), p.info.cwd.clone())
                 };
-                let argv = self.argv_for(&agent, true)?;
-                let run = self.spawn(&id, &argv, &cwd, cols, rows)?;
-                {
-                    let mut s = self.sessions.lock().unwrap();
-                    if let Some(sess) = s.get_mut(&id) {
-                        sess.info.status = Status::Running;
-                        sess.run = Some(run);
-                    }
+                // Stopped after a daemon restart or an `exit`: the same relaunch as `r`.
+                if let Some(id) = existing {
+                    return self.restart(&id, cols, rows);
                 }
+                let id = new_id();
+                let run = self.spawn(&id, &Self::shell_argv(), &cwd, cols, rows)?;
+                let info = SessionInfo {
+                    id: id.clone(),
+                    agent: "shell".into(),
+                    name,
+                    cwd,
+                    status: Status::Running,
+                    created_at: now_secs(),
+                    parent: Some(parent),
+                };
+                self.sessions
+                    .lock()
+                    .unwrap()
+                    .insert(id, Session { info, run: Some(run) });
                 self.announce();
             }
 
@@ -507,17 +534,58 @@ impl Hub {
                 }
             }
 
+            // A companion shell goes with its session: nothing lists it on its own, so
+            // left behind it would be a PTY no client could ever reach again.
             Req::Kill { id } => {
-                let removed = self.sessions.lock().unwrap().remove(&id);
-                if let Some(sess) = removed {
+                let removed: Vec<(String, Session)> = {
+                    let mut s = self.sessions.lock().unwrap();
+                    let doomed: Vec<String> = s
+                        .iter()
+                        .filter(|(k, x)| **k == id || x.info.parent.as_deref() == Some(&id))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    doomed
+                        .into_iter()
+                        .filter_map(|k| s.remove(&k).map(|x| (k, x)))
+                        .collect()
+                };
+                for (k, sess) in removed {
                     if let Some(run) = sess.run {
                         let _ = run.child.lock().unwrap().kill();
                     }
-                    let _ = std::fs::remove_file(self.log_path(&id));
+                    let _ = std::fs::remove_file(self.log_path(&k));
                 }
                 self.announce();
             }
         }
+        Ok(())
+    }
+
+    /// Relaunches a stopped session under its own id; a running one is left alone. A
+    /// companion shell comes back as a shell, an agent through its `resume` argv.
+    fn restart(self: &Arc<Self>, id: &str, cols: u16, rows: u16) -> Result<()> {
+        let (agent, cwd, shell) = {
+            let s = self.sessions.lock().unwrap();
+            let sess = s.get(id).ok_or_else(|| anyhow!("no such session"))?;
+            if sess.run.is_some() {
+                return Ok(()); // already running, nothing to do
+            }
+            (sess.info.agent.clone(), sess.info.cwd.clone(), sess.info.parent.is_some())
+        };
+        let argv = if shell {
+            Self::shell_argv()
+        } else {
+            self.argv_for(&agent, true)?
+        };
+        let run = self.spawn(id, &argv, &cwd, cols, rows)?;
+        {
+            let mut s = self.sessions.lock().unwrap();
+            if let Some(sess) = s.get_mut(id) {
+                sess.info.status = Status::Running;
+                sess.run = Some(run);
+            }
+        }
+        self.announce();
         Ok(())
     }
 }

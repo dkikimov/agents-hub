@@ -586,7 +586,10 @@ fn copy_status(data: &[u8]) -> String {
 
 pub fn on_msg(app: &mut App, vi: usize, resp: Resp) {
     match resp {
-        Resp::Sessions { sessions } => {
+        Resp::Sessions { mut sessions } => {
+            // Companion shells belong to the macOS client's ⌘B panel; this client has no
+            // place to show one, so it neither lists nor attaches to them.
+            sessions.retain(|s| s.parent.is_none());
             // A restart is a new pty behind an unchanged id, and the daemon's output channel
             // died with the old one — an attach that predates it never receives anything
             // again. Forgetting the attachment puts the session back down the path a dropped
@@ -1338,6 +1341,27 @@ mod tests {
             !a.panes[&pane].screen().contents().contains("before"),
             "the replay rebuilds the pane, so it must start empty"
         );
+    }
+
+    #[test]
+    fn companion_shells_are_neither_listed_nor_attached() {
+        let (mut a, mut rx) = app(&["~/a"]);
+        a.reconcile(0);
+        sent(&mut rx);
+        let sidebar = shape(&a);
+
+        let mut sessions = a.vms[0].sessions.clone();
+        let mut shell = sessions[0].clone();
+        shell.id = "sh".into();
+        shell.agent = "shell".into();
+        shell.parent = Some("s0".into());
+        sessions.push(shell);
+        on_msg(&mut a, 0, Resp::Sessions { sessions });
+
+        assert!(sent(&mut rx).is_empty(), "no attach for the shell");
+        assert_eq!(a.vms[0].sessions.len(), 1);
+        assert_eq!(shape(&a), sidebar);
+        assert!(!a.panes.contains_key(&(0, "sh".to_string())));
     }
 
     #[test]

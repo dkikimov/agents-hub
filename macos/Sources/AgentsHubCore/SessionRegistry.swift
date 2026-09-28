@@ -30,6 +30,8 @@ public enum Effect: Equatable, Sendable {
 public struct SessionRegistry {
     private(set) public var attached: Set<SessionKey> = []
     private var known: [Int: [String: Status]] = [:]
+    /// Companion shells, which size themselves from their own panel.
+    private var shells: Set<SessionKey> = []
 
     public init() {}
 
@@ -67,6 +69,8 @@ public struct SessionRegistry {
         var live: [String: Status] = [:]
         for s in list { live[s.id] = s.status }
         known[vm] = live
+        shells = shells.filter { $0.vm != vm }
+            .union(list.filter(\.isShell).map { SessionKey(vm: vm, id: $0.id) })
 
         var effects: [Effect] = []
 
@@ -99,7 +103,12 @@ public struct SessionRegistry {
     /// One geometry for every pane, as in the Rust client. Unmounted sessions are
     /// included deliberately: they have no surface to report their own size, and without
     /// this their PTY sits at 80×24 while the window is 200 columns wide.
+    ///
+    /// Companion shells are not: they live in a panel of their own height, and dragging
+    /// the agent pane must not squash a shell to its geometry.
     public func resized(cols: UInt16, rows: UInt16) -> [Effect] {
-        attached.sorted().map { .send(vm: $0.vm, req: .resize(id: $0.id, cols: cols, rows: rows)) }
+        attached.subtracting(shells).sorted().map {
+            .send(vm: $0.vm, req: .resize(id: $0.id, cols: cols, rows: rows))
+        }
     }
 }
