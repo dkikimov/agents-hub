@@ -131,7 +131,7 @@ struct SettingsView: View {
                 }
             }
             Text("Height of the shell panel, as a share of the terminal area. Dragging the "
-                 + "line above the panel sets the same value.")
+                 + "panel's header sets the same value.")
                 .font(Ghostty.ui(Ghostty.fontSize - 2))
                 .foregroundStyle(.secondary)
         }
