@@ -112,7 +112,7 @@ into `vt100::Parser` and renders with `tui-term`. Keep the server dumb about scr
 rather than triggering a fresh replay. `App::reconcile` does this; `Ui::Up` clears `attached`
 so a reconnect re-attaches and rebuilds parsers from replay.
 
-**Companion shells** (`Req::Shell`, the macOS app's ⌘J) are ordinary daemon sessions with
+**Companion shells** (`Req::Shell`, the macOS app's ⌘B) are ordinary daemon sessions with
 `parent` set, so they get PTY ownership, logs, replay and restart for free. What sets them
 apart: the daemon launches `$SHELL -l` rather than an `[agents.*]` entry, `Shell` is
 idempotent (create, relaunch if stopped, else nothing), and `Kill` of the parent takes them

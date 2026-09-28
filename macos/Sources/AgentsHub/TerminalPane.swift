@@ -44,7 +44,7 @@ struct TerminalPane: View {
 
 }
 
-/// The ⌘J panel: every mounted companion shell, stacked for the same reasons as
+/// The ⌘B panel: every mounted companion shell, stacked for the same reasons as
 /// `TerminalPane`, with only the selected session's drawing.
 struct ShellPane: View {
     @ObservedObject var model: AppModel

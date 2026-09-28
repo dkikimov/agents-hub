@@ -587,7 +587,7 @@ fn copy_status(data: &[u8]) -> String {
 pub fn on_msg(app: &mut App, vi: usize, resp: Resp) {
     match resp {
         Resp::Sessions { mut sessions } => {
-            // Companion shells belong to the macOS client's ⌘J panel; this client has no
+            // Companion shells belong to the macOS client's ⌘B panel; this client has no
             // place to show one, so it neither lists nor attaches to them.
             sessions.retain(|s| s.parent.is_none());
             // A restart is a new pty behind an unchanged id, and the daemon's output channel

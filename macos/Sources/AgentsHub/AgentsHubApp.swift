@@ -79,9 +79,10 @@ struct AgentsHubApp: App {
                 Button("Focus Sidebar") { model.requestSidebarFocus.toggle() }
                     .keyboardShortcut("l", modifiers: .command)
                 // A shell in the selected session's cwd, on its VM, run by that VM's daemon.
-                // Works from inside a terminal for the same reason ⌘L does.
+                // Must be a key ghostty leaves unbound (`ghostty +list-keybinds --default`),
+                // or a focused surface eats it before the menu: ⌘J is scroll_to_selection.
                 Button("Toggle Terminal") { model.toggleShell() }
-                    .keyboardShortcut("j", modifiers: .command)
+                    .keyboardShortcut("b", modifiers: .command)
                 Divider()
                 Picker("Appearance", selection: $appearance) {
                     ForEach(AppAppearance.allCases) { Text($0.label).tag($0) }
@@ -121,7 +122,7 @@ struct SettingsView: View {
                  + "only paints the app around it.")
                 .font(Ghostty.ui(Ghostty.fontSize - 2))
                 .foregroundStyle(.secondary)
-            LabeledContent("Terminal panel (⌘J)") {
+            LabeledContent("Terminal panel (⌘B)") {
                 HStack {
                     Slider(value: $shellFraction, in: ShellPanelSize.range)
                     Text("\(Int((shellFraction * 100).rounded()))%")
@@ -201,7 +202,7 @@ struct RootView: View {
         }
     }
 
-    /// The agent pane, with the ⌘J shell panel under it when the selected session has one
+    /// The agent pane, with the ⌘B shell panel under it when the selected session has one
     /// open.
     ///
     /// The panel is laid out at its full height even while closed, behind the agent pane
@@ -230,26 +231,36 @@ struct RootView: View {
         }
     }
 
-    /// Same shape as `splitHandle`, turned on its side. Global coordinates, because the
-    /// handle moves with the drag and a local translation would chase its own tail.
+    /// The panel's header, which is also its resize handle. Global coordinates, because
+    /// the handle moves with the drag and a local translation would chase its own tail.
     private func shellHandle(total: CGFloat) -> some View {
-        Divider()
-            .overlay {
-                Color.clear
-                    .frame(height: 9)
-                    .contentShape(.rect)
-                    .onHover { $0 ? NSCursor.resizeUpDown.push() : NSCursor.pop() }
-                    .gesture(
-                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
-                            .onChanged { drag in
-                                let start = fractionAtDragStart ?? shellFraction
-                                fractionAtDragStart = start
-                                let moved = Double(drag.translation.height / max(total, 1))
-                                shellFraction = ShellPanelSize.clamp(start - moved)
-                            }
-                            .onEnded { _ in fractionAtDragStart = nil }
-                    )
+        VStack(spacing: 0) {
+            Divider()
+            HStack {
+                Text("terminal")
+                    .font(Ghostty.ui(Ghostty.fontSize - 3))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(.quaternary, in: Capsule())
+                Spacer()
             }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+        }
+        .background(Ghostty.background)
+        .contentShape(.rect)
+        .onHover { $0 ? NSCursor.resizeUpDown.push() : NSCursor.pop() }
+        .gesture(
+            DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                .onChanged { drag in
+                    let start = fractionAtDragStart ?? shellFraction
+                    fractionAtDragStart = start
+                    let moved = Double(drag.translation.height / max(total, 1))
+                    shellFraction = ShellPanelSize.clamp(start - moved)
+                }
+                .onEnded { _ in fractionAtDragStart = nil }
+        )
     }
 
     /// The `Divider` is the visible pane edge; the clear strip over it is the grab area,
@@ -312,9 +323,9 @@ struct RootView: View {
     }
 
     private var hints: String {
-        if model.terminalFocused { return "⌘L back to list · ⌘J shell" }
+        if model.terminalFocused { return "⌘L back to list · ⌘B shell" }
         if model.selectionIsFolder { return "j/k move · space fold · f favourite · n new" }
-        return "j/k move · ⏎ attach · ⌘J shell · n new · d kill · / filter"
+        return "j/k move · ⏎ attach · ⌘B shell · n new · d kill · / filter"
     }
 
     private var statusBar: some View {

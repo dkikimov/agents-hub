@@ -63,9 +63,9 @@ In the TUI, `?` lists the keys. The ones you need:
 
 Click a row to switch sessions, drag the split to resize, drag pane text to copy.
 
-In the macOS app, `⌘J` opens a shell under the selected session: a login shell in its
+In the macOS app, `⌘B` opens a shell under the selected session: a login shell in its
 folder, on its VM, run by that VM's daemon like the session itself, so it survives the app
-quitting. `⌘J` again (or `exit`) hides it. Drag the line above it to resize, or set its
+quitting. `⌘B` again (or `exit`) hides it. Drag the line above it to resize, or set its
 height in Settings (`⌘,`). Killing the session kills its shell.
 
 ### Restarts

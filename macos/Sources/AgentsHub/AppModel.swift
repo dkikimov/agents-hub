@@ -72,7 +72,7 @@ final class AppModel: ObservableObject {
     /// than reaching into `@FocusState` from the model.
     @Published var requestSidebarFocus = false
     @Published private(set) var mounted: [SessionKey] = []
-    /// Agent sessions whose ⌘J shell panel is open. Per session, so switching to one
+    /// Agent sessions whose ⌘B shell panel is open. Per session, so switching to one
     /// without a shell does not open an empty panel under it.
     @Published private(set) var shellOpen: Set<SessionKey> = []
     /// Companion shells with a surface in the panel. Same never-unmount rule as `mounted`,
@@ -103,7 +103,7 @@ final class AppModel: ObservableObject {
     /// The panel's own grid, reported by whichever shell surface laid out last. Only the
     /// size a brand-new shell starts at; a mounted one resizes itself.
     private var shellGrid: (cols: UInt16, rows: UInt16) = (80, 12)
-    /// The session whose shell ⌘J just asked for, so it takes the keyboard the moment it
+    /// The session whose shell ⌘B just asked for, so it takes the keyboard the moment it
     /// has a live surface — which, for a first open, is a round trip to the daemon later.
     private var shellFocusPending: SessionKey?
     private var dotTimer: Timer?
@@ -212,10 +212,10 @@ final class AppModel: ObservableObject {
             router.finish(key, code: code)
             if let s = vms[index].sessions.first(where: { $0.id == id }) {
                 if let parent = s.parent {
-                    // `exit` closes the panel, as in any editor's terminal; ⌘J brings the
+                    // `exit` closes the panel, as in any editor's terminal; ⌘B brings the
                     // same shell back, relaunched, with its scrollback above the prompt.
                     closeShell(SessionKey(vm: index, id: parent))
-                    status = "shell exited (\(code)) — ⌘J starts it again"
+                    status = "shell exited (\(code)) — ⌘B starts it again"
                 } else {
                     status = "\(s.name) exited (\(code)) — press r to restart"
                 }
@@ -380,7 +380,7 @@ final class AppModel: ObservableObject {
         return shellKey(for: key)
     }
 
-    /// ⌘J. Opening always asks the daemon, which makes that one request cover every
+    /// ⌘B. Opening always asks the daemon, which makes that one request cover every
     /// case: no shell yet, one stopped by `exit` or a daemon restart, or one running.
     func toggleShell() {
         guard let key = selectedKey, info(for: key)?.isShell == false else { return }
@@ -394,7 +394,7 @@ final class AppModel: ObservableObject {
         revealShell()
     }
 
-    /// Focus goes back to the agent only if it was in the shell: ⌘J from the sidebar
+    /// Focus goes back to the agent only if it was in the shell: ⌘B from the sidebar
     /// closes the panel without dragging the keyboard into a session.
     private func closeShell(_ parent: SessionKey) {
         let hadFocus = shellKey(for: parent).flatMap { terminals[$0]?.state.isFocused } ?? false
@@ -405,8 +405,8 @@ final class AppModel: ObservableObject {
     }
 
     /// Mounts the selected session's shell if its panel is open, and hands it the keyboard
-    /// if ⌘J is still waiting on it. Called wherever a shell can newly exist or be shown:
-    /// a `Sessions` frame, a selection change, ⌘J itself.
+    /// if ⌘B is still waiting on it. Called wherever a shell can newly exist or be shown:
+    /// a `Sessions` frame, a selection change, ⌘B itself.
     ///
     /// Focus waits for `.running`: a stopped shell's terminal is about to be replaced by
     /// the relaunch, and focusing it would hand the keyboard to a surface on its way out.
@@ -645,7 +645,7 @@ final class AppModel: ObservableObject {
     private func rebuild() {
         rowsByVM = vms.indices.map { vi in
             let sessions = vms[vi].sessions
-            // Companion shells ride along in the list but are reached with ⌘J, not a row.
+            // Companion shells ride along in the list but are reached with ⌘B, not a row.
             let idx = sessions.indices.filter { !sessions[$0].isShell && matches(sessions[$0]) }
             let folds = Set(collapsed.filter { $0.vm == vi }.map(\.path))
             // A filter is a search for sessions, so an empty favourite is noise in it.
