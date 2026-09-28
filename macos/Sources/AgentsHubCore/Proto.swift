@@ -20,21 +20,28 @@ public struct SessionInfo: Codable, Sendable, Equatable, Identifiable {
     public let cwd: String
     public let status: Status
     public let createdAt: UInt64
+    /// Set on a companion shell (`Req.shell`), naming the session it belongs to. Absent
+    /// on the wire otherwise, exactly as serde's `skip_serializing_if` leaves it.
+    public let parent: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, agent, name, cwd, status
+        case id, agent, name, cwd, status, parent
         case createdAt = "created_at"
     }
 
     public init(id: String, agent: String, name: String, cwd: String,
-                status: Status, createdAt: UInt64) {
+                status: Status, createdAt: UInt64, parent: String? = nil) {
         self.id = id
         self.agent = agent
         self.name = name
         self.cwd = cwd
         self.status = status
         self.createdAt = createdAt
+        self.parent = parent
     }
+
+    /// A companion shell rather than a session of its own: never a sidebar row.
+    public var isShell: Bool { parent != nil }
 }
 
 public enum Req: Equatable, Sendable {
@@ -46,10 +53,15 @@ public enum Req: Equatable, Sendable {
     case kill(id: String)
     case restart(id: String, cols: UInt16, rows: UInt16)
     case listDir(path: String)
+    /// Open `parent`'s companion shell: created on first ask, relaunched if stopped, a
+    /// no-op if running. It arrives through `Sessions` like any other session.
+    case shell(parent: String, cols: UInt16, rows: UInt16)
 }
 
 extension Req: Encodable {
-    private enum K: String, CodingKey { case t, id, agent, name, cwd, cols, rows, data, path }
+    private enum K: String, CodingKey {
+        case t, id, agent, name, cwd, cols, rows, data, path, parent
+    }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: K.self)
@@ -88,6 +100,11 @@ extension Req: Encodable {
         case let .listDir(path):
             try c.encode("ListDir", forKey: .t)
             try c.encode(path, forKey: .path)
+        case let .shell(parent, cols, rows):
+            try c.encode("Shell", forKey: .t)
+            try c.encode(parent, forKey: .parent)
+            try c.encode(cols, forKey: .cols)
+            try c.encode(rows, forKey: .rows)
         }
     }
 }
@@ -124,6 +141,10 @@ extension Req: Decodable {
                             rows: try c.decode(UInt16.self, forKey: .rows))
         case "ListDir":
             self = .listDir(path: try c.decode(String.self, forKey: .path))
+        case "Shell":
+            self = .shell(parent: try c.decode(String.self, forKey: .parent),
+                          cols: try c.decode(UInt16.self, forKey: .cols),
+                          rows: try c.decode(UInt16.self, forKey: .rows))
         case let other:
             throw DecodingError.dataCorruptedError(forKey: .t, in: c,
                                                    debugDescription: "unknown Req '\(other)'")

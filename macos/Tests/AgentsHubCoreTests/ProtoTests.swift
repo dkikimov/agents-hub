@@ -20,6 +20,7 @@ import Testing
             .kill(id: "x"),
             .restart(id: "x", cols: 80, rows: 24),
             .listDir(path: "~"),
+            .shell(parent: "x", cols: 80, rows: 12),
         ]
         for r in reqs {
             let encoded = try line(r)
@@ -32,6 +33,8 @@ import Testing
         let resps: [Resp] = [
             .sessions([SessionInfo(id: "1", agent: "claude", name: "api", cwd: "/tmp",
                                    status: .stopped, createdAt: 7)]),
+            .sessions([SessionInfo(id: "2", agent: "shell", name: "api", cwd: "/tmp",
+                                   status: .running, createdAt: 8, parent: "1")]),
             .sessions([]),
             .output(id: "x", data: Data([0, 255, 10, 13]), live: true),
             .exited(id: "x", code: -1),
@@ -73,6 +76,22 @@ import Testing
             with: try JSONEncoder().encode(info)) as? [String: Any]
         #expect(json?["created_at"] as? UInt64 == 3, "serde uses the snake_case field name")
         #expect(json?["status"] as? String == "Running", "serde emits the bare variant name")
+        #expect(json?.keys.contains("parent") == false,
+                "an ordinary session carries no parent, as skip_serializing_if leaves it")
+
+        let shell = try line(Req.shell(parent: "a", cols: 80, rows: 12))
+        let fields = try JSONSerialization.jsonObject(with: Data(shell.utf8)) as? [String: Any]
+        #expect(fields?["t"] as? String == "Shell")
+        #expect(fields?["parent"] as? String == "a")
+    }
+
+    /// A daemon from before companion shells never sends `parent`, and neither does a
+    /// `state.json` it wrote.
+    @Test func sessionInfoWithoutParentIsASession() throws {
+        let raw = #"{"id":"1","agent":"claude","name":"api","cwd":"/","status":"Running","created_at":1}"#
+        let info = try JSONDecoder().decode(SessionInfo.self, from: Data(raw.utf8))
+        #expect(info.parent == nil)
+        #expect(!info.isShell)
     }
 
     @Test func unknownFramesFailLoudlyRatherThanSilently() {

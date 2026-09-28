@@ -44,6 +44,43 @@ struct TerminalPane: View {
 
 }
 
+/// The ⌘J panel: every mounted companion shell, stacked for the same reasons as
+/// `TerminalPane`, with only the selected session's drawing.
+struct ShellPane: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        let visible = model.visibleShellKey
+        ZStack {
+            if model.shellPanelOpen, !(visible.map { model.mountedShells.contains($0) } ?? false) {
+                Text("starting shell…").foregroundStyle(.secondary)
+            }
+            ForEach(model.mountedShells, id: \.self) { key in
+                if let terminal = model.terminals[key] {
+                    TerminalSurfaceView(context: terminal.state)
+                        .opacity(key == visible ? 1 : 0)
+                        .allowsHitTesting(key == visible)
+                        .accessibilityHidden(key != visible)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Ghostty.background)
+    }
+}
+
+/// The panel's height as a share of the space the terminals get, so it keeps its
+/// proportion through a window resize. Dragged from the handle, or set in Settings.
+enum ShellPanelSize {
+    static let key = "shellPanelFraction"
+    static let initial = 0.35
+    static let range = 0.15...0.85
+
+    static func clamp(_ fraction: Double) -> Double {
+        min(range.upperBound, max(range.lowerBound, fraction))
+    }
+}
+
 /// Hands the model the window holding the panes, so it can ask whether that window is on
 /// screen. Sits in the pane's own background rather than the root view so it can only ever
 /// answer for the window the surfaces are in — the Settings window is one too.

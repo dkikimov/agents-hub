@@ -78,6 +78,10 @@ struct AgentsHubApp: App {
                 // keyboard it takes everything except the command layer.
                 Button("Focus Sidebar") { model.requestSidebarFocus.toggle() }
                     .keyboardShortcut("l", modifiers: .command)
+                // A shell in the selected session's cwd, on its VM, run by that VM's daemon.
+                // Works from inside a terminal for the same reason ⌘L does.
+                Button("Toggle Terminal") { model.toggleShell() }
+                    .keyboardShortcut("j", modifiers: .command)
                 Divider()
                 Picker("Appearance", selection: $appearance) {
                     ForEach(AppAppearance.allCases) { Text($0.label).tag($0) }
@@ -96,6 +100,7 @@ struct AgentsHubApp: App {
 struct SettingsView: View {
     @AppStorage("appearance") private var appearance = AppAppearance.dark
     @AppStorage("theme") private var theme = Theme.classic
+    @AppStorage(ShellPanelSize.key) private var shellFraction = ShellPanelSize.initial
 
     var body: some View {
         Form {
@@ -114,6 +119,18 @@ struct SettingsView: View {
             }
             Text("Terminal colours and font come from your own ghostty config; a theme here "
                  + "only paints the app around it.")
+                .font(Ghostty.ui(Ghostty.fontSize - 2))
+                .foregroundStyle(.secondary)
+            LabeledContent("Terminal panel (⌘J)") {
+                HStack {
+                    Slider(value: $shellFraction, in: ShellPanelSize.range)
+                    Text("\(Int((shellFraction * 100).rounded()))%")
+                        .monospacedDigit()
+                        .frame(width: 40, alignment: .trailing)
+                }
+            }
+            Text("Height of the shell panel, as a share of the terminal area. Dragging the "
+                 + "line above the panel sets the same value.")
                 .font(Ghostty.ui(Ghostty.fontSize - 2))
                 .foregroundStyle(.secondary)
         }
@@ -137,6 +154,8 @@ struct RootView: View {
     @AppStorage("theme") private var theme = Theme.classic
     @AppStorage("sidebarWidth") private var sidebarWidth = 270.0
     @State private var widthAtDragStart: Double?
+    @AppStorage(ShellPanelSize.key) private var shellFraction = ShellPanelSize.initial
+    @State private var fractionAtDragStart: Double?
 
     private var scheme: ColorScheme { appearance.colorScheme ?? systemScheme }
 
@@ -150,8 +169,7 @@ struct RootView: View {
                 .frame(width: sidebarWidth)
             splitHandle
             VStack(spacing: 0) {
-                TerminalPane(model: model)
-                    .focused($focus, equals: .terminal)
+                terminals
                 Divider()
                 statusBar
             }
@@ -181,6 +199,57 @@ struct RootView: View {
                 KillConfirm(model: model, key: key, label: label)
             }
         }
+    }
+
+    /// The agent pane, with the ⌘J shell panel under it when the selected session has one
+    /// open.
+    ///
+    /// The panel is laid out at its full height even while closed, behind the agent pane
+    /// at `opacity(0)`: pulling it out of the hierarchy would destroy every shell's
+    /// scrollback, and a zero-height one would build no surface at all — the same traps
+    /// `TerminalPane` documents. Opening it only shrinks the agent pane to uncover it.
+    private var terminals: some View {
+        GeometryReader { geo in
+            let panel = (geo.size.height * CGFloat(ShellPanelSize.clamp(shellFraction))).rounded()
+            ZStack(alignment: .bottom) {
+                ShellPane(model: model)
+                    .frame(height: panel)
+                    .opacity(model.shellPanelOpen ? 1 : 0)
+                    .allowsHitTesting(model.shellPanelOpen)
+                VStack(spacing: 0) {
+                    TerminalPane(model: model)
+                        .focused($focus, equals: .terminal)
+                    if model.shellPanelOpen {
+                        shellHandle(total: geo.size.height)
+                        Color.clear
+                            .frame(height: panel)
+                            .allowsHitTesting(false)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Same shape as `splitHandle`, turned on its side. Global coordinates, because the
+    /// handle moves with the drag and a local translation would chase its own tail.
+    private func shellHandle(total: CGFloat) -> some View {
+        Divider()
+            .overlay {
+                Color.clear
+                    .frame(height: 9)
+                    .contentShape(.rect)
+                    .onHover { $0 ? NSCursor.resizeUpDown.push() : NSCursor.pop() }
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                            .onChanged { drag in
+                                let start = fractionAtDragStart ?? shellFraction
+                                fractionAtDragStart = start
+                                let moved = Double(drag.translation.height / max(total, 1))
+                                shellFraction = ShellPanelSize.clamp(start - moved)
+                            }
+                            .onEnded { _ in fractionAtDragStart = nil }
+                    )
+            }
     }
 
     /// The `Divider` is the visible pane edge; the clear strip over it is the grab area,
@@ -243,9 +312,9 @@ struct RootView: View {
     }
 
     private var hints: String {
-        if model.terminalFocused { return "⌘L back to list" }
+        if model.terminalFocused { return "⌘L back to list · ⌘J shell" }
         if model.selectionIsFolder { return "j/k move · space fold · f favourite · n new" }
-        return "j/k move · ⏎ attach · n new · d kill · / filter"
+        return "j/k move · ⏎ attach · ⌘J shell · n new · d kill · / filter"
     }
 
     private var statusBar: some View {

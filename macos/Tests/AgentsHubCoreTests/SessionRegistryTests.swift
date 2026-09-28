@@ -105,6 +105,22 @@ import Testing
             .send(vm: 1, req: .resize(id: "z", cols: 200, rows: 50)),
         ])
     }
+
+    /// A companion shell is attached like any session — that is how its panel gets bytes —
+    /// but it is sized by its own panel, never by the agent pane.
+    @Test func companionShellsAttachButKeepTheirOwnSize() {
+        var r = SessionRegistry()
+        _ = r.connected(vm: 0)
+        let shell = SessionInfo(id: "sh", agent: "shell", name: "a", cwd: "~/p",
+                                status: .running, createdAt: 1, parent: "a")
+        let effects = r.sessions(vm: 0, [info("a", .running), shell], cols: 80, rows: 24)
+
+        #expect(effects.contains(.send(vm: 0, req: .attach(id: "sh", cols: 80, rows: 24))))
+        #expect(r.isAttached(key("sh")))
+        #expect(r.resized(cols: 200, rows: 50) == [
+            .send(vm: 0, req: .resize(id: "a", cols: 200, rows: 50)),
+        ])
+    }
 }
 
 @Suite struct LineReaderTests {
