@@ -205,7 +205,8 @@ fn a_companion_shell_lives_and_dies_with_its_session() {
     let mut s = connect(&dir);
     let mut r = BufReader::new(s.try_clone().unwrap());
 
-    let cwd = dir.display().to_string();
+    // Canonical because the shell's $PWD is: macOS's temp dir sits behind /var → /private/var.
+    let cwd = dir.canonicalize().unwrap().display().to_string();
     send(
         &mut s,
         &format!(r#"{{"t":"Create","agent":"echo","name":"host","cwd":"{cwd}","cols":80,"rows":24}}"#),
