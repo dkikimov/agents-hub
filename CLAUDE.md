@@ -22,7 +22,7 @@ make vm HOST=buildbox                          # provision a remote over SSH
 Underneath, and for anything narrower than a whole suite:
 
 ```bash
-cargo test                                     # 71 unit + 1 integration
+cargo test                                     # 75 unit + 2 integration
 cargo test --test roundtrip                    # integration only (spawns real daemons + PTYs)
 cargo test tui::event::                        # one module's tests
 cargo test key_bytes_match_a_real_terminal     # single test by name
@@ -111,6 +111,14 @@ into `vt100::Parser` and renders with `tui-term`. Keep the server dumb about scr
 **The client attaches to every session and never detaches**, so switching selection is instant
 rather than triggering a fresh replay. `App::reconcile` does this; `Ui::Up` clears `attached`
 so a reconnect re-attaches and rebuilds parsers from replay.
+
+**Companion shells** (`Req::Shell`, the macOS app's ⌘J) are ordinary daemon sessions with
+`parent` set, so they get PTY ownership, logs, replay and restart for free. What sets them
+apart: the daemon launches `$SHELL -l` rather than an `[agents.*]` entry, `Shell` is
+idempotent (create, relaunch if stopped, else nothing), and `Kill` of the parent takes them
+with it. Clients must not list them as rows — the TUI drops them on arrival, the macOS
+client filters them out of the sidebar and keeps them out of `SessionRegistry.resized`,
+because a shell is sized by its own panel.
 
 **Persistence semantics** (deliberate, confirmed with the user): PTYs die with the daemon since
 it holds the master fd. `state.json` + per-session logs survive, so after any restart sessions

@@ -42,6 +42,14 @@ pub enum Req {
     ListDir {
         path: String,
     },
+    /// Opens the companion shell of session `parent`: a login shell in its cwd, created on
+    /// first ask and relaunched if stopped. Idempotent, so a client never has to know
+    /// whether one exists yet. It arrives in `Sessions` like any other, with `parent` set.
+    Shell {
+        parent: String,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 /// Struct variants only: serde's internally-tagged repr cannot serialize a newtype
@@ -72,6 +80,10 @@ pub struct SessionInfo {
     pub cwd: String,
     pub status: Status,
     pub created_at: u64,
+    /// Set on a companion shell (`Req::Shell`), naming the session it belongs to. Clients
+    /// that know nothing of shells must not list these, and killing the parent kills them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +122,11 @@ mod tests {
                 data: b64(b"hi\x1b[0m"),
             },
             Req::ListDir { path: "~".into() },
+            Req::Shell {
+                parent: "x".into(),
+                cols: 80,
+                rows: 24,
+            },
         ];
         for r in reqs {
             let line = serde_json::to_string(&r).unwrap();
@@ -128,6 +145,18 @@ mod tests {
                     cwd: "/tmp".into(),
                     status: Status::Stopped,
                     created_at: 7,
+                    parent: None,
+                }],
+            },
+            Resp::Sessions {
+                sessions: vec![SessionInfo {
+                    id: "2".into(),
+                    agent: "shell".into(),
+                    name: "api".into(),
+                    cwd: "/tmp".into(),
+                    status: Status::Running,
+                    created_at: 8,
+                    parent: Some("1".into()),
                 }],
             },
             Resp::Sessions { sessions: vec![] },
@@ -166,6 +195,15 @@ mod tests {
                 live: false,
             }
         );
+
+        // A state.json or a daemon from before companion shells has no `parent`, and an
+        // ordinary session must not grow one on the wire.
+        let old_info: SessionInfo = serde_json::from_str(
+            r#"{"id":"1","agent":"claude","name":"api","cwd":"/","status":"Running","created_at":1}"#,
+        )
+        .unwrap();
+        assert_eq!(old_info.parent, None);
+        assert!(!serde_json::to_string(&old_info).unwrap().contains("parent"));
     }
 
     #[test]

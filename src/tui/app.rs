@@ -396,6 +396,7 @@ pub mod fixture {
                 cwd: (*cwd).into(),
                 status: Status::Running,
                 created_at: i as u64,
+                parent: None,
             })
             .collect();
         let vm = VmState {
