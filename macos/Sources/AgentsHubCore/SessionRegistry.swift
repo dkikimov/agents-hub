@@ -62,8 +62,12 @@ public struct SessionRegistry {
     /// with the old PTY — a surviving attachment would go silent forever. Any id that
     /// went Stopped → Running is therefore dropped from `attached` first, so it takes
     /// exactly the same path a dropped connection takes.
+    ///
+    /// Attach resizes the PTY, so companion shells attach at the panel's grid: a shell
+    /// attached at the agent pane's stays that size until its own surface is built.
     public mutating func sessions(
-        vm: Int, _ list: [SessionInfo], cols: UInt16, rows: UInt16
+        vm: Int, _ list: [SessionInfo], cols: UInt16, rows: UInt16,
+        shellCols: UInt16, shellRows: UInt16
     ) -> [Effect] {
         let previous = known[vm] ?? [:]
         var live: [String: Status] = [:]
@@ -95,7 +99,8 @@ public struct SessionRegistry {
             attached.insert(key)
             effects.append(.teardown(key))
             // Attach doubles as a resize server-side, so no separate Resize is needed.
-            effects.append(.send(vm: vm, req: .attach(id: id, cols: cols, rows: rows)))
+            let (c, r) = shells.contains(key) ? (shellCols, shellRows) : (cols, rows)
+            effects.append(.send(vm: vm, req: .attach(id: id, cols: c, rows: r)))
         }
         return effects
     }

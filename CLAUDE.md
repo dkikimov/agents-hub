@@ -163,6 +163,12 @@ work. `Run`'s fields are `Arc<Mutex<..>>` specifically to make that possible.
   `mode_prelude` — without it ⌘V arrives unbracketed and every newline submits. Anything else
   sticky and one-shot (alt screen, focus reporting) has the same shape; the prelude restores
   whatever it finds rather than a list someone has to remember to extend.
+- **A fresh ghostty surface is 49×17 until it isn't.** libghostty-spm attaches the session
+  at `ghostty_surface_new`, flushes everything buffered into it, and only then sizes it —
+  so replay was parsed at 49 columns (a stopped agent's alt screen never reflows), that
+  default grid went out as a `Resize` to every session, and ghostty's answers to the
+  history's DA/XTWINOPS queries were typed into live shells. `AttachFeed` holds bytes and
+  resizes until ghostty reports the grid the view laid out; its tests pin each rule.
 
 ## Conventions
 

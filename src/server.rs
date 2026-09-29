@@ -459,13 +459,13 @@ impl Hub {
             Req::Attach { id, cols, rows } => {
                 let mut replay = mode_prelude(&self.log_path(&id), REPLAY_BYTES);
                 replay.extend_from_slice(&read_tail(&self.log_path(&id), REPLAY_BYTES));
-                if !replay.is_empty() {
-                    let _ = tx.send(Resp::Output {
-                        id: id.clone(),
-                        data: b64(&replay),
-                        live: false,
-                    });
-                }
+                // Sent even when empty: it is how a client learns the replay is over, and
+                // the macOS one shuts writeback until then.
+                let _ = tx.send(Resp::Output {
+                    id: id.clone(),
+                    data: b64(&replay),
+                    live: false,
+                });
                 let sub = {
                     let s = self.sessions.lock().unwrap();
                     s.get(&id).and_then(|x| x.run.as_ref()).map(|r| {

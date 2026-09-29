@@ -1,49 +1,17 @@
 import AgentsHubCore
+import Combine
 import Foundation
 import GhosttyTerminal
-
-/// Holds back anything ghostty writes while the attach replay is still being parsed.
-///
-/// Ghostty is a real emulator, so feeding it 128 KB of replayed history could make it
-/// *answer* the DA/DSR/CPR queries buried in that history — and those answers would go
-/// out the write callback into the live PTY as if typed. `vt100::Parser` never talked
-/// back, so the Rust client never had to care.
-///
-/// Measured against real Claude Code scrollback this never actually fires, so it is
-/// insurance rather than load-bearing. It costs a lock on a path that runs at keystroke
-/// rate, which is free.
-final class ReplayGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private var open = false
-    private var held = 0
-
-    func allows(_ data: Data) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        if open { return true }
-        held += data.count
-        return false
-    }
-
-    /// Returns how many bytes were suppressed, for the log.
-    @discardableResult
-    func openUp() -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        open = true
-        return held
-    }
-}
 
 /// Routes PTY bytes from the link queues to the right terminal without ever touching the
 /// main actor. `AppModel` owns the terminals; this owns just enough to feed them, because
 /// hopping every 8 KB chunk onto the main actor is what makes a busy agent stutter.
 final class TerminalRouter: @unchecked Sendable {
     private let lock = NSLock()
-    private var sinks: [SessionKey: InMemoryTerminalSession] = [:]
+    private var sinks: [SessionKey: AttachFeed] = [:]
     private var watch = ActivityWatch()
 
-    func set(_ key: SessionKey, _ sink: InMemoryTerminalSession?) {
+    func set(_ key: SessionKey, _ sink: AttachFeed?) {
         lock.lock()
         defer { lock.unlock() }
         sinks[key] = sink
@@ -69,7 +37,7 @@ final class TerminalRouter: @unchecked Sendable {
         lock.lock()
         let sink = sinks[key]
         lock.unlock()
-        sink?.finish(exitCode: UInt32(bitPattern: code), runtimeMilliseconds: 0)
+        sink?.finish(exitCode: UInt32(bitPattern: code))
     }
 
     /// Keys that produced output of their own within `window`.
@@ -81,24 +49,25 @@ final class TerminalRouter: @unchecked Sendable {
 }
 
 /// One session's terminal: the ghostty-side session, the view state that renders it, and
-/// the replay gate. Created fresh on attach — handing `backend` a different
-/// `InMemoryTerminalSession` instance is what rebuilds the surface, which is exactly the
-/// teardown a restart needs.
+/// the feed between them and the link. Created fresh on attach — handing `backend` a
+/// different `InMemoryTerminalSession` instance is what rebuilds the surface, which is
+/// exactly the teardown a restart needs.
 @MainActor
 final class TerminalSession {
     let key: SessionKey
     let state = TerminalViewState(controller: Ghostty.controller)
     let session: InMemoryTerminalSession
+    let feed = AttachFeed()
 
-    private let gate = ReplayGate()
     private var bellsAtReplayEnd: Int?
+    private var layout: AnyCancellable?
 
     /// Bells rung since the attach replay finished.
     ///
     /// Replay is real scrollback fed to a real emulator, so a bell buried in it rings
     /// exactly like a live one — counting from zero would fire a notification for every
-    /// answer already read, on every reconnect and every restart. Same hazard as
-    /// `ReplayGate`, so it is drawn from the same line.
+    /// answer already read, on every reconnect and every restart. Same hazard as the
+    /// feed's writeback, so it is drawn from the same line.
     var liveBells: Int {
         guard let bellsAtReplayEnd else { return 0 }
         return max(0, state.bellCount - bellsAtReplayEnd)
@@ -113,17 +82,39 @@ final class TerminalSession {
          onGrid: @escaping @Sendable (UInt16, UInt16) -> Void) {
         self.key = key
         let id = key.id
-        let gate = self.gate
+        let feed = self.feed
+        let report: @Sendable (AttachFeed.Grid) -> Void = { grid in
+            send(.resize(id: id, cols: grid.cols, rows: grid.rows))
+            onGrid(grid.cols, grid.rows)
+        }
         session = InMemoryTerminalSession(
             write: { data in
-                guard gate.allows(data) else { return }
+                guard feed.allowsWriteback(data) else { return }
                 send(.input(id: id, data: data))
             },
             resize: { viewport in
-                send(.resize(id: id, cols: viewport.columns, rows: viewport.rows))
-                onGrid(viewport.columns, viewport.rows)
+                let grid = AttachFeed.Grid(cols: viewport.columns, rows: viewport.rows)
+                if feed.resized(grid) { report(grid) }
             }
         )
+        let session = self.session
+        feed.bind(
+            parse: { session.receive($0) },
+            exit: { session.finish(exitCode: $0, runtimeMilliseconds: 0) },
+            // ponytail: a fixed beat for ghostty's IO thread to take the terminal lock it
+            // resizes under, since nothing reports the resize applied. Queued behind it,
+            // the write waits; a thread stalled past the beat still lays out narrow.
+            sized: {
+                DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(20)) {
+                    feed.release()
+                }
+            },
+            settled: { Task { @MainActor [weak self] in await self?.replayParsed() } }
+        )
+        layout = state.$surfaceSize.compactMap { $0 }.sink { size in
+            let grid = AttachFeed.Grid(cols: size.columns, rows: size.rows)
+            if feed.laidOut(grid) { report(grid) }
+        }
         state.configuration = TerminalSurfaceOptions(
             backend: .inMemory(session),
             // Claude Code repaints fully on every resize; coalescing a live window drag
@@ -131,7 +122,6 @@ final class TerminalSession {
             resizeThrottleMilliseconds: 100
         )
         state.isSurfaceVisible = false
-        openGateOnceReplayDrains()
     }
 
     func focus() {
@@ -140,35 +130,29 @@ final class TerminalSession {
         state.requestFocus()
     }
 
-    /// ponytail: polls for the surface because `TerminalViewState` is the view's own
-    /// delegate and there is no attach callback to hang this on. Replace if the package
-    /// ever exposes one.
-    private func openGateOnceReplayDrains() {
-        let session = self.session
-        let gate = self.gate
-        let name = key.id
-        Task { @MainActor [weak self] in
-            for _ in 0..<600 where self?.state.surface == nil {
-                try? await Task.sleep(for: .milliseconds(16))
-            }
-            // On the main actor, never detached: a replay dense with titles and OSC 7
-            // (any shell prompt) fills ghostty's 64-slot app mailbox, only a main-thread
-            // tick empties it, and only a main-thread caller ticks while it waits. Off
-            // main, the gate stays shut — dropping keystrokes — until something else
-            // happens to tick.
-            session.waitForPendingOutput()
-            let held = gate.openUp()
-            if held > 0 {
-                NSLog("agents-hub: held %d bytes of replay writeback for %@", held, name)
-            }
-            // A turn late, deliberately. Replay's bells are parsed by the time
-            // `waitForPendingOutput` returns but publish through
-            // `terminalRunOnMainNextTurn`, so they are sitting on the main queue ahead of
-            // this — which is FIFO, so reading the count here counts all of them.
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                MainActor.assumeIsolated { self.bellsAtReplayEnd = self.state.bellCount }
-            }
+    /// On the main actor, never detached: a replay dense with titles and OSC 7 (any shell
+    /// prompt) fills ghostty's 64-slot app mailbox, only a main-thread tick empties it, and
+    /// only a main-thread caller ticks while it waits. Off main, writeback stays shut —
+    /// dropping keystrokes — until something else happens to tick.
+    private func replayParsed() async {
+        session.waitForPendingOutput()
+        // ponytail: a fixed grace, because answers to parsed queries leave through
+        // ghostty's IO-thread mailbox after the parse returns, and nothing reports that
+        // queue empty. Measured at under a millisecond; an IO thread stalled longer still
+        // leaks them. The fix at the origin is the fork's
+        // `ghostty_surface_write_buffer_replay`, once libghostty-spm's session exposes it.
+        try? await Task.sleep(for: .milliseconds(100))
+        let dropped = feed.openWriteback()
+        if dropped > 0 {
+            NSLog("agents-hub: dropped %d bytes of replay writeback for %@", dropped, key.id)
+        }
+        // A turn late, deliberately. Replay's bells are parsed by the time
+        // `waitForPendingOutput` returns but publish through `terminalRunOnMainNextTurn`,
+        // so they are sitting on the main queue ahead of this — which is FIFO, so reading
+        // the count here counts all of them.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            MainActor.assumeIsolated { self.bellsAtReplayEnd = self.state.bellCount }
         }
     }
 }

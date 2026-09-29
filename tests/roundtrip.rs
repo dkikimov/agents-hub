@@ -109,11 +109,15 @@ fn session_survives_a_daemon_restart() {
 
     send(&mut s, &format!(r#"{{"t":"Attach","id":"{id}","cols":80,"rows":24}}"#));
     let out = wait_for(&mut r, |l| l.contains("\"Output\""));
+    assert!(
+        out.contains("\"live\":false"),
+        "an attach answers with its replay first, even an empty one: {out}"
+    );
     let b64 = out.split("\"data\":\"").nth(1).unwrap().split('"').next().unwrap();
-    let decoded = String::from_utf8_lossy(
-        &base64_decode(b64),
-    )
-    .to_string();
+    let mut decoded = String::from_utf8_lossy(&base64_decode(b64)).to_string();
+    if !decoded.contains("ping-from-pty") {
+        decoded += &wait_for_output(&mut r, &id, "ping-from-pty");
+    }
     assert!(
         decoded.contains("ping-from-pty"),
         "PTY output should reach the client, got: {decoded:?}"
