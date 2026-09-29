@@ -208,7 +208,10 @@ fn modal_key(app: &mut App, modal: Modal, k: KeyEvent) -> bool {
                     if agent_name.is_empty() {
                         app.status = "no [agents.*] in config.toml".into();
                     } else {
-                        let display = if name.trim().is_empty() {
+                        // A blank name is the user declining to choose: the folder stands in
+                        // until the agent titles itself, and the daemon may then swap it.
+                        let auto = name.trim().is_empty();
+                        let display = if auto {
                             default_name(&cwd, &agent_name)
                         } else {
                             name.trim().to_string()
@@ -221,6 +224,7 @@ fn modal_key(app: &mut App, modal: Modal, k: KeyEvent) -> bool {
                                 cwd: cwd.clone(),
                                 cols,
                                 rows,
+                                auto,
                             },
                         );
                     }
@@ -861,7 +865,8 @@ mod tests {
                 name: "work".into(),
                 cwd: "~/work".into(),
                 cols: 80,
-                rows: 24
+                rows: 24,
+                auto: true,
             }]
         );
         assert!(a.modal.is_none());
@@ -879,10 +884,11 @@ mod tests {
         on_key(&mut a, code(KeyCode::Tab)); // → cwd
         on_key(&mut a, code(KeyCode::Backspace));
         on_key(&mut a, code(KeyCode::Enter));
-        let Some(Req::Create { name, cwd, .. }) = sent(&mut rx).pop() else {
+        let Some(Req::Create { name, cwd, auto, .. }) = sent(&mut rx).pop() else {
             panic!("expected a Create")
         };
         assert_eq!((name.as_str(), cwd.as_str()), ("api", "~/wor"));
+        assert!(!auto, "a name the user typed must survive the agent's own title");
 
         // Esc throws the whole thing away.
         on_key(&mut a, key('n'));

@@ -31,6 +31,10 @@ pub struct Agent {
     /// Used by `r` on a stopped session, so Claude Code can pick its thread back up.
     #[serde(default)]
     pub resume: Option<Vec<String>>,
+    /// Rename the session after the window title the agent sets. Left out, that is on for
+    /// `claude` and `codex` and off for anything else.
+    #[serde(default)]
+    pub title: Option<bool>,
 }
 
 fn default_remote_bin() -> String {

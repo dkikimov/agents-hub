@@ -15,6 +15,11 @@ pub enum Req {
         cwd: String,
         cols: u16,
         rows: u16,
+        /// The client picked the name itself (a folder default) because the user gave none,
+        /// so the agent's own title may replace it. False for a name the user typed. Absent
+        /// from an older client, which reads as "keep the name".
+        #[serde(default)]
+        auto: bool,
     },
     Attach {
         id: String,
@@ -84,6 +89,14 @@ pub struct SessionInfo {
     /// that know nothing of shells must not list these, and killing the parent kills them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// `name` is a placeholder the agent's window title may replace (see `Req::Create`).
+    /// Clients have no use for it; it rides along because `state.json` stores this struct.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +129,7 @@ mod tests {
                 cwd: "/tmp".into(),
                 cols: 80,
                 rows: 24,
+                auto: true,
             },
             Req::Input {
                 id: "x".into(),
@@ -146,6 +160,7 @@ mod tests {
                     status: Status::Stopped,
                     created_at: 7,
                     parent: None,
+                    auto: true,
                 }],
             },
             Resp::Sessions {
@@ -157,6 +172,7 @@ mod tests {
                     status: Status::Running,
                     created_at: 8,
                     parent: Some("1".into()),
+                    auto: false,
                 }],
             },
             Resp::Sessions { sessions: vec![] },
@@ -204,6 +220,14 @@ mod tests {
         .unwrap();
         assert_eq!(old_info.parent, None);
         assert!(!serde_json::to_string(&old_info).unwrap().contains("parent"));
+        // Likewise `auto`: old state means "keep the name", and false stays off the wire.
+        assert!(!old_info.auto);
+        assert!(!serde_json::to_string(&old_info).unwrap().contains("auto"));
+        let old_create: Req = serde_json::from_str(
+            r#"{"t":"Create","agent":"claude","name":"api","cwd":"/","cols":80,"rows":24}"#,
+        )
+        .unwrap();
+        assert!(matches!(old_create, Req::Create { auto: false, .. }));
     }
 
     #[test]

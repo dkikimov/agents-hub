@@ -7,6 +7,7 @@ mod config;
 mod proto;
 mod server;
 mod setup;
+mod title;
 mod tui;
 
 use anyhow::{bail, Context, Result};

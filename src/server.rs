@@ -4,6 +4,7 @@
 
 use crate::config::{expand, Config};
 use crate::proto::*;
+use crate::title::{self, TitleScanner};
 use anyhow::{anyhow, Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
@@ -208,19 +209,25 @@ impl SessionLog {
     }
 }
 
-/// Fans one PTY's output out to whoever is attached and appends it to the session log.
+/// Fans one PTY's output out to whoever is attached and appends it to the session log,
+/// handing any window title the guest sets to `on_title`.
 /// Returns the child's exit code once the PTY closes.
 fn pty_reader(
     mut reader: Box<dyn Read + Send>,
     log_path: PathBuf,
     tx: &broadcast::Sender<Ev>,
     child: &Mutex<Box<dyn Child + Send + Sync>>,
+    mut on_title: impl FnMut(String),
 ) -> i32 {
     let mut log = SessionLog::open(log_path);
+    let mut titles = TitleScanner::default();
     let mut buf = [0u8; 8192];
     while let Ok(n @ 1..) = reader.read(&mut buf) {
         let chunk = &buf[..n];
         log.append(chunk);
+        if let Some(title) = titles.feed(chunk) {
+            on_title(title);
+        }
         let _ = tx.send(Ev::Data(Arc::new(chunk.to_vec())));
     }
     child
@@ -287,6 +294,39 @@ impl Hub {
         let _ = self.changed.send(());
     }
 
+    /// Whether this agent's window title names the work. Claude Code and Codex set one;
+    /// a shell's is `user@host: cwd`, which is noise as a session name. `title` in the
+    /// agent's config overrides the guess from the command.
+    fn wants_titles(&self, agent: &str) -> bool {
+        let Some(a) = self.cfg.agents.get(agent) else {
+            return false;
+        };
+        a.title.unwrap_or_else(|| {
+            let prog = a.command.first().map(|c| expand(c)).unwrap_or_default();
+            matches!(
+                Path::new(&prog).file_name().and_then(|n| n.to_str()),
+                Some("claude" | "codex")
+            )
+        })
+    }
+
+    /// The agent titled itself: adopt that as the session's name, unless the user chose one.
+    fn set_title(&self, id: &str, raw: &str) {
+        {
+            let mut s = self.sessions.lock().unwrap();
+            let Some(sess) = s.get_mut(id) else { return };
+            let info = &mut sess.info;
+            if !info.auto || info.parent.is_some() || !self.wants_titles(&info.agent) {
+                return;
+            }
+            match title::clean(raw, &info.agent) {
+                Some(name) if name != info.name => info.name = name,
+                _ => return,
+            }
+        }
+        self.announce();
+    }
+
     fn mark_stopped(&self, id: &str) {
         {
             let mut s = self.sessions.lock().unwrap();
@@ -345,7 +385,7 @@ impl Hub {
         let etx = tx.clone();
         let echild = child.clone();
         std::thread::spawn(move || {
-            let code = pty_reader(reader, log_path, &etx, &echild);
+            let code = pty_reader(reader, log_path, &etx, &echild, |t| hub.set_title(&sid, &t));
             let _ = etx.send(Ev::Exited(code));
             hub.mark_stopped(&sid);
         });
@@ -399,6 +439,7 @@ impl Hub {
                 cwd,
                 cols,
                 rows,
+                auto,
             } => {
                 let argv = self.argv_for(&agent, false)?;
                 let id = new_id();
@@ -411,6 +452,7 @@ impl Hub {
                     status: Status::Running,
                     created_at: now_secs(),
                     parent: None,
+                    auto,
                 };
                 self.sessions
                     .lock()
@@ -448,6 +490,7 @@ impl Hub {
                     status: Status::Running,
                     created_at: now_secs(),
                     parent: Some(parent),
+                    auto: false,
                 };
                 self.sessions
                     .lock()
@@ -899,5 +942,110 @@ mod tests {
     fn ids_are_unique() {
         let a: std::collections::HashSet<_> = (0..1000).map(|_| new_id()).collect();
         assert_eq!(a.len(), 1000);
+    }
+
+    /// A hub with a claude, a codex, a shell, and a custom agent that opts in and one that
+    /// opts out, and a session of each kind for `set_title` to be pointed at.
+    fn titled_hub() -> Hub {
+        let cfg: Config = toml::from_str(
+            r#"
+[agents.claude]
+command = ["/usr/local/bin/claude"]
+[agents.codex]
+command = ["codex", "--no-alt-screen"]
+[agents.shell]
+command = ["/bin/sh", "-l"]
+[agents.wrapped]
+command = ["my-wrapper"]
+title = true
+[agents.quiet]
+command = ["claude"]
+title = false
+"#,
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("ah-title-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = Hub::new(dir, cfg);
+        let add = |id: &str, agent: &str, auto: bool, parent: Option<&str>| {
+            hub.sessions.lock().unwrap().insert(
+                id.into(),
+                Session {
+                    info: SessionInfo {
+                        id: id.into(),
+                        agent: agent.into(),
+                        name: "proj".into(),
+                        cwd: "/".into(),
+                        status: Status::Running,
+                        created_at: 0,
+                        parent: parent.map(Into::into),
+                        auto,
+                    },
+                    run: None,
+                },
+            );
+        };
+        add("claude", "claude", true, None);
+        add("codex", "codex", true, None);
+        add("shell", "shell", true, None);
+        add("wrapped", "wrapped", true, None);
+        add("quiet", "quiet", true, None);
+        add("typed", "claude", false, None);
+        add("companion", "claude", true, Some("claude"));
+        hub
+    }
+
+    fn name_of(hub: &Hub, id: &str) -> String {
+        hub.sessions.lock().unwrap()[id].info.name.clone()
+    }
+
+    #[test]
+    fn a_title_renames_an_auto_named_agent_session() {
+        let hub = titled_hub();
+        hub.set_title("claude", "✳ Fix login bug");
+        hub.set_title("codex", "Refactor the parser");
+        hub.set_title("wrapped", "Custom agent, opted in");
+        assert_eq!(name_of(&hub, "claude"), "Fix login bug");
+        assert_eq!(name_of(&hub, "codex"), "Refactor the parser");
+        assert_eq!(name_of(&hub, "wrapped"), "Custom agent, opted in");
+
+        // and it lands in state.json, not just memory
+        let state = std::fs::read_to_string(hub.state_path()).unwrap();
+        assert!(state.contains("Fix login bug"), "{state}");
+
+        // a later turn retitles it: auto stays on
+        hub.set_title("claude", "⠂ Add rate limiting");
+        assert_eq!(name_of(&hub, "claude"), "Add rate limiting");
+    }
+
+    #[test]
+    fn a_title_leaves_alone_what_it_should() {
+        let hub = titled_hub();
+        for (id, why) in [
+            ("typed", "the user chose that name"),
+            ("shell", "a shell's title is user@host: cwd"),
+            ("quiet", "title = false"),
+            ("companion", "a companion shell is named after its parent"),
+        ] {
+            hub.set_title(id, "✳ Fix login bug");
+            assert_eq!(name_of(&hub, id), "proj", "{why}");
+        }
+        // generic and empty titles say nothing about the work
+        hub.set_title("claude", "✳ Claude Code");
+        hub.set_title("claude", "⠋");
+        assert_eq!(name_of(&hub, "claude"), "proj");
+        hub.set_title("no-such-session", "x"); // must not panic
+    }
+
+    #[test]
+    fn an_unchanged_title_does_not_announce_again() {
+        let hub = titled_hub();
+        let mut rx = hub.changed.subscribe();
+        hub.set_title("claude", "✳ Fix login bug");
+        assert!(rx.try_recv().is_ok(), "the first title is news");
+        // Claude re-sends the title every turn, and the glyph animates.
+        hub.set_title("claude", "✻ Fix login bug");
+        hub.set_title("claude", "Fix login bug");
+        assert!(rx.try_recv().is_err(), "a repeat must not wake every client");
     }
 }

@@ -14,6 +14,7 @@ import Testing
         let reqs: [Req] = [
             .list,
             .create(agent: "claude", name: "api", cwd: "/tmp", cols: 80, rows: 24),
+            .create(agent: "claude", name: "api", cwd: "/tmp", cols: 80, rows: 24, auto: true),
             .attach(id: "x", cols: 80, rows: 24),
             .input(id: "x", data: Data([0x68, 0x69, 0x1b, 0x5b, 0x30, 0x6d])),
             .resize(id: "x", cols: 100, rows: 30),

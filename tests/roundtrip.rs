@@ -266,6 +266,85 @@ fn a_companion_shell_lives_and_dies_with_its_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two agents that set the window title the way Claude Code does: a bare "Claude Code"
+/// first, the real title a beat later. `titled` opts in; `plain` is a `sh`, which the daemon
+/// must not treat as an agent that names its work.
+const TITLE_CONFIG: &str = r#"
+[[vm]]
+name = "local"
+
+[agents.titled]
+command = ["sh", "-c", '''printf "\033]0;✳ Claude Code\007"; sleep 1; printf "\033]0;✳ Fix login bug\007"; sleep 30''']
+title = true
+
+[agents.plain]
+command = ["sh", "-c", '''sleep 1; printf "\033]0;user@host: ~/x\007"; sleep 30''']
+"#;
+
+/// Every session's name in a `Sessions` frame, sorted.
+fn names(frame: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+    let mut out: Vec<String> = v["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn an_agents_title_renames_only_the_sessions_nobody_named() {
+    let dir = std::env::temp_dir().join(format!("agents-hub-title-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, TITLE_CONFIG).unwrap();
+
+    let d1 = start(&dir, &cfg);
+    let mut s = connect(&dir);
+    let mut r = BufReader::new(s.try_clone().unwrap());
+
+    let create = |agent: &str, name: &str, auto: bool| {
+        format!(
+            r#"{{"t":"Create","agent":"{agent}","name":"{name}","cwd":"/tmp","cols":80,"rows":24,"auto":{auto}}}"#
+        )
+    };
+    send(&mut s, &create("titled", "auto-folder", true)); // the folder stood in for a name
+    send(&mut s, &create("titled", "chosen", false)); // the user typed this one
+    send(&mut s, &create("plain", "a-shell", true)); // auto, but not an agent that titles
+
+    // The generic "Claude Code" title must not rename anything; the real one must.
+    let expect = ["Fix login bug", "a-shell", "chosen"];
+    let renamed = wait_for(&mut r, |l| l.contains("\"Sessions\"") && l.contains("Fix login bug"));
+    assert_eq!(names(&renamed), expect, "in {renamed}");
+
+    // Let `plain` set its title too, then confirm nothing else moved.
+    std::thread::sleep(Duration::from_millis(1500));
+    send(&mut s, r#"{"t":"List"}"#);
+    let listed = wait_for(&mut r, |l| l.contains("\"Sessions\""));
+    assert_eq!(names(&listed), expect, "in {listed}");
+
+    // The new name is what state.json holds, so it survives a restart.
+    let state = std::fs::read_to_string(dir.join("state.json")).unwrap();
+    assert!(state.contains("Fix login bug") && !state.contains("auto-folder"));
+
+    drop(r);
+    drop(s);
+    drop(d1);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let _d2 = start(&dir, &cfg);
+    let mut s = connect(&dir);
+    let mut r = BufReader::new(s.try_clone().unwrap());
+    send(&mut s, r#"{"t":"List"}"#);
+    let listed = wait_for(&mut r, |l| l.contains("\"Sessions\""));
+    assert_eq!(names(&listed), expect, "after restart: {listed}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Tiny standalone decoder so the test doesn't depend on the crate's internals.
 fn base64_decode(s: &str) -> Vec<u8> {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

@@ -120,6 +120,16 @@ with it. Clients must not list them as rows — the TUI drops them on arrival, t
 client filters them out of the sidebar and keeps them out of `SessionRegistry.resized`,
 because a shell is sized by its own panel.
 
+**Session names follow the agent's window title.** `pty_reader` feeds every chunk to
+`title::TitleScanner`, which pulls out `ESC ] 0 ; … BEL` (Claude Code sets it every turn), and
+`Hub::set_title` adopts it as `SessionInfo.name` and `announce()`s, so both clients update
+with no attached client and no new frame. Only a session created with `auto: true` (the
+user left the name blank and the client substituted the folder) is renamed, never a
+companion shell, and only for agents that title: `claude`/`codex` by command basename, or
+`title = true` in `[agents.*]`. A shell's title is `user@host: cwd`, so the default is off.
+`title::clean` drops the animated status glyph and the bare "Claude Code" it shows before
+it has a title, which is what stops the name flickering.
+
 **Persistence semantics** (deliberate, confirmed with the user): PTYs die with the daemon since
 it holds the master fd. `state.json` + per-session logs survive, so after any restart sessions
 come back listed as `Stopped` with readable history, and `r` relaunches (using `resume` argv if

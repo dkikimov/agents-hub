@@ -46,7 +46,10 @@ public struct SessionInfo: Codable, Sendable, Equatable, Identifiable {
 
 public enum Req: Equatable, Sendable {
     case list
-    case create(agent: String, name: String, cwd: String, cols: UInt16, rows: UInt16)
+    /// `auto`: the name is a stand-in (the folder) because the user typed none, so the
+    /// agent's own window title may replace it. A name the user typed is never touched.
+    case create(agent: String, name: String, cwd: String, cols: UInt16, rows: UInt16,
+                auto: Bool = false)
     case attach(id: String, cols: UInt16, rows: UInt16)
     case input(id: String, data: Data)
     case resize(id: String, cols: UInt16, rows: UInt16)
@@ -60,7 +63,7 @@ public enum Req: Equatable, Sendable {
 
 extension Req: Encodable {
     private enum K: String, CodingKey {
-        case t, id, agent, name, cwd, cols, rows, data, path, parent
+        case t, id, agent, name, cwd, cols, rows, data, path, parent, auto
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -68,13 +71,14 @@ extension Req: Encodable {
         switch self {
         case .list:
             try c.encode("List", forKey: .t)
-        case let .create(agent, name, cwd, cols, rows):
+        case let .create(agent, name, cwd, cols, rows, auto):
             try c.encode("Create", forKey: .t)
             try c.encode(agent, forKey: .agent)
             try c.encode(name, forKey: .name)
             try c.encode(cwd, forKey: .cwd)
             try c.encode(cols, forKey: .cols)
             try c.encode(rows, forKey: .rows)
+            try c.encode(auto, forKey: .auto)
         case let .attach(id, cols, rows):
             try c.encode("Attach", forKey: .t)
             try c.encode(id, forKey: .id)
@@ -121,7 +125,8 @@ extension Req: Decodable {
                            name: try c.decode(String.self, forKey: .name),
                            cwd: try c.decode(String.self, forKey: .cwd),
                            cols: try c.decode(UInt16.self, forKey: .cols),
-                           rows: try c.decode(UInt16.self, forKey: .rows))
+                           rows: try c.decode(UInt16.self, forKey: .rows),
+                           auto: try c.decodeIfPresent(Bool.self, forKey: .auto) ?? false)
         case "Attach":
             self = .attach(id: try c.decode(String.self, forKey: .id),
                            cols: try c.decode(UInt16.self, forKey: .cols),

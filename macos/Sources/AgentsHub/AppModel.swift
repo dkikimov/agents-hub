@@ -511,8 +511,9 @@ final class AppModel: ObservableObject {
         let vm = currentVM
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let display = name.isEmpty ? defaultName(cwd: cwd, agent: agent) : name
+        // A blank name is the user declining to choose, so the agent may title it later.
         send(vm, .create(agent: agent, name: display, cwd: cwd,
-                         cols: pane.cols, rows: pane.rows))
+                         cols: pane.cols, rows: pane.rows, auto: name.isEmpty))
         status = "starting \(agent) · \(display)…"
     }
 
