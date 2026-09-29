@@ -16,7 +16,7 @@ import Testing
         #expect(r.connected(vm: 0) == [.send(vm: 0, req: .list)])
 
         let effects = r.sessions(vm: 0, [info("a", .running), info("b", .stopped)],
-                                 cols: 80, rows: 24)
+                                 cols: 80, rows: 24, shellCols: 80, shellRows: 12)
         #expect(effects == [
             .teardown(key("a")), .send(vm: 0, req: .attach(id: "a", cols: 80, rows: 24)),
             .teardown(key("b")), .send(vm: 0, req: .attach(id: "b", cols: 80, rows: 24)),
@@ -30,9 +30,9 @@ import Testing
         var r = SessionRegistry()
         _ = r.connected(vm: 0)
         let list = [info("a", .running)]
-        _ = r.sessions(vm: 0, list, cols: 80, rows: 24)
-        #expect(r.sessions(vm: 0, list, cols: 80, rows: 24).isEmpty)
-        #expect(r.sessions(vm: 0, list, cols: 80, rows: 24).isEmpty)
+        _ = r.sessions(vm: 0, list, cols: 80, rows: 24, shellCols: 80, shellRows: 12)
+        #expect(r.sessions(vm: 0, list, cols: 80, rows: 24, shellCols: 80, shellRows: 12).isEmpty)
+        #expect(r.sessions(vm: 0, list, cols: 80, rows: 24, shellCols: 80, shellRows: 12).isEmpty)
     }
 
     /// Restart reuses the id, but the old broadcast channel died with the old PTY. A
@@ -40,9 +40,9 @@ import Testing
     @Test func stoppedToRunningReattachesUnderTheSameId() {
         var r = SessionRegistry()
         _ = r.connected(vm: 0)
-        _ = r.sessions(vm: 0, [info("a", .stopped)], cols: 80, rows: 24)
+        _ = r.sessions(vm: 0, [info("a", .stopped)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
 
-        #expect(r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24) == [
+        #expect(r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12) == [
             .teardown(key("a")), .send(vm: 0, req: .attach(id: "a", cols: 80, rows: 24)),
         ])
     }
@@ -52,16 +52,16 @@ import Testing
     @Test func runningToStoppedDoesNotReattach() {
         var r = SessionRegistry()
         _ = r.connected(vm: 0)
-        _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24)
-        #expect(r.sessions(vm: 0, [info("a", .stopped)], cols: 80, rows: 24).isEmpty)
+        _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
+        #expect(r.sessions(vm: 0, [info("a", .stopped)], cols: 80, rows: 24, shellCols: 80, shellRows: 12).isEmpty)
     }
 
     @Test func aVanishedSessionIsForgotten() {
         var r = SessionRegistry()
         _ = r.connected(vm: 0)
-        _ = r.sessions(vm: 0, [info("a", .running), info("b", .running)], cols: 80, rows: 24)
+        _ = r.sessions(vm: 0, [info("a", .running), info("b", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
 
-        #expect(r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24) == [.forget(key("b"))])
+        #expect(r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12) == [.forget(key("b"))])
         #expect(r.attached == [key("a")])
     }
 
@@ -71,14 +71,14 @@ import Testing
         var r = SessionRegistry()
         _ = r.connected(vm: 0)
         _ = r.connected(vm: 1)
-        _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24)
-        _ = r.sessions(vm: 1, [info("z", .running)], cols: 80, rows: 24)
+        _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
+        _ = r.sessions(vm: 1, [info("z", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
 
         #expect(r.connected(vm: 0) == [.teardown(key("a")), .send(vm: 0, req: .list)])
         #expect(r.attached == [key("z", vm: 1)], "vm 1 was never touched")
 
         // And the frame that comes back re-attaches from scratch.
-        #expect(r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24) == [
+        #expect(r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12) == [
             .teardown(key("a")), .send(vm: 0, req: .attach(id: "a", cols: 80, rows: 24)),
         ])
     }
@@ -86,7 +86,7 @@ import Testing
     @Test func disconnectVoidsWithoutSending() {
         var r = SessionRegistry()
         _ = r.connected(vm: 0)
-        _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24)
+        _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
         #expect(r.disconnected(vm: 0) == [.teardown(key("a"))])
         #expect(r.attached.isEmpty)
     }
@@ -97,8 +97,8 @@ import Testing
         var r = SessionRegistry()
         _ = r.connected(vm: 0)
         _ = r.connected(vm: 1)
-        _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24)
-        _ = r.sessions(vm: 1, [info("z", .running)], cols: 80, rows: 24)
+        _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
+        _ = r.sessions(vm: 1, [info("z", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
 
         #expect(r.resized(cols: 200, rows: 50) == [
             .send(vm: 0, req: .resize(id: "a", cols: 200, rows: 50)),
@@ -113,9 +113,10 @@ import Testing
         _ = r.connected(vm: 0)
         let shell = SessionInfo(id: "sh", agent: "shell", name: "a", cwd: "~/p",
                                 status: .running, createdAt: 1, parent: "a")
-        let effects = r.sessions(vm: 0, [info("a", .running), shell], cols: 80, rows: 24)
+        let effects = r.sessions(vm: 0, [info("a", .running), shell],
+                                 cols: 80, rows: 24, shellCols: 80, shellRows: 12)
 
-        #expect(effects.contains(.send(vm: 0, req: .attach(id: "sh", cols: 80, rows: 24))))
+        #expect(effects.contains(.send(vm: 0, req: .attach(id: "sh", cols: 80, rows: 12))))
         #expect(r.isAttached(key("sh")))
         #expect(r.resized(cols: 200, rows: 50) == [
             .send(vm: 0, req: .resize(id: "a", cols: 200, rows: 50)),

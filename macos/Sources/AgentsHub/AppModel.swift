@@ -99,10 +99,10 @@ final class AppModel: ObservableObject {
     private let notifier = Notifier()
     private var collapsed: Set<PathKey> = []
     private var favourites: Set<PathKey> = []
-    private var pane: (cols: UInt16, rows: UInt16) = (80, 24)
+    private var pane = AppModel.loadGrid(AppModel.paneGridKey) ?? (80, 24)
     /// The panel's own grid, reported by whichever shell surface laid out last. Only the
     /// size a brand-new shell starts at; a mounted one resizes itself.
-    private var shellGrid: (cols: UInt16, rows: UInt16) = (80, 12)
+    private var shellGrid = AppModel.loadGrid(AppModel.shellGridKey) ?? (80, 12)
     /// The session whose shell ⌘B just asked for, so it takes the keyboard the moment it
     /// has a live surface — which, for a first open, is a round trip to the daemon later.
     private var shellFocusPending: SessionKey?
@@ -203,7 +203,8 @@ final class AppModel: ObservableObject {
         case let .sessions(list):
             let previous = allRows
             vms[index].sessions = list
-            apply(registry.sessions(vm: index, list, cols: pane.cols, rows: pane.rows))
+            apply(registry.sessions(vm: index, list, cols: pane.cols, rows: pane.rows,
+                                    shellCols: shellGrid.cols, shellRows: shellGrid.rows))
             rebuild()
             pruneSelection(near: previous)
             revealShell()
@@ -287,7 +288,7 @@ final class AppModel: ObservableObject {
             }
         )
         terminals[key] = terminal
-        router.set(key, terminal.session)
+        router.set(key, terminal.feed)
         // A restarted session keeps its slot in the ZStack, so the surface is rebuilt in
         // place rather than the pane going blank.
         if mounted.contains(key) || mountedShells.contains(key) { applySurfaceVisibility() }
@@ -494,10 +495,12 @@ final class AppModel: ObservableObject {
         // pane everyone else shares.
         if info(for: reporter)?.isShell == true {
             shellGrid = (cols, rows)
+            Self.saveGrid(shellGrid, Self.shellGridKey)
             return
         }
         guard (cols, rows) != (pane.cols, pane.rows) else { return }
         pane = (cols, rows)
+        Self.saveGrid(pane, Self.paneGridKey)
         let others = registry.resized(cols: cols, rows: rows).filter { effect in
             guard case let .send(vm, .resize(id, _, _)) = effect else { return true }
             return SessionKey(vm: vm, id: id) != reporter
@@ -723,6 +726,22 @@ final class AppModel: ObservableObject {
     private static func save(_ paths: Set<PathKey>, _ key: String) {
         guard let data = try? JSONEncoder().encode(paths) else { return }
         UserDefaults.standard.set(data, forKey: key)
+    }
+
+    // The last real grids, so the attach burst at launch leaves every PTY the size it
+    // already is — rather than squeezing each to a placeholder and back before the first
+    // surface lays out, which a shell answers by redrawing its prompt at the wrong width.
+    private static let paneGridKey = "paneGrid"
+    private static let shellGridKey = "shellGrid"
+
+    private static func loadGrid(_ key: String) -> (cols: UInt16, rows: UInt16)? {
+        guard let grid = UserDefaults.standard.array(forKey: key) as? [Int], grid.count == 2
+        else { return nil }
+        return (UInt16(clamping: grid[0]), UInt16(clamping: grid[1]))
+    }
+
+    private static func saveGrid(_ grid: (cols: UInt16, rows: UInt16), _ key: String) {
+        UserDefaults.standard.set([Int(grid.cols), Int(grid.rows)], forKey: key)
     }
 }
 
