@@ -73,6 +73,10 @@ struct AgentsHubApp: App {
                 Button("Kill Session…") { model.killSelected() }
                     .keyboardShortcut(.delete, modifiers: .command)
             }
+            CommandGroup(replacing: .saveItem) {
+                Button("Close") { closeShellOrWindow() }
+                    .keyboardShortcut("w", modifiers: .command)
+            }
             CommandMenu("View") {
                 // ⌘L is the way back out of a focused terminal: once ghostty has the
                 // keyboard it takes everything except the command layer.
@@ -104,6 +108,20 @@ struct AgentsHubApp: App {
         // ⌘, for free, and the window macOS users look for when a menu picker isn't enough.
         Settings { SettingsView() }
     }
+
+    /// ⌘W takes the visible ⌘B tab first, as in any editor's terminal panel, and only then
+    /// the window. Settings is exempt: closing it must not kill a shell behind it.
+    @MainActor
+    private func closeShellOrWindow() {
+        let window = NSApp.keyWindow
+        if let shell = model.visibleShellKey, window?.identifier?.rawValue != Self.settingsWindow {
+            model.closeShellTab(shell)
+        } else {
+            window?.performClose(nil)
+        }
+    }
+
+    private static let settingsWindow = "com_apple_SwiftUI_Settings_window"
 }
 
 struct SettingsView: View {
@@ -326,7 +344,7 @@ struct RootView: View {
     }
 
     private var hints: String {
-        if model.terminalFocused { return "⌘L back to list · ⌘B shell · ⌘T new · ⌘1-9 switch" }
+        if model.terminalFocused { return "⌘L back to list · ⌘B shell · ⌘T new · ⌘W close · ⌘1-9 switch" }
         if model.selectionIsFolder { return "j/k move · space fold · f favourite · n new" }
         return "j/k move · ⏎ attach · ⌘B shell · n new · d kill · / filter"
     }
