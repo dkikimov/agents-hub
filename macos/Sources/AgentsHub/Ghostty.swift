@@ -83,10 +83,11 @@ enum Ghostty {
     }
 
     /// A focused surface claims every key ghostty binds before the menu sees it, and by
-    /// default ⌘T and ⌘1…⌘9 are its own tab commands — dead ends here, with no tabs. Both
+    /// default ⌘T, ⌘W and ⌘1…⌘9 are its own tab commands — dead ends here, with no tabs. Both
     /// spellings go, since the defaults bind the character and the physical key alike.
     private static func releaseMenuKeys(_ b: inout TerminalConfiguration.Builder) {
         b.withCustom("keybind", "super+t=unbind")
+        b.withCustom("keybind", "super+w=unbind")
         for n in 1...9 {
             b.withCustom("keybind", "super+\(n)=unbind")
             b.withCustom("keybind", "super+digit_\(n)=unbind")
