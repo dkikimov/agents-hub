@@ -115,6 +115,7 @@ final class AppModel: ObservableObject {
     private var dotTimer: Timer?
     private var requestedDirs: Set<String> = []
     private var windowVisible = true
+    private var windowShown = false
     private weak var paneWindow: NSWindow?
 
     /// Set only while the New Session sheet is showing a dropped folder, and cleared when it
@@ -279,8 +280,16 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Mounted at once, selected or not: until a surface exists its bytes wait in the
+    /// feed's backlog, and a busy agent overflows that in minutes — trimming the mode
+    /// prelude and leaving a garbled screen that pastes unbracketed. A hidden surface
+    /// costs memory, not draws.
+    ///
+    /// A focused terminal hands the keyboard to its replacement; the new surface is a new
+    /// view, so first-responder does not carry over on its own.
     private func makeTerminal(_ key: SessionKey) {
         let vm = key.vm
+        let hadFocus = terminals[key]?.state.isFocused ?? false
         let terminal = TerminalSession(
             key: key,
             send: { [weak self, router] req in
@@ -297,9 +306,22 @@ final class AppModel: ObservableObject {
         )
         terminals[key] = terminal
         router.set(key, terminal.feed)
-        // A restarted session keeps its slot in the ZStack, so the surface is rebuilt in
-        // place rather than the pane going blank.
-        if mounted.contains(key) || mountedShells.contains(key) { applySurfaceVisibility() }
+        if info(for: key)?.isShell == true {
+            if !mountedShells.contains(key) { mountedShells.append(key) }
+        } else if !mounted.contains(key) {
+            mounted.append(key)
+        }
+        applySurfaceVisibility()
+        if hadFocus { terminal.focus() }
+    }
+
+    /// Closing the window frees every surface with it, and the one the reopened window
+    /// builds starts from a feed long since drained. Only the daemon still has the
+    /// history, so every link reconnects and the replay rebuilds each terminal.
+    func windowAppeared() {
+        defer { windowShown = true }
+        guard windowShown else { return }
+        links.forEach { $0.reconnect() }
     }
 
     // MARK: - selection and mounting
@@ -323,16 +345,13 @@ final class AppModel: ObservableObject {
         return true
     }
 
-    /// Mount on first selection and never unmount: unmounting destroys the grid and the
-    /// scrollback with it, and the 1 MiB pending buffer only refills from that moment.
-    /// Hidden surfaces keep parsing, they just stop drawing.
+    /// Never unmount: unmounting destroys the grid and the scrollback with it. Hidden
+    /// surfaces keep parsing, they just stop drawing.
     ///
     /// Deliberately does *not* take keyboard focus. Moving the selection with j/k has to
     /// leave focus in the sidebar, or the second keystroke lands in the agent — the
     /// terminal is entered explicitly, with ⏎ or a click.
     func selectionChanged() {
-        guard let key = selectedKey else { return }
-        if !mounted.contains(key) { mounted.append(key) }
         applySurfaceVisibility()
         revealShell()
     }
@@ -480,7 +499,7 @@ final class AppModel: ObservableObject {
         applySurfaceVisibility()
     }
 
-    /// Mounts the selected session's visible shell if its panel is open, and hands it the
+    /// Draws the selected session's visible shell if its panel is open, and hands it the
     /// keyboard if a shell command is still waiting on it. Called wherever a shell can
     /// newly exist or be shown: a `Sessions` frame, a selection change, a tab switch.
     ///
@@ -490,7 +509,6 @@ final class AppModel: ObservableObject {
     private func revealShell() {
         guard let key = selectedKey, let shell = visibleShellKey, let terminal = terminals[shell]
         else { return }
-        if !mountedShells.contains(shell) { mountedShells.append(shell) }
         applySurfaceVisibility()
         if shellFocusPending == key, awaitingShell?.parent != key,
            info(for: shell)?.status == .running {
@@ -536,7 +554,6 @@ final class AppModel: ObservableObject {
 
     func focusSelectedTerminal() {
         guard let key = selectedKey else { return }
-        if !mounted.contains(key) { mounted.append(key) }
         terminals[key]?.focus()
     }
 
@@ -761,11 +778,6 @@ final class AppModel: ObservableObject {
     ///
     /// Every terminal is counted whether or not it will notify, so a bell you watched
     /// arrive is spent rather than waiting to fire the moment you look away.
-    ///
-    /// ponytail: a session never selected since launch has no surface, so nothing parses
-    /// its bytes and it cannot ring — mounting is lazy and `pendingWrites` just accrues.
-    /// The fix is mounting every session at startup, at one GPU surface each; do it only
-    /// if the gap actually bites.
     private func notifyBells() {
         let watching = NSApp.isActive ? selectedKey : nil
         for (key, terminal) in terminals {

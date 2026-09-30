@@ -13,7 +13,7 @@ struct TerminalPane: View {
 
     var body: some View {
         ZStack {
-            if model.mounted.isEmpty {
+            if model.selectedKey == nil {
                 placeholder
             }
             ForEach(model.mounted, id: \.self) { key in

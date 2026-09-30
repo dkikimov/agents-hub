@@ -74,7 +74,7 @@ import Testing
         _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
         _ = r.sessions(vm: 1, [info("z", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
 
-        #expect(r.connected(vm: 0) == [.teardown(key("a")), .send(vm: 0, req: .list)])
+        #expect(r.connected(vm: 0) == [.send(vm: 0, req: .list)])
         #expect(r.attached == [key("z", vm: 1)], "vm 1 was never touched")
 
         // And the frame that comes back re-attaches from scratch.
@@ -87,8 +87,23 @@ import Testing
         var r = SessionRegistry()
         _ = r.connected(vm: 0)
         _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
-        #expect(r.disconnected(vm: 0) == [.teardown(key("a"))])
+        #expect(r.disconnected(vm: 0).isEmpty, "the old screen stays up until the replay")
         #expect(r.attached.isEmpty)
+    }
+
+    /// The frame after a reconnect lists what survived the outage; anything killed in
+    /// between must still be dropped, not left mounted behind the others.
+    @Test func aSessionKilledDuringAnOutageIsForgottenOnReconnect() {
+        var r = SessionRegistry()
+        _ = r.connected(vm: 0)
+        _ = r.sessions(vm: 0, [info("a", .running), info("b", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
+        _ = r.disconnected(vm: 0)
+        _ = r.connected(vm: 0)
+
+        #expect(r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12) == [
+            .forget(key("b")),
+            .teardown(key("a")), .send(vm: 0, req: .attach(id: "a", cols: 80, rows: 24)),
+        ])
     }
 
     /// Unmounted sessions have no surface to report their own size, so they must be

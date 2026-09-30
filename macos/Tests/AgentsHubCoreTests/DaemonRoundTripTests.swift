@@ -15,10 +15,13 @@ import Testing
     private actor FrameLog {
         private var frames: [Resp] = []
         private var up = false
+        private var ups = 0
 
         func record(_ event: LinkEvent) {
             switch event {
-            case .up: up = true
+            case .up:
+                up = true
+                ups += 1
             case .down: up = false
             case let .frame(f): frames.append(f)
             }
@@ -27,6 +30,12 @@ import Testing
         func waitForLink(timeout: TimeInterval) async -> Bool {
             await poll(timeout: timeout) { self.up } != nil
         }
+
+        func waitForUps(_ n: Int, timeout: TimeInterval) async -> Bool {
+            await poll(timeout: timeout) { self.ups >= n } != nil
+        }
+
+        func clear() { frames = [] }
 
         func first(timeout: TimeInterval = 25,
                    where predicate: @escaping (Resp) -> Bool) async -> Resp? {
@@ -134,6 +143,16 @@ import Testing
             return String(decoding: data, as: UTF8.self).contains("ping-from-pty")
         }
         #expect(output != nil, "PTY bytes never made it back through the codec")
+
+        await log.clear()
+        link.reconnect()
+        #expect(await log.waitForUps(2, timeout: 15), "reconnect never brought the link back up")
+        link.send(.attach(id: info.id, cols: 80, rows: 24))
+        let replayed = await log.first { frame in
+            guard case let .output(id, data, false) = frame, id == info.id else { return false }
+            return String(decoding: data, as: UTF8.self).contains("ping-from-pty")
+        }
+        #expect(replayed != nil, "a reconnect must get the history replayed")
 
         link.send(.listDir(path: root.path))
         let dirs = await log.first { frame in
