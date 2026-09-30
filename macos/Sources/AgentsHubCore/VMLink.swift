@@ -31,9 +31,6 @@ public final class VMLink: @unchecked Sendable {
     private var backoff: UInt64 = 1
     private var stopping = false
     private var connected = false
-    /// Bumped per connection. A closed channel still calls its handler once, and a stale
-    /// `done` must not tear down the connection that replaced it.
-    private var generation = 0
 
     /// Delivered on the link's own queue, never the main actor.
     public var onEvent: (@Sendable (Int, LinkEvent) -> Void)?
@@ -62,8 +59,7 @@ public final class VMLink: @unchecked Sendable {
         }
     }
 
-    /// Drops a live connection and dials again at once, so the daemon replays every
-    /// session from scratch. A link that is down is left to its own retry.
+    /// Redials a live connection at once; a link that is down is left to its own retry.
     public func reconnect() {
         queue.async { [self] in
             guard connected else { return }
@@ -126,19 +122,19 @@ public final class VMLink: @unchecked Sendable {
         }
 
         proc = p
-        generation += 1
-        let current = generation
         inPipe = inp
         reader.reset()
         connected = true
         backoff = 1
         emit(.up)
 
-        drainStderr(errPipe, generation: current)
+        drainStderr(errPipe, of: p)
 
         let io = readChannel(out)
         io.read(offset: 0, length: Int.max, queue: queue) { [weak self] done, data, _ in
-            guard let self, current == self.generation else { return }
+            // A cancelled channel still calls back once; only the live process's may
+            // tear down, or a redial or a retry already scheduled is torn down twice.
+            guard let self, self.proc === p else { return }
             if let data, !data.isEmpty {
                 let ok = self.reader.push(Array(data)) { line in
                     do {
@@ -167,10 +163,10 @@ public final class VMLink: @unchecked Sendable {
     /// Same `DispatchIO` as stdout rather than a thread blocked in `read`: that thread
     /// parked for the life of the process, one per VM, to carry a line of text that
     /// arrives once per connection.
-    private func drainStderr(_ pipe: Pipe, generation current: Int) {
+    private func drainStderr(_ pipe: Pipe, of p: Process) {
         let io = readChannel(pipe)
         io.read(offset: 0, length: Int.max, queue: queue) { [weak self] _, data, _ in
-            guard let self, current == self.generation, let data, !data.isEmpty else { return }
+            guard let self, self.proc === p, let data, !data.isEmpty else { return }
             let text = String(decoding: data, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return }

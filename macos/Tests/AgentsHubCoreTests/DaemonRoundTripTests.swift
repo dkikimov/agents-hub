@@ -15,14 +15,17 @@ import Testing
     private actor FrameLog {
         private var frames: [Resp] = []
         private var up = false
-        private var ups = 0
+        private(set) var ups = 0
+        private(set) var downs = 0
 
         func record(_ event: LinkEvent) {
             switch event {
             case .up:
                 up = true
                 ups += 1
-            case .down: up = false
+            case .down:
+                up = false
+                downs += 1
             case let .frame(f): frames.append(f)
             }
         }
@@ -34,8 +37,6 @@ import Testing
         func waitForUps(_ n: Int, timeout: TimeInterval) async -> Bool {
             await poll(timeout: timeout) { self.ups >= n } != nil
         }
-
-        func clear() { frames = [] }
 
         func first(timeout: TimeInterval = 25,
                    where predicate: @escaping (Resp) -> Bool) async -> Resp? {
@@ -144,15 +145,24 @@ import Testing
         }
         #expect(output != nil, "PTY bytes never made it back through the codec")
 
-        await log.clear()
+        // Typed after the reconnect, so only the new connection can carry it: the old
+        // one's replay already sits in the log.
         link.reconnect()
         #expect(await log.waitForUps(2, timeout: 15), "reconnect never brought the link back up")
-        link.send(.attach(id: info.id, cols: 80, rows: 24))
-        let replayed = await log.first { frame in
-            guard case let .output(id, data, false) = frame, id == info.id else { return false }
-            return String(decoding: data, as: UTF8.self).contains("ping-from-pty")
+        link.send(.input(id: info.id, data: Data("after-reconnect\r".utf8)))
+        func carries(_ marker: String, live: Bool) -> (Resp) -> Bool {
+            { frame in
+                guard case let .output(id, data, isLive) = frame, id == info.id, isLive == live
+                else { return false }
+                return String(decoding: data, as: UTF8.self).contains(marker)
+            }
         }
-        #expect(replayed != nil, "a reconnect must get the history replayed")
+        #expect(await log.first(timeout: 1, where: carries("after-reconnect", live: true)) == nil,
+                "the old connection's stream outlived the reconnect")
+        link.send(.attach(id: info.id, cols: 80, rows: 24))
+        #expect(await log.first(where: carries("after-reconnect", live: false)) != nil,
+                "a reconnect must get the history replayed")
+        #expect(await log.downs == 0, "a stale callback tore down the new connection")
 
         link.send(.listDir(path: root.path))
         let dirs = await log.first { frame in

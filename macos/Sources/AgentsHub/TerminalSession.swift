@@ -49,12 +49,13 @@ final class TerminalRouter: @unchecked Sendable {
 }
 
 /// One session's terminal: the ghostty-side session, the view state that renders it, and
-/// the feed between them and the link. Created fresh on attach — handing `backend` a
-/// different `InMemoryTerminalSession` instance is what rebuilds the surface, which is
-/// exactly the teardown a restart needs.
+/// the feed between them and the link. Created fresh on attach.
 @MainActor
 final class TerminalSession {
     let key: SessionKey
+    /// The surface view's identity. Not `ObjectIdentifier`: a replaced terminal is freed,
+    /// and a later one at the same address would hand SwiftUI the old view back.
+    let id = UUID()
     let state = TerminalViewState(controller: Ghostty.controller)
     let session: InMemoryTerminalSession
     let feed = AttachFeed()
@@ -122,6 +123,12 @@ final class TerminalSession {
             resizeThrottleMilliseconds: 100
         )
         state.isSurfaceVisible = false
+    }
+
+    /// First responder, not `state.isFocused`: that follows window key status too, so it
+    /// reads false for the focused terminal of an app in the background.
+    var ownsKeyboard: Bool {
+        state.attachedPlatformView.map { $0.window?.firstResponder === $0 } ?? false
     }
 
     func focus() {

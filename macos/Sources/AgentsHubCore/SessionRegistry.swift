@@ -41,9 +41,8 @@ public struct SessionRegistry {
     /// subscriptions, so every attachment for this VM is void. Re-`List` afterwards;
     /// the `Sessions` frame that comes back drives the re-attach.
     ///
-    /// Voiding tears nothing down: the old screen stays up through the outage and is
-    /// replaced when its replay is on the way. `known` survives too, so that frame
-    /// still forgets whatever was killed in between.
+    /// Nothing is torn down: the old screen stays up until its replay lands. `known` is
+    /// kept so that frame still forgets sessions killed during the outage.
     public mutating func connected(vm: Int) -> [Effect] {
         attached = attached.filter { $0.vm != vm }
         return [.send(vm: vm, req: .list)]
@@ -98,9 +97,9 @@ public struct SessionRegistry {
         return effects
     }
 
-    /// One geometry for every pane, as in the Rust client. Unmounted sessions are
-    /// included deliberately: they have no surface to report their own size, and without
-    /// this their PTY sits at 80×24 while the window is 200 columns wide.
+    /// One geometry for every pane, as in the Rust client. Sessions without a laid-out
+    /// surface are included deliberately: without this their PTY sits at 80×24 while the
+    /// window is 200 columns wide.
     ///
     /// Companion shells are not: they live in a panel of their own height, and dragging
     /// the agent pane must not squash a shell to its geometry.

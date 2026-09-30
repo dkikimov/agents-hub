@@ -64,8 +64,8 @@ struct AgentsHubApp: App {
         // One short band instead of titlebar-plus-toolbar; the header is a line of text.
         .windowToolbarStyle(.unifiedCompact)
         .commands {
-            // Replacing, not after: a second window would present the same terminals, and
-            // each one's surface steals the session's output from the other's.
+            // Replaces File > New Window: a second window would show the same terminals,
+            // and each surface steals the session's output from the other.
             CommandGroup(replacing: .newItem) {
                 Button("New Session…") { model.sheet = .newSession }
                     .keyboardShortcut("n", modifiers: .command)
@@ -201,6 +201,7 @@ struct RootView: View {
             AppDelegate.reopen = { openWindow(id: AgentsHubApp.mainWindow) }
             model.windowAppeared()
         }
+        .onDisappear { model.windowClosed() }
         .onChange(of: scheme) { _, new in Ghostty.apply(new) }
         .onChange(of: model.requestSidebarFocus) { _, _ in focus = .sidebar }
         .sheet(item: $model.sheet) { sheet in

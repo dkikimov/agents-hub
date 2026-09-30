@@ -16,4 +16,36 @@ import Testing
         for link in links { link.stop() }
         try await Task.sleep(for: .milliseconds(500))
     }
+
+    /// A link that is down already has a retry on its backoff; dialling again on top of
+    /// it would start a second retry chain.
+    @Test func reconnectLeavesADownLinkToItsRetry() async throws {
+        let downs = Counter()
+        let link = VMLink(index: 0, vm: VMConfig(name: "down"),
+                          helper: URL(fileURLWithPath: "/nonexistent/agents-hub"))
+        link.onEvent = { _, event in if case .down = event { downs.bump() } }
+        link.start()
+        try await Task.sleep(for: .milliseconds(200))
+        link.reconnect()
+        try await Task.sleep(for: .milliseconds(300))
+        link.stop()
+        #expect(downs.value == 1, "reconnect dialled a down link outside its backoff")
+    }
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func bump() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
 }

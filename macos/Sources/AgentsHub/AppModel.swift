@@ -71,12 +71,14 @@ final class AppModel: ObservableObject {
     /// Toggled by ⌘L; the root view watches it and moves focus. A plain signal rather
     /// than reaching into `@FocusState` from the model.
     @Published var requestSidebarFocus = false
+    /// Every agent terminal's surface, never unmounted: the surface is the scrollback.
+    /// Append-only rather than derived from `terminals`, so a new session never reorders
+    /// the views under the focused one — a moved view resigns first responder.
     @Published private(set) var mounted: [SessionKey] = []
     /// Agent sessions whose ⌘B shell panel is open. Per session, so switching to one
     /// without a shell does not open an empty panel under it.
     @Published private(set) var shellOpen: Set<SessionKey> = []
-    /// Companion shells with a surface in the panel. Same never-unmount rule as `mounted`,
-    /// for the same reason: the surface *is* the scrollback.
+    /// `mounted`'s twin for the companion shells in the panel.
     @Published private(set) var mountedShells: [SessionKey] = []
     /// The panel tab each agent session last showed. A missing or dead entry falls back
     /// to its first shell.
@@ -280,16 +282,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Mounted at once, selected or not: until a surface exists its bytes wait in the
-    /// feed's backlog, and a busy agent overflows that in minutes — trimming the mode
-    /// prelude and leaving a garbled screen that pastes unbracketed. A hidden surface
-    /// costs memory, not draws.
+    /// Mounted at once, selected or not: an unmounted terminal's bytes pile up in the
+    /// feed's backlog, and a busy agent overflows it — trimming the mode prelude, so the
+    /// screen is garbled and paste arrives unbracketed.
     ///
-    /// A focused terminal hands the keyboard to its replacement; the new surface is a new
-    /// view, so first-responder does not carry over on its own.
+    /// First responder does not follow a surface to its replacement, so it is handed on.
     private func makeTerminal(_ key: SessionKey) {
         let vm = key.vm
-        let hadFocus = terminals[key]?.state.isFocused ?? false
+        let hadFocus = terminals[key]?.ownsKeyboard ?? false
         let terminal = TerminalSession(
             key: key,
             send: { [weak self, router] req in
@@ -315,16 +315,23 @@ final class AppModel: ObservableObject {
         if hadFocus { terminal.focus() }
     }
 
-    /// Closing the window frees every surface with it, and the one the reopened window
-    /// builds starts from a feed long since drained. Only the daemon still has the
-    /// history, so every link reconnects and the replay rebuilds each terminal.
+    /// Closing the window frees every surface. A feed that already released its replay
+    /// would hand the reopened window's surfaces live bytes at ghostty's default grid —
+    /// forwarding that grid to every PTY and answering the queries in them — so each
+    /// terminal starts over, holding everything until a surface lays out.
+    func windowClosed() {
+        terminals.keys.sorted().forEach(makeTerminal)
+    }
+
+    /// Only the daemon still has the history. Reconnect rather than re-attach: a daemon
+    /// older than per-connection stream dedupe would send every byte twice.
     func windowAppeared() {
         defer { windowShown = true }
         guard windowShown else { return }
         links.forEach { $0.reconnect() }
     }
 
-    // MARK: - selection and mounting
+    // MARK: - selection
 
     var selectedKey: SessionKey? {
         guard let selection else { return nil }
@@ -345,9 +352,6 @@ final class AppModel: ObservableObject {
         return true
     }
 
-    /// Never unmount: unmounting destroys the grid and the scrollback with it. Hidden
-    /// surfaces keep parsing, they just stop drawing.
-    ///
     /// Deliberately does *not* take keyboard focus. Moving the selection with j/k has to
     /// leave focus in the sidebar, or the second keystroke lands in the agent — the
     /// terminal is entered explicitly, with ⏎ or a click.
@@ -581,7 +585,8 @@ final class AppModel: ObservableObject {
     /// size follows the user's ghostty font and is not ours to guess.
     ///
     /// The reporter already resized itself through its own callback; this is only for
-    /// everyone else, who are hidden or unmounted and will never notice the window moved.
+    /// everyone else, whose surface may not be there to notice: not laid out yet, or gone
+    /// with a closed window.
     private func gridChanged(_ reporter: SessionKey, cols: UInt16, rows: UInt16) {
         guard cols > 0, rows > 0 else { return }
         // A shell's surface already resized its own PTY; its grid is the panel's, not the
