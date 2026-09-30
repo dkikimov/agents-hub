@@ -78,6 +78,9 @@ final class AppModel: ObservableObject {
     /// Companion shells with a surface in the panel. Same never-unmount rule as `mounted`,
     /// for the same reason: the surface *is* the scrollback.
     @Published private(set) var mountedShells: [SessionKey] = []
+    /// The panel tab each agent session last showed. A missing or dead entry falls back
+    /// to its first shell.
+    @Published private(set) var activeShells: [SessionKey: SessionKey] = [:]
     /// Who owns the keyboard, as ghostty sees it — SwiftUI's own `@FocusState` doesn't
     /// notice a click landing straight in the surface, and an indicator that lies is
     /// worse than none.
@@ -106,6 +109,9 @@ final class AppModel: ObservableObject {
     /// The session whose shell ⌘B just asked for, so it takes the keyboard the moment it
     /// has a live surface — which, for a first open, is a round trip to the daemon later.
     private var shellFocusPending: SessionKey?
+    /// A new tab asked of the daemon, and the shells its parent had before — the one not
+    /// among them when it shows up is the tab to switch to.
+    private var awaitingShell: (parent: SessionKey, known: Set<String>)?
     private var dotTimer: Timer?
     private var requestedDirs: Set<String> = []
     private var windowVisible = true
@@ -207,16 +213,16 @@ final class AppModel: ObservableObject {
                                     shellCols: shellGrid.cols, shellRows: shellGrid.rows))
             rebuild()
             pruneSelection(near: previous)
+            adoptNewShell()
             revealShell()
         case let .exited(id, code):
             let key = SessionKey(vm: index, id: id)
             router.finish(key, code: code)
             if let s = vms[index].sessions.first(where: { $0.id == id }) {
-                if let parent = s.parent {
-                    // `exit` closes the panel, as in any editor's terminal; ⌘B brings the
-                    // same shell back, relaunched, with its scrollback above the prompt.
-                    closeShell(SessionKey(vm: index, id: parent))
-                    status = "shell exited (\(code)) — ⌘B starts it again"
+                if s.isShell {
+                    // `exit` closes its tab, as in any editor's terminal.
+                    closeShellTab(key)
+                    status = "shell exited (\(code))"
                 } else {
                     status = "\(s.name) exited (\(code)) — press r to restart"
                 }
@@ -227,7 +233,7 @@ final class AppModel: ObservableObject {
             status = "\(vms[index].name): \(msg)"
             // Most likely a daemon that predates `Shell` and has no idea what we asked
             // for. Leaving the panel open would be a blank promise that never resolves.
-            if let parent = shellFocusPending, parent.vm == index, shellKey(for: parent) == nil {
+            if let parent = shellFocusPending, parent.vm == index, shellKeys(for: parent).isEmpty {
                 closeShell(parent)
             }
         case .output:
@@ -266,7 +272,9 @@ final class AppModel: ObservableObject {
                 mounted.removeAll { $0 == key }
                 mountedShells.removeAll { $0 == key }
                 shellOpen.remove(key)
+                activeShells[key] = nil
                 if shellFocusPending == key { shellFocusPending = nil }
+                if awaitingShell?.parent == key { awaitingShell = nil }
             }
         }
     }
@@ -367,10 +375,10 @@ final class AppModel: ObservableObject {
 
     // MARK: - companion shell
 
-    /// The shell that belongs to `parent`, once the daemon has made one.
-    func shellKey(for parent: SessionKey) -> SessionKey? {
-        vms[safe: parent.vm]?.sessions
-            .first { $0.parent == parent.id }
+    /// The shells that belong to `parent`, oldest first as the daemon lists them.
+    func shellKeys(for parent: SessionKey) -> [SessionKey] {
+        (vms[safe: parent.vm]?.sessions ?? [])
+            .filter { $0.parent == parent.id }
             .map { SessionKey(vm: parent.vm, id: $0.id) }
     }
 
@@ -378,46 +386,114 @@ final class AppModel: ObservableObject {
 
     var visibleShellKey: SessionKey? {
         guard let key = selectedKey, shellOpen.contains(key) else { return nil }
-        return shellKey(for: key)
+        return activeShell(of: key)
     }
 
-    /// ⌘B. Opening always asks the daemon, which makes that one request cover every
-    /// case: no shell yet, one stopped by `exit` or a daemon restart, or one running.
+    private func activeShell(of parent: SessionKey) -> SessionKey? {
+        let shells = shellKeys(for: parent)
+        return activeShells[parent].flatMap { shells.contains($0) ? $0 : nil } ?? shells.first
+    }
+
+    private var selectedAgent: SessionKey? {
+        guard let key = selectedKey, info(for: key)?.isShell == false else { return nil }
+        return key
+    }
+
+    /// ⌘B. Opening with no shell yet starts one; otherwise it shows the last tab.
     func toggleShell() {
-        guard let key = selectedKey, info(for: key)?.isShell == false else { return }
+        guard let key = selectedAgent else { return }
         if shellOpen.contains(key) {
             closeShell(key)
-            return
+        } else if let shell = activeShell(of: key) {
+            show(shell, of: key, focus: true)
+        } else {
+            newShell()
         }
+    }
+
+    /// ⌘T and the panel's +: another shell in the session's cwd, which takes the tab and
+    /// the keyboard once the daemon has made it.
+    func newShell() {
+        guard let key = selectedAgent else { return }
         shellOpen.insert(key)
         shellFocusPending = key
-        send(key.vm, .shell(parent: key.id, cols: shellGrid.cols, rows: shellGrid.rows))
+        awaitingShell = (key, Set(shellKeys(for: key).map(\.id)))
+        send(key.vm, .shell(parent: key.id, cols: shellGrid.cols, rows: shellGrid.rows, new: true))
+        applySurfaceVisibility()
+    }
+
+    /// ⌘1…⌘9: the selected session's shells in tab order.
+    func selectShell(at index: Int) {
+        guard let key = selectedAgent, let shell = shellKeys(for: key)[safe: index] else { return }
+        show(shell, of: key, focus: true)
+    }
+
+    /// A tab click.
+    func showShell(_ shell: SessionKey) {
+        guard let parent = info(for: shell)?.parent else { return }
+        show(shell, of: SessionKey(vm: shell.vm, id: parent), focus: true)
+    }
+
+    /// A stopped tab is relaunched on sight — after a daemon restart every one is.
+    private func show(_ shell: SessionKey, of parent: SessionKey, focus: Bool) {
+        activeShells[parent] = shell
+        shellOpen.insert(parent)
+        if focus { shellFocusPending = parent }
+        if info(for: shell)?.status == .stopped {
+            send(shell.vm, .restart(id: shell.id, cols: shellGrid.cols, rows: shellGrid.rows))
+        }
+        applySurfaceVisibility()
         revealShell()
+    }
+
+    /// The tab's ×, and a shell's own `exit`. The panel closes with its last tab, and the
+    /// keyboard follows the tab that takes the closed one's place only if it was there.
+    func closeShellTab(_ shell: SessionKey) {
+        guard let parentID = info(for: shell)?.parent else { return }
+        let parent = SessionKey(vm: shell.vm, id: parentID)
+        let shells = shellKeys(for: parent)
+        send(shell.vm, .kill(id: shell.id))
+        let rest = shells.filter { $0 != shell }
+        guard let fallback = rest[safe: min(shells.firstIndex(of: shell) ?? 0, rest.count - 1)]
+        else { return closeShell(parent) }
+        guard activeShell(of: parent) == shell else { return }
+        let hadFocus = terminals[shell]?.state.isFocused ?? false
+        show(fallback, of: parent, focus: hadFocus)
     }
 
     /// Focus goes back to the agent only if it was in the shell: ⌘B from the sidebar
     /// closes the panel without dragging the keyboard into a session.
     private func closeShell(_ parent: SessionKey) {
-        let hadFocus = shellKey(for: parent).flatMap { terminals[$0]?.state.isFocused } ?? false
+        let hadFocus = activeShell(of: parent).flatMap { terminals[$0]?.state.isFocused } ?? false
         shellOpen.remove(parent)
         if shellFocusPending == parent { shellFocusPending = nil }
         applySurfaceVisibility()
         if hadFocus, parent == selectedKey { terminals[parent]?.focus() }
     }
 
-    /// Mounts the selected session's shell if its panel is open, and hands it the keyboard
-    /// if ⌘B is still waiting on it. Called wherever a shell can newly exist or be shown:
-    /// a `Sessions` frame, a selection change, ⌘B itself.
+    private func adoptNewShell() {
+        guard let (parent, known) = awaitingShell,
+              let fresh = shellKeys(for: parent).first(where: { !known.contains($0.id) })
+        else { return }
+        awaitingShell = nil
+        activeShells[parent] = fresh
+        applySurfaceVisibility()
+    }
+
+    /// Mounts the selected session's visible shell if its panel is open, and hands it the
+    /// keyboard if a shell command is still waiting on it. Called wherever a shell can
+    /// newly exist or be shown: a `Sessions` frame, a selection change, a tab switch.
     ///
     /// Focus waits for `.running`: a stopped shell's terminal is about to be replaced by
     /// the relaunch, and focusing it would hand the keyboard to a surface on its way out.
+    /// It also waits out a new tab, or the old one would take it first.
     private func revealShell() {
-        guard let key = selectedKey, shellOpen.contains(key),
-              let shell = shellKey(for: key), let terminal = terminals[shell]
+        guard let key = selectedKey, let shell = visibleShellKey, let terminal = terminals[shell]
         else { return }
         if !mountedShells.contains(shell) { mountedShells.append(shell) }
         applySurfaceVisibility()
-        if shellFocusPending == key, info(for: shell)?.status == .running {
+        if shellFocusPending == key, awaitingShell?.parent != key,
+           info(for: shell)?.status == .running {
             shellFocusPending = nil
             terminal.focus()
         }

@@ -421,7 +421,7 @@ impl Hub {
 
             Req::Restart { id, cols, rows } => self.restart(&id, cols, rows)?,
 
-            Req::Shell { parent, cols, rows } => {
+            Req::Shell { parent, cols, rows, new } => {
                 let (existing, name, cwd) = {
                     let s = self.sessions.lock().unwrap();
                     let p = s.get(&parent).ok_or_else(|| anyhow!("no such session"))?;
@@ -435,7 +435,7 @@ impl Hub {
                     (child, p.info.name.clone(), p.info.cwd.clone())
                 };
                 // Stopped after a daemon restart or an `exit`: the same relaunch as `r`.
-                if let Some(id) = existing {
+                if let (Some(id), false) = (existing, new) {
                     return self.restart(&id, cols, rows);
                 }
                 let id = new_id();

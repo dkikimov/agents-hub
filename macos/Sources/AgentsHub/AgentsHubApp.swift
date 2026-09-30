@@ -83,6 +83,14 @@ struct AgentsHubApp: App {
                 // or a focused surface eats it before the menu: ⌘J is scroll_to_selection.
                 Button("Toggle Terminal") { model.toggleShell() }
                     .keyboardShortcut("b", modifiers: .command)
+                Button("New Terminal") { model.newShell() }
+                    .keyboardShortcut("t", modifiers: .command)
+                Menu("Switch Terminal") {
+                    ForEach(1...9, id: \.self) { n in
+                        Button("Terminal \(n)") { model.selectShell(at: n - 1) }
+                            .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
+                    }
+                }
                 Divider()
                 Picker("Appearance", selection: $appearance) {
                     ForEach(AppAppearance.allCases) { Text($0.label).tag($0) }
@@ -237,12 +245,7 @@ struct RootView: View {
         VStack(spacing: 0) {
             Divider()
             HStack {
-                Text("terminal")
-                    .font(Ghostty.ui(Ghostty.fontSize - 3))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 1)
-                    .background(.quaternary, in: Capsule())
+                ShellTabs(model: model)
                 Spacer()
             }
             .padding(.horizontal, 8)
@@ -323,7 +326,7 @@ struct RootView: View {
     }
 
     private var hints: String {
-        if model.terminalFocused { return "⌘L back to list · ⌘B shell" }
+        if model.terminalFocused { return "⌘L back to list · ⌘B shell · ⌘T new · ⌘1-9 switch" }
         if model.selectionIsFolder { return "j/k move · space fold · f favourite · n new" }
         return "j/k move · ⏎ attach · ⌘B shell · n new · d kill · / filter"
     }

@@ -54,13 +54,14 @@ public enum Req: Equatable, Sendable {
     case restart(id: String, cols: UInt16, rows: UInt16)
     case listDir(path: String)
     /// Open `parent`'s companion shell: created on first ask, relaunched if stopped, a
-    /// no-op if running. It arrives through `Sessions` like any other session.
-    case shell(parent: String, cols: UInt16, rows: UInt16)
+    /// no-op if running. `new` always starts another. It arrives through `Sessions` like
+    /// any other session.
+    case shell(parent: String, cols: UInt16, rows: UInt16, new: Bool = false)
 }
 
 extension Req: Encodable {
     private enum K: String, CodingKey {
-        case t, id, agent, name, cwd, cols, rows, data, path, parent
+        case t, id, agent, name, cwd, cols, rows, data, path, parent, new
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -100,11 +101,12 @@ extension Req: Encodable {
         case let .listDir(path):
             try c.encode("ListDir", forKey: .t)
             try c.encode(path, forKey: .path)
-        case let .shell(parent, cols, rows):
+        case let .shell(parent, cols, rows, new):
             try c.encode("Shell", forKey: .t)
             try c.encode(parent, forKey: .parent)
             try c.encode(cols, forKey: .cols)
             try c.encode(rows, forKey: .rows)
+            try c.encode(new, forKey: .new)
         }
     }
 }
@@ -144,7 +146,8 @@ extension Req: Decodable {
         case "Shell":
             self = .shell(parent: try c.decode(String.self, forKey: .parent),
                           cols: try c.decode(UInt16.self, forKey: .cols),
-                          rows: try c.decode(UInt16.self, forKey: .rows))
+                          rows: try c.decode(UInt16.self, forKey: .rows),
+                          new: try c.decodeIfPresent(Bool.self, forKey: .new) ?? false)
         case let other:
             throw DecodingError.dataCorruptedError(forKey: .t, in: c,
                                                    debugDescription: "unknown Req '\(other)'")
