@@ -121,11 +121,7 @@ public final class VMLink: @unchecked Sendable {
 
         drainStderr(errPipe)
 
-        let io = DispatchIO(type: .stream,
-                            fileDescriptor: out.fileHandleForReading.fileDescriptor,
-                            queue: queue,
-                            cleanupHandler: { _ in })
-        io.setLimit(lowWater: 1)
+        let io = readChannel(out)
         io.read(offset: 0, length: Int.max, queue: queue) { [weak self] done, data, _ in
             guard let self else { return }
             if let data, !data.isEmpty {
@@ -157,11 +153,7 @@ public final class VMLink: @unchecked Sendable {
     /// parked for the life of the process, one per VM, to carry a line of text that
     /// arrives once per connection.
     private func drainStderr(_ pipe: Pipe) {
-        let io = DispatchIO(type: .stream,
-                            fileDescriptor: pipe.fileHandleForReading.fileDescriptor,
-                            queue: queue,
-                            cleanupHandler: { _ in })
-        io.setLimit(lowWater: 1)
+        let io = readChannel(pipe)
         io.read(offset: 0, length: Int.max, queue: queue) { [weak self] _, data, _ in
             guard let self, let data, !data.isEmpty else { return }
             let text = String(decoding: data, as: UTF8.self)
@@ -173,6 +165,19 @@ public final class VMLink: @unchecked Sendable {
         errIO = io
     }
 
+    /// The pipe closes its fd when it deallocates, and `close(flags: .stop)` only asks the
+    /// channel to stop — its kqueue source outlives the call. Closing the fd under that
+    /// source is an EV_VANISHED trap in libdispatch, so the cleanup handler, which runs
+    /// once the channel has let go of the fd, is what keeps the pipe alive.
+    private func readChannel(_ pipe: Pipe) -> DispatchIO {
+        let io = DispatchIO(type: .stream,
+                            fileDescriptor: pipe.fileHandleForReading.fileDescriptor,
+                            queue: queue,
+                            cleanupHandler: { _ in withExtendedLifetime(pipe) {} })
+        io.setLimit(lowWater: 1)
+        return io
+    }
+
     private var lastStderr: String?
 
     private func fail(_ reason: String) {
@@ -182,8 +187,6 @@ public final class VMLink: @unchecked Sendable {
     }
 
     private func teardown(reason: String?, notify: Bool) {
-        // Both channels go before `proc`: the pipes die with the Process, and their fds
-        // with them, so a reader still holding one would be reading a reused descriptor.
         io?.close(flags: .stop)
         io = nil
         errIO?.close(flags: .stop)
