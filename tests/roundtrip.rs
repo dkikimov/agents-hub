@@ -246,6 +246,21 @@ fn a_companion_shell_lives_and_dies_with_its_session() {
     let listed = wait_for(&mut r, |l| l.contains("\"Sessions\""));
     assert_eq!(sessions(&listed).len(), 2, "Shell must be idempotent: {listed}");
 
+    // ── unless the client asks for another ────────────────────────────────────
+    send(
+        &mut s,
+        &format!(r#"{{"t":"Shell","parent":"{parent}","cols":80,"rows":24,"new":true}}"#),
+    );
+    let listed = wait_for(&mut r, |l| l.contains("\"Sessions\"") && sessions(l).len() == 3);
+    let second = sessions(&listed)
+        .into_iter()
+        .find(|(id, p)| *id != shell && p.as_deref() == Some(parent.as_str()))
+        .expect("a second shell under the same parent")
+        .0;
+    send(&mut s, &format!(r#"{{"t":"Kill","id":"{second}"}}"#));
+    let listed = wait_for(&mut r, |l| l.contains("\"Sessions\"") && !l.contains(&second));
+    assert_eq!(sessions(&listed).len(), 2, "a shell is killed on its own: {listed}");
+
     drop(r);
     drop(s);
     drop(d1);

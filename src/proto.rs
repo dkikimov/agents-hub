@@ -45,10 +45,13 @@ pub enum Req {
     /// Opens the companion shell of session `parent`: a login shell in its cwd, created on
     /// first ask and relaunched if stopped. Idempotent, so a client never has to know
     /// whether one exists yet. It arrives in `Sessions` like any other, with `parent` set.
+    /// `new` always starts another one instead, for a client that shows several.
     Shell {
         parent: String,
         cols: u16,
         rows: u16,
+        #[serde(default)]
+        new: bool,
     },
 }
 
@@ -126,6 +129,7 @@ mod tests {
                 parent: "x".into(),
                 cols: 80,
                 rows: 24,
+                new: true,
             },
         ];
         for r in reqs {

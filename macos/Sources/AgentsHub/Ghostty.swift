@@ -57,12 +57,12 @@ enum Ghostty {
             return TerminalController { b in
                 b.withFontFamily("SF Mono")
                 b.withFontSize(13)
-                layoutProofBindings(&b)
+                appBindings(&b)
             }
         }
         let controller = TerminalController(
             configSource: .file(path),
-            terminalConfiguration: TerminalConfiguration(configure: layoutProofBindings)
+            terminalConfiguration: TerminalConfiguration(configure: appBindings)
         )
         if controller.lastConfigurationIssue != nil,
            let text = try? String(contentsOfFile: path, encoding: .utf8) {
@@ -76,6 +76,22 @@ enum Ghostty {
         }
         return controller
     }()
+
+    private static func appBindings(_ b: inout TerminalConfiguration.Builder) {
+        layoutProofBindings(&b)
+        releaseMenuKeys(&b)
+    }
+
+    /// A focused surface claims every key ghostty binds before the menu sees it, and by
+    /// default ⌘T and ⌘1…⌘9 are its own tab commands — dead ends here, with no tabs. Both
+    /// spellings go, since the defaults bind the character and the physical key alike.
+    private static func releaseMenuKeys(_ b: inout TerminalConfiguration.Builder) {
+        b.withCustom("keybind", "super+t=unbind")
+        for n in 1...9 {
+            b.withCustom("keybind", "super+\(n)=unbind")
+            b.withCustom("keybind", "super+digit_\(n)=unbind")
+        }
+    }
 
     /// Ghostty matches a keybind against the *character* a layout produces, so with a
     /// Cyrillic layout active ⌘V is `cmd+м` and nothing pastes — including the synthetic ⌘V

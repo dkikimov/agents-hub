@@ -21,6 +21,7 @@ import Testing
             .restart(id: "x", cols: 80, rows: 24),
             .listDir(path: "~"),
             .shell(parent: "x", cols: 80, rows: 12),
+            .shell(parent: "x", cols: 80, rows: 12, new: true),
         ]
         for r in reqs {
             let encoded = try line(r)

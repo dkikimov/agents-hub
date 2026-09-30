@@ -69,6 +69,60 @@ struct ShellPane: View {
     }
 }
 
+/// The panel's tabs, one per shell of the selected session, numbered for ⌘1…⌘9.
+struct ShellTabs: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        let shells = model.selectedKey.map(model.shellKeys) ?? []
+        let visible = model.visibleShellKey
+        HStack(spacing: 4) {
+            ForEach(Array(shells.enumerated()), id: \.element) { index, key in
+                if let terminal = model.terminals[key] {
+                    ShellTab(model: model, key: key, number: index + 1, state: terminal.state,
+                             active: key == visible,
+                             stopped: model.info(for: key)?.status == .stopped)
+                }
+            }
+            Button { model.newShell() } label: { Image(systemName: "plus") }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("New terminal (⌘T)")
+        }
+        .font(Ghostty.ui(Ghostty.fontSize - 3))
+    }
+}
+
+/// Its own view so each tab observes only its own terminal's title.
+private struct ShellTab: View {
+    let model: AppModel
+    let key: SessionKey
+    let number: Int
+    @ObservedObject var state: TerminalViewState
+    let active: Bool
+    let stopped: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text("\(number) \(state.title.isEmpty ? "shell" : state.title)")
+                .lineLimit(1)
+                .truncationMode(.head)
+                .frame(maxWidth: 180)
+            Button { model.closeShellTab(key) } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain)
+                .help("Close terminal")
+        }
+        .foregroundStyle(active ? .primary : .secondary)
+        .opacity(stopped ? 0.6 : 1)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 1)
+        .background(active ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear), in: Capsule())
+        .contentShape(Capsule())
+        .onTapGesture { model.showShell(key) }
+        .help(number <= 9 ? "⌘\(number)" : "")
+    }
+}
+
 /// The panel's height as a share of the space the terminals get, so it keeps its
 /// proportion through a window resize. Dragged from the handle, or set in Settings.
 enum ShellPanelSize {

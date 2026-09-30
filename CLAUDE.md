@@ -115,8 +115,9 @@ so a reconnect re-attaches and rebuilds parsers from replay.
 **Companion shells** (`Req::Shell`, the macOS app's ⌘B) are ordinary daemon sessions with
 `parent` set, so they get PTY ownership, logs, replay and restart for free. What sets them
 apart: the daemon launches `$SHELL -l` rather than an `[agents.*]` entry, `Shell` is
-idempotent (create, relaunch if stopped, else nothing), and `Kill` of the parent takes them
-with it. Clients must not list them as rows — the TUI drops them on arrival, the macOS
+idempotent (create, relaunch if stopped, else nothing) unless `new` asks for another, and
+`Kill` of the parent takes them with it. The macOS panel shows one tab per shell (⌘T new,
+⌘1–⌘9 switch); a shell's `exit` kills its tab rather than leaving it stopped. Clients must not list them as rows — the TUI drops them on arrival, the macOS
 client filters them out of the sidebar and keeps them out of `SessionRegistry.resized`,
 because a shell is sized by its own panel.
 
