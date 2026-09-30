@@ -74,7 +74,7 @@ import Testing
         _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
         _ = r.sessions(vm: 1, [info("z", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
 
-        #expect(r.connected(vm: 0) == [.teardown(key("a")), .send(vm: 0, req: .list)])
+        #expect(r.connected(vm: 0) == [.send(vm: 0, req: .list)])
         #expect(r.attached == [key("z", vm: 1)], "vm 1 was never touched")
 
         // And the frame that comes back re-attaches from scratch.
@@ -87,12 +87,56 @@ import Testing
         var r = SessionRegistry()
         _ = r.connected(vm: 0)
         _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
-        #expect(r.disconnected(vm: 0) == [.teardown(key("a"))])
+        #expect(r.disconnected(vm: 0).isEmpty, "the old screen stays up until the replay")
         #expect(r.attached.isEmpty)
     }
 
-    /// Unmounted sessions have no surface to report their own size, so they must be
-    /// resized explicitly or their PTY stays at 80×24 forever.
+    @Test func disconnectVoidsOnlyThatVM() {
+        var r = SessionRegistry()
+        _ = r.connected(vm: 0)
+        _ = r.connected(vm: 1)
+        _ = r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
+        _ = r.sessions(vm: 1, [info("z", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
+        _ = r.disconnected(vm: 0)
+        #expect(r.attached == [key("z", vm: 1)])
+    }
+
+    /// After an outage a shell comes back at the panel's grid, and the pane's resizes
+    /// still pass it by.
+    @Test func aShellReattachesAtThePanelSizeAfterAnOutage() {
+        var r = SessionRegistry()
+        let shell = SessionInfo(id: "sh", agent: "shell", name: "a", cwd: "~/p",
+                                status: .running, createdAt: 1, parent: "a")
+        let list = [info("a", .running), shell]
+        _ = r.connected(vm: 0)
+        _ = r.sessions(vm: 0, list, cols: 80, rows: 24, shellCols: 80, shellRows: 12)
+        _ = r.disconnected(vm: 0)
+        _ = r.connected(vm: 0)
+
+        #expect(r.sessions(vm: 0, list, cols: 200, rows: 50, shellCols: 100, shellRows: 10) == [
+            .teardown(key("a")), .send(vm: 0, req: .attach(id: "a", cols: 200, rows: 50)),
+            .teardown(key("sh")), .send(vm: 0, req: .attach(id: "sh", cols: 100, rows: 10)),
+        ])
+        #expect(r.resized(cols: 120, rows: 40) == [.send(vm: 0, req: .resize(id: "a", cols: 120, rows: 40))])
+    }
+
+    /// Anything killed during an outage must still be forgotten by the frame after the
+    /// reconnect.
+    @Test func aSessionKilledDuringAnOutageIsForgottenOnReconnect() {
+        var r = SessionRegistry()
+        _ = r.connected(vm: 0)
+        _ = r.sessions(vm: 0, [info("a", .running), info("b", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12)
+        _ = r.disconnected(vm: 0)
+        _ = r.connected(vm: 0)
+
+        #expect(r.sessions(vm: 0, [info("a", .running)], cols: 80, rows: 24, shellCols: 80, shellRows: 12) == [
+            .forget(key("b")),
+            .teardown(key("a")), .send(vm: 0, req: .attach(id: "a", cols: 80, rows: 24)),
+        ])
+    }
+
+    /// A session with no laid-out surface can't report its own size, so it must be
+    /// resized explicitly or its PTY stays at 80×24.
     @Test func resizeReachesEveryAttachedSessionOnEveryVM() {
         var r = SessionRegistry()
         _ = r.connected(vm: 0)

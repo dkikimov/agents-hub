@@ -123,6 +123,28 @@ fn session_survives_a_daemon_restart() {
         "PTY output should reach the client, got: {decoded:?}"
     );
 
+    // A client that attaches again on the same connection gets one stream, not two:
+    // otherwise every byte after it arrives twice.
+    send(&mut s, &format!(r#"{{"t":"Attach","id":"{id}","cols":80,"rows":24}}"#));
+    wait_for(&mut r, |l| l.contains("\"Output\"") && l.contains("\"live\":false"));
+    // "dup-check\n", echoed back by the PTY's line discipline.
+    send(&mut s, &format!(r#"{{"t":"Input","id":"{id}","data":"ZHVwLWNoZWNrCg=="}}"#));
+    std::thread::sleep(Duration::from_millis(500));
+    send(&mut s, r#"{"t":"List"}"#);
+    let mut live = String::new();
+    loop {
+        let mut line = String::new();
+        assert!(r.read_line(&mut line).unwrap() > 0, "daemon closed the link");
+        if line.contains("\"Sessions\"") {
+            break;
+        }
+        if line.contains("\"Output\"") && line.contains("\"live\":true") {
+            let b64 = line.split("\"data\":\"").nth(1).unwrap().split('"').next().unwrap();
+            live.push_str(&String::from_utf8_lossy(&base64_decode(b64)));
+        }
+    }
+    assert_eq!(live.matches("dup-check").count(), 1, "a re-attach doubled the stream: {live:?}");
+
     // cwd completion is answered by the machine that would host the session, which is
     // what makes it work for a VM the client can't see the filesystem of
     std::fs::create_dir_all(dir.join("subdir")).unwrap();

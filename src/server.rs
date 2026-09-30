@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::AbortHandle;
 
 /// Replayed to a client on attach, so a reconnect shows recent history.
 // ponytail: 128 KB per session per attach. With many sessions on a slow link this is
@@ -380,7 +381,14 @@ impl Hub {
         })
     }
 
-    async fn handle(self: &Arc<Self>, req: Req, tx: &mpsc::UnboundedSender<Resp>) -> Result<()> {
+    /// `streams` is this connection's live forwarder per session: an `Attach` replaces
+    /// the previous one rather than adding a second, which would send every byte twice.
+    async fn handle(
+        self: &Arc<Self>,
+        req: Req,
+        tx: &mpsc::UnboundedSender<Resp>,
+        streams: &mut HashMap<String, AbortHandle>,
+    ) -> Result<()> {
         match req {
             Req::List => {
                 let _ = tx.send(Resp::Sessions { sessions: self.list() });
@@ -457,6 +465,10 @@ impl Hub {
             }
 
             Req::Attach { id, cols, rows } => {
+                // Before the replay, so no stale live chunk can land after it.
+                if let Some(old) = streams.remove(&id) {
+                    old.abort();
+                }
                 let mut replay = mode_prelude(&self.log_path(&id), REPLAY_BYTES);
                 replay.extend_from_slice(&read_tail(&self.log_path(&id), REPLAY_BYTES));
                 // Sent even when empty: it is how a client learns the replay is over, and
@@ -480,7 +492,8 @@ impl Hub {
                 };
                 if let Some(mut sub) = sub {
                     let out = tx.clone();
-                    tokio::spawn(async move {
+                    let key = id.clone();
+                    let task = tokio::spawn(async move {
                         loop {
                             match sub.recv().await {
                                 Ok(Ev::Data(d)) => {
@@ -503,6 +516,7 @@ impl Hub {
                             }
                         }
                     });
+                    streams.insert(key, task.abort_handle());
                 }
             }
 
@@ -628,6 +642,7 @@ async fn serve_conn(hub: Arc<Hub>, stream: UnixStream) {
         }
     });
 
+    let mut streams = HashMap::new();
     let mut lines = BufReader::new(r).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
@@ -635,7 +650,7 @@ async fn serve_conn(hub: Arc<Hub>, stream: UnixStream) {
         }
         match serde_json::from_str::<Req>(&line) {
             Ok(req) => {
-                if let Err(e) = hub.handle(req, &tx).await {
+                if let Err(e) = hub.handle(req, &tx, &mut streams).await {
                     // `{e:#}` not `{e}`: the cause is the whole message. A bare
                     // "launching claude" hides the "No such file or directory" that
                     // says it is a PATH problem.

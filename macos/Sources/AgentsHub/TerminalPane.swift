@@ -13,12 +13,17 @@ struct TerminalPane: View {
 
     var body: some View {
         ZStack {
-            if model.mounted.isEmpty {
+            if model.selectedKey == nil {
                 placeholder
             }
             ForEach(model.mounted, id: \.self) { key in
                 if let terminal = model.terminals[key] {
+                    // A restart or reconnect swaps the terminal under the same key. Reusing
+                    // the NSView would leave its delegate on the old state, which the
+                    // package binds only at creation, and the new feed would never learn
+                    // its grid — holding the replay forever behind a blank pane.
                     TerminalSurfaceView(context: terminal.state)
+                        .id(terminal.id)
                         .opacity(key == model.selectedKey ? 1 : 0)
                         .allowsHitTesting(key == model.selectedKey)
                         .accessibilityHidden(key != model.selectedKey)
@@ -52,12 +57,13 @@ struct ShellPane: View {
     var body: some View {
         let visible = model.visibleShellKey
         ZStack {
-            if model.shellPanelOpen, !(visible.map { model.mountedShells.contains($0) } ?? false) {
+            if model.shellPanelOpen, visible == nil {
                 Text("starting shell…").foregroundStyle(.secondary)
             }
             ForEach(model.mountedShells, id: \.self) { key in
                 if let terminal = model.terminals[key] {
                     TerminalSurfaceView(context: terminal.state)
+                        .id(terminal.id)
                         .opacity(key == visible ? 1 : 0)
                         .allowsHitTesting(key == visible)
                         .accessibilityHidden(key != visible)

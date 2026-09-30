@@ -171,6 +171,16 @@ work. `Run`'s fields are `Arc<Mutex<..>>` specifically to make that possible.
   history's DA/XTWINOPS queries were typed into live shells. `AttachFeed` holds bytes and
   resizes until ghostty reports the grid the view laid out; its tests pin each rule.
 
+- **A surface is only as fresh as the view that built it.** libghostty-spm binds a
+  `TerminalView`'s delegate to its `TerminalViewState` in `makeNSView` only, so a new
+  `TerminalSession` under the same SwiftUI identity reports to the old state and its
+  `AttachFeed` never releases: a blank pane with a cursor. Surfaces are `.id`'d by a
+  per-terminal UUID (an address can be reused). Closing the window frees every surface,
+  so the terminals start over and a reopen reconnects each link for a fresh replay.
+- **One connection, one stream per session.** `Attach` spawns a forwarder; a second one
+  on the same connection used to add another, doubling every byte. `serve_conn` keeps
+  them per session and aborts the old before the new replay goes out.
+
 ## Conventions
 
 - A file earns its existence by having one job someone can name. Split when a file

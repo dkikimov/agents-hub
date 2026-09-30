@@ -71,12 +71,14 @@ final class AppModel: ObservableObject {
     /// Toggled by ⌘L; the root view watches it and moves focus. A plain signal rather
     /// than reaching into `@FocusState` from the model.
     @Published var requestSidebarFocus = false
+    /// Every agent terminal's surface, never unmounted: the surface is the scrollback.
+    /// Append-only rather than derived from `terminals`, so a new session never reorders
+    /// the views under the focused one — a moved view resigns first responder.
     @Published private(set) var mounted: [SessionKey] = []
     /// Agent sessions whose ⌘B shell panel is open. Per session, so switching to one
     /// without a shell does not open an empty panel under it.
     @Published private(set) var shellOpen: Set<SessionKey> = []
-    /// Companion shells with a surface in the panel. Same never-unmount rule as `mounted`,
-    /// for the same reason: the surface *is* the scrollback.
+    /// `mounted`'s twin for the companion shells in the panel.
     @Published private(set) var mountedShells: [SessionKey] = []
     /// The panel tab each agent session last showed. A missing or dead entry falls back
     /// to its first shell.
@@ -115,6 +117,7 @@ final class AppModel: ObservableObject {
     private var dotTimer: Timer?
     private var requestedDirs: Set<String> = []
     private var windowVisible = true
+    private var windowShown = false
     private weak var paneWindow: NSWindow?
 
     /// Set only while the New Session sheet is showing a dropped folder, and cleared when it
@@ -279,8 +282,14 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Mounted at once, selected or not: an unmounted terminal's bytes pile up in the
+    /// feed's backlog, and a busy agent overflows it — trimming the mode prelude, so the
+    /// screen is garbled and paste arrives unbracketed.
+    ///
+    /// First responder does not follow a surface to its replacement, so it is handed on.
     private func makeTerminal(_ key: SessionKey) {
         let vm = key.vm
+        let hadFocus = terminals[key]?.ownsKeyboard ?? false
         let terminal = TerminalSession(
             key: key,
             send: { [weak self, router] req in
@@ -297,12 +306,32 @@ final class AppModel: ObservableObject {
         )
         terminals[key] = terminal
         router.set(key, terminal.feed)
-        // A restarted session keeps its slot in the ZStack, so the surface is rebuilt in
-        // place rather than the pane going blank.
-        if mounted.contains(key) || mountedShells.contains(key) { applySurfaceVisibility() }
+        if info(for: key)?.isShell == true {
+            if !mountedShells.contains(key) { mountedShells.append(key) }
+        } else if !mounted.contains(key) {
+            mounted.append(key)
+        }
+        applySurfaceVisibility()
+        if hadFocus { terminal.focus() }
     }
 
-    // MARK: - selection and mounting
+    /// Closing the window frees every surface. A feed that already released its replay
+    /// would hand the reopened window's surfaces live bytes at ghostty's default grid —
+    /// forwarding that grid to every PTY and answering the queries in them — so each
+    /// terminal starts over, holding everything until a surface lays out.
+    func windowClosed() {
+        terminals.keys.sorted().forEach(makeTerminal)
+    }
+
+    /// Only the daemon still has the history. Reconnect rather than re-attach: a daemon
+    /// older than per-connection stream dedupe would send every byte twice.
+    func windowAppeared() {
+        defer { windowShown = true }
+        guard windowShown else { return }
+        links.forEach { $0.reconnect() }
+    }
+
+    // MARK: - selection
 
     var selectedKey: SessionKey? {
         guard let selection else { return nil }
@@ -323,16 +352,10 @@ final class AppModel: ObservableObject {
         return true
     }
 
-    /// Mount on first selection and never unmount: unmounting destroys the grid and the
-    /// scrollback with it, and the 1 MiB pending buffer only refills from that moment.
-    /// Hidden surfaces keep parsing, they just stop drawing.
-    ///
     /// Deliberately does *not* take keyboard focus. Moving the selection with j/k has to
     /// leave focus in the sidebar, or the second keystroke lands in the agent — the
     /// terminal is entered explicitly, with ⏎ or a click.
     func selectionChanged() {
-        guard let key = selectedKey else { return }
-        if !mounted.contains(key) { mounted.append(key) }
         applySurfaceVisibility()
         revealShell()
     }
@@ -480,7 +503,7 @@ final class AppModel: ObservableObject {
         applySurfaceVisibility()
     }
 
-    /// Mounts the selected session's visible shell if its panel is open, and hands it the
+    /// Draws the selected session's visible shell if its panel is open, and hands it the
     /// keyboard if a shell command is still waiting on it. Called wherever a shell can
     /// newly exist or be shown: a `Sessions` frame, a selection change, a tab switch.
     ///
@@ -490,7 +513,6 @@ final class AppModel: ObservableObject {
     private func revealShell() {
         guard let key = selectedKey, let shell = visibleShellKey, let terminal = terminals[shell]
         else { return }
-        if !mountedShells.contains(shell) { mountedShells.append(shell) }
         applySurfaceVisibility()
         if shellFocusPending == key, awaitingShell?.parent != key,
            info(for: shell)?.status == .running {
@@ -536,7 +558,6 @@ final class AppModel: ObservableObject {
 
     func focusSelectedTerminal() {
         guard let key = selectedKey else { return }
-        if !mounted.contains(key) { mounted.append(key) }
         terminals[key]?.focus()
     }
 
@@ -564,7 +585,8 @@ final class AppModel: ObservableObject {
     /// size follows the user's ghostty font and is not ours to guess.
     ///
     /// The reporter already resized itself through its own callback; this is only for
-    /// everyone else, who are hidden or unmounted and will never notice the window moved.
+    /// everyone else, whose surface may not be there to notice: not laid out yet, or gone
+    /// with a closed window.
     private func gridChanged(_ reporter: SessionKey, cols: UInt16, rows: UInt16) {
         guard cols > 0, rows > 0 else { return }
         // A shell's surface already resized its own PTY; its grid is the panel's, not the
@@ -761,11 +783,6 @@ final class AppModel: ObservableObject {
     ///
     /// Every terminal is counted whether or not it will notify, so a bell you watched
     /// arrive is spent rather than waiting to fire the moment you look away.
-    ///
-    /// ponytail: a session never selected since launch has no surface, so nothing parses
-    /// its bytes and it cannot ring — mounting is lazy and `pendingWrites` just accrues.
-    /// The fix is mounting every session at startup, at one GPU surface each; do it only
-    /// if the gap actually bites.
     private func notifyBells() {
         let watching = NSApp.isActive ? selectedKey : nil
         for (key, terminal) in terminals {

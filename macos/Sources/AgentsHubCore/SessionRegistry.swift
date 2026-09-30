@@ -40,19 +40,18 @@ public struct SessionRegistry {
     /// Rule 1: a reconnected daemon has no memory of the dropped connection's
     /// subscriptions, so every attachment for this VM is void. Re-`List` afterwards;
     /// the `Sessions` frame that comes back drives the re-attach.
+    ///
+    /// Nothing is torn down: the old screen stays up until its replay lands. `known` is
+    /// kept so that frame still forgets sessions killed during the outage.
     public mutating func connected(vm: Int) -> [Effect] {
-        let mine = attached.filter { $0.vm == vm }.sorted()
-        attached.subtract(mine)
-        known[vm] = nil
-        return mine.map { .teardown($0) } + [.send(vm: vm, req: .list)]
+        attached = attached.filter { $0.vm != vm }
+        return [.send(vm: vm, req: .list)]
     }
 
     /// The link dropped. Same voiding, but nothing to send — `connected` re-lists.
     public mutating func disconnected(vm: Int) -> [Effect] {
-        let mine = attached.filter { $0.vm == vm }.sorted()
-        attached.subtract(mine)
-        known[vm] = nil
-        return mine.map { .teardown($0) }
+        attached = attached.filter { $0.vm != vm }
+        return []
     }
 
     /// Rule 2: `Sessions` frames arrive unsolicited on every daemon-side change, so this
@@ -83,13 +82,6 @@ public struct SessionRegistry {
             attached.remove(key)
             effects.append(.forget(key))
         }
-        // Also forget anything we were attached to that this frame doesn't list — the
-        // first frame after a restart has no `previous` to diff against.
-        for key in attached.filter({ $0.vm == vm && live[$0.id] == nil }).sorted() {
-            attached.remove(key)
-            effects.append(.forget(key))
-        }
-
         for id in live.keys.sorted() {
             let key = SessionKey(vm: vm, id: id)
             if previous[id] == .stopped, live[id] == .running {
@@ -105,9 +97,9 @@ public struct SessionRegistry {
         return effects
     }
 
-    /// One geometry for every pane, as in the Rust client. Unmounted sessions are
-    /// included deliberately: they have no surface to report their own size, and without
-    /// this their PTY sits at 80×24 while the window is 200 columns wide.
+    /// One geometry for every pane, as in the Rust client. Sessions without a laid-out
+    /// surface are included deliberately: without this their PTY sits at 80×24 while the
+    /// window is 200 columns wide.
     ///
     /// Companion shells are not: they live in a panel of their own height, and dragging
     /// the agent pane must not squash a shell to its geometry.

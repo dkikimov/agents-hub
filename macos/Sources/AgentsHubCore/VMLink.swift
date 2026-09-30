@@ -59,6 +59,15 @@ public final class VMLink: @unchecked Sendable {
         }
     }
 
+    /// Redials a live connection at once; a link that is down is left to its own retry.
+    public func reconnect() {
+        queue.async { [self] in
+            guard connected else { return }
+            teardown(reason: nil, notify: false)
+            connect()
+        }
+    }
+
     public func send(_ req: Req) {
         queue.async { [self] in
             guard connected, let pipe = inPipe else { return }  // dropped while down
@@ -119,11 +128,13 @@ public final class VMLink: @unchecked Sendable {
         backoff = 1
         emit(.up)
 
-        drainStderr(errPipe)
+        drainStderr(errPipe, of: p)
 
         let io = readChannel(out)
         io.read(offset: 0, length: Int.max, queue: queue) { [weak self] done, data, _ in
-            guard let self else { return }
+            // A cancelled channel still calls back once; only the live process's may
+            // tear down, or a redial or a retry already scheduled is torn down twice.
+            guard let self, self.proc === p else { return }
             if let data, !data.isEmpty {
                 let ok = self.reader.push(Array(data)) { line in
                     do {
@@ -152,10 +163,10 @@ public final class VMLink: @unchecked Sendable {
     /// Same `DispatchIO` as stdout rather than a thread blocked in `read`: that thread
     /// parked for the life of the process, one per VM, to carry a line of text that
     /// arrives once per connection.
-    private func drainStderr(_ pipe: Pipe) {
+    private func drainStderr(_ pipe: Pipe, of p: Process) {
         let io = readChannel(pipe)
         io.read(offset: 0, length: Int.max, queue: queue) { [weak self] _, data, _ in
-            guard let self, let data, !data.isEmpty else { return }
+            guard let self, self.proc === p, let data, !data.isEmpty else { return }
             let text = String(decoding: data, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return }
