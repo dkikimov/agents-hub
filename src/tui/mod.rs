@@ -20,22 +20,12 @@ use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     KeyEventKind,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 /// One redraw per frame at most, however many bytes arrive in between. This is what
 /// keeps the UI responsive when three agents stream at once.
 const FRAME: Duration = Duration::from_millis(16);
-const ACTIVITY_WINDOW: Duration = Duration::from_secs(1);
-
-/// How long after a request at a session its output stops counting as that session's own.
-/// `Req::Attach` resizes the PTY server-side and `reconcile` attaches everything at once, so
-/// without this every dot lights together on each reconnect — a redraw we asked for, read
-/// back as work the agent chose to do.
-///
-/// ponytail: one fixed window rather than pairing each request with its reply. A dot is
-/// decoration, and a repaint slower than this costs a stray blink.
-const POKE_GRACE: Duration = Duration::from_millis(500);
 
 /// Sidebar width: start, and the bounds the drag handle clamps to.
 const SIDE_W: u16 = 30;
@@ -124,12 +114,7 @@ pub async fn run() -> Result<()> {
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // The activity dots expire on their own, so a session that fell quiet
-                // needs one more frame even with nothing else to report.
-                let before = app.activity.len();
-                let now = Instant::now();
-                app.activity.retain(|_, last| now.duration_since(*last) < ACTIVITY_WINDOW);
-                app.dirty |= app.activity.len() != before;
+                event::seen(&mut app);
                 event::autoscroll(&mut app);
                 if app.dirty {
                     app.dirty = false;

@@ -307,6 +307,51 @@ fn a_companion_shell_lives_and_dies_with_its_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The daemon reads an agent's screen and tells every client what it is doing. A
+/// stand-in `claude` sets the working spinner title, then finishes its turn and shows
+/// the idle title over an empty prompt box.
+#[test]
+fn the_daemon_reports_what_an_agent_is_doing() {
+    let dir = std::env::temp_dir().join(format!("agents-hub-act-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Named `claude`, which is all the daemon goes by. Octal escapes: `⠂` and `✳`.
+    let agent = dir.join("claude");
+    std::fs::write(
+        &agent,
+        "#!/bin/sh\n\
+         printf '\\033]0;\\342\\240\\202 Fixing it\\007working\\r\\n'\n\
+         sleep 4\n\
+         printf '\\033]0;\\342\\234\\263 Claude Code\\007\\r\\n\\342\\224\\200\\342\\224\\200\\342\\224\\200\\r\\n\\342\\235\\257 \\r\\n\\342\\224\\200\\342\\224\\200\\342\\224\\200\\r\\n'\n\
+         sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let cfg = dir.join("config.toml");
+    std::fs::write(
+        &cfg,
+        format!("[[vm]]\nname = \"local\"\n\n[agents.claude]\ncommand = [{:?}]\n", agent),
+    )
+    .unwrap();
+
+    let _d = start(&dir, &cfg);
+    let mut s = connect(&dir);
+    let mut r = BufReader::new(s.try_clone().unwrap());
+    send(
+        &mut s,
+        r#"{"t":"Create","agent":"claude","name":"act","cwd":"/tmp","cols":80,"rows":24}"#,
+    );
+    let first = wait_for(&mut r, |l| l.contains("\"Sessions\"") && l.contains("act"));
+    assert!(first.contains("\"activity\":\"Unknown\""), "nothing read yet: {first}");
+
+    // Past the startup grace, the spinner in the title says working…
+    wait_for(&mut r, |l| l.contains("\"activity\":\"Working\""));
+    // …and the idle title takes over once the turn ends.
+    wait_for(&mut r, |l| l.contains("\"activity\":\"Idle\""));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Tiny standalone decoder so the test doesn't depend on the crate's internals.
 fn base64_decode(s: &str) -> Vec<u8> {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

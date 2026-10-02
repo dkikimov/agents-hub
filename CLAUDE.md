@@ -22,7 +22,7 @@ make vm HOST=buildbox                          # provision a remote over SSH
 Underneath, and for anything narrower than a whole suite:
 
 ```bash
-cargo test                                     # 75 unit + 2 integration
+cargo test                                     # 93 unit + 3 integration
 cargo test --test roundtrip                    # integration only (spawns real daemons + PTYs)
 cargo test tui::event::                        # one module's tests
 cargo test key_bytes_match_a_real_terminal     # single test by name
@@ -106,7 +106,21 @@ mismatch surfaces as `Resp::Error` in the status bar.
 
 **Terminal emulation lives on the client.** The server ships raw PTY bytes and appends them to
 `logs/<id>.log`; on attach it replays the last 128 KB, then streams. The client feeds all of it
-into `vt100::Parser` and renders with `tui-term`. Keep the server dumb about screen state.
+into `vt100::Parser` and renders with `tui-term`. Keep the server dumb about screen state,
+with one exception:
+
+**The daemon reads agent screens to say what they're doing.** `src/detect.rs` is herdr's
+Claude and Codex detection (herdrdev/herdr, Apache-2.0) ported rule for rule: working,
+blocked on a prompt, or idle, from the visible screen plus the OSC title, never from output
+timing. That approach lit every dot whenever the client resized or refocused anything. For
+a session whose argv names `claude` or `codex`, `server.rs` keeps a private `vt100` screen
+that is fed by the reader thread and resized with the PTY. A 100 ms scan rereads only the
+screens that changed, and changes go out as `SessionInfo.activity`. A
+launch reads `Unknown` for 3 s, and working → idle waits 300 ms unless a prompt box is on
+screen. *Done*, meaning finished while you looked elsewhere, is per client: `App::done` in
+the TUI and `AgentWatch` on macOS, which also turns `Blocked` and background completions
+into banners. When an agent's UI changes, update its rule in `detect.rs` and add the new
+screen to that file's tests.
 
 **The client attaches to every session and never detaches**, so switching selection is instant
 rather than triggering a fresh replay. `App::reconcile` does this; `Ui::Up` clears `attached`

@@ -3,6 +3,7 @@
 //! access arrives via `agents-hub stdio` on the far end of an SSH pipe.
 
 use crate::config::{expand, Config};
+use crate::detect::{self, Agent, Tracker};
 use crate::proto::*;
 use anyhow::{anyhow, Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -12,11 +13,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::AbortHandle;
+use tui_term::vt100;
 
 /// Replayed to a client on attach, so a reconnect shows recent history.
 // ponytail: 128 KB per session per attach. With many sessions on a slow link this is
@@ -25,6 +27,9 @@ const REPLAY_BYTES: u64 = 128 * 1024;
 const LOG_MAX: u64 = 8 * 1024 * 1024;
 const LOG_KEEP: u64 = 2 * 1024 * 1024;
 const CHUNK_CAP: usize = 1024;
+/// How often agent screens are reread. Only a screen that changed since, or an idle
+/// waiting out `detect::IDLE_HOLD`, costs anything.
+const SCAN_TICK: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 enum Ev {
@@ -37,6 +42,76 @@ struct Run {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     tx: broadcast::Sender<Ev>,
+    /// Only for an agent `detect` has rules for.
+    watch: Option<Arc<Mutex<Watch>>>,
+}
+
+impl Run {
+    /// The PTY and the screen the detector reads have to agree on the grid, or a
+    /// redraw at the new width parses into the old one.
+    fn resize(&self, cols: u16, rows: u16) {
+        let (cols, rows) = (cols.max(1), rows.max(1));
+        let _ = self.master.lock().unwrap().resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        if let Some(w) = &self.watch {
+            let mut w = w.lock().unwrap();
+            w.parser.screen_mut().set_size(rows, cols);
+            w.seq += 1;
+        }
+    }
+}
+
+/// The agent's latest window title, which is where Claude and Codex put their spinner.
+#[derive(Default)]
+struct Title(String);
+
+impl vt100::Callbacks for Title {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.0 = String::from_utf8_lossy(title).chars().take(256).collect();
+    }
+}
+
+/// The one place the daemon keeps screen state: a parsed copy of an agent's output, so
+/// `detect` can read what the agent shows. Clients still emulate for themselves.
+struct Watch {
+    agent: Agent,
+    parser: vt100::Parser<Title>,
+    /// Bumped by every chunk and resize; equal to `scanned` means nothing to reread.
+    seq: u64,
+    scanned: u64,
+    tracker: Tracker,
+}
+
+impl Watch {
+    fn new(agent: Agent, cols: u16, rows: u16) -> Watch {
+        Watch {
+            agent,
+            parser: vt100::Parser::new_with_callbacks(rows.max(1), cols.max(1), 0, Title::default()),
+            seq: 0,
+            scanned: 0,
+            tracker: Tracker::new(Instant::now()),
+        }
+    }
+
+    /// The new activity, if it changed.
+    fn scan(&mut self, now: Instant) -> Option<Activity> {
+        if self.seq == self.scanned && !self.tracker.pending() {
+            return None;
+        }
+        // Left unscanned, so the first look after the grace happens even if the splash
+        // was the last thing the agent printed.
+        if self.tracker.starting(now) {
+            return None;
+        }
+        self.scanned = self.seq;
+        let text = detect::snapshot(self.parser.screen());
+        let reading = detect::detect(self.agent, &text, &self.parser.callbacks().0);
+        self.tracker.step(reading, now).then(|| self.tracker.shown())
+    }
 }
 
 struct Session {
@@ -216,12 +291,18 @@ fn pty_reader(
     log_path: PathBuf,
     tx: &broadcast::Sender<Ev>,
     child: &Mutex<Box<dyn Child + Send + Sync>>,
+    watch: Option<&Mutex<Watch>>,
 ) -> i32 {
     let mut log = SessionLog::open(log_path);
     let mut buf = [0u8; 8192];
     while let Ok(n @ 1..) = reader.read(&mut buf) {
         let chunk = &buf[..n];
         log.append(chunk);
+        if let Some(w) = watch {
+            let mut w = w.lock().unwrap();
+            w.parser.process(chunk);
+            w.seq += 1;
+        }
         let _ = tx.send(Ev::Data(Arc::new(chunk.to_vec())));
     }
     child
@@ -239,6 +320,7 @@ impl Hub {
         for mut info in restored {
             // Nothing survives the daemon dying: the PTY master died with it.
             info.status = Status::Stopped;
+            info.activity = Activity::Unknown;
             sessions.insert(info.id.clone(), Session { info, run: None });
         }
         Hub {
@@ -293,10 +375,38 @@ impl Hub {
             let mut s = self.sessions.lock().unwrap();
             if let Some(sess) = s.get_mut(id) {
                 sess.info.status = Status::Stopped;
+                sess.info.activity = Activity::Unknown;
                 sess.run = None;
             }
         }
         self.announce();
+    }
+
+    /// Rereads every agent screen that changed, and tells clients about what moved.
+    /// Not saved: activity is live state, and a restored session starts `Unknown`.
+    fn scan(&self, now: Instant) {
+        let watches: Vec<(String, Arc<Mutex<Watch>>)> = {
+            let s = self.sessions.lock().unwrap();
+            s.iter()
+                .filter_map(|(id, x)| Some((id.clone(), x.run.as_ref()?.watch.clone()?)))
+                .collect()
+        };
+        let moved: Vec<(String, Activity)> = watches
+            .into_iter()
+            .filter_map(|(id, w)| Some((id, w.lock().unwrap().scan(now)?)))
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        {
+            let mut s = self.sessions.lock().unwrap();
+            for (id, activity) in moved {
+                if let Some(sess) = s.get_mut(&id).filter(|x| x.run.is_some()) {
+                    sess.info.activity = activity;
+                }
+            }
+        }
+        let _ = self.changed.send(());
     }
 
     /// Opens a PTY, launches `argv` in `cwd`, and starts the reader thread that
@@ -339,14 +449,16 @@ impl Hub {
         let writer = pair.master.take_writer()?;
         let tx = broadcast::channel(CHUNK_CAP).0;
         let child = Arc::new(Mutex::new(child));
+        let watch = Agent::of(&argv).map(|a| Arc::new(Mutex::new(Watch::new(a, cols, rows))));
 
         let hub = self.clone();
         let sid = id.to_string();
         let log_path = self.log_path(id);
         let etx = tx.clone();
         let echild = child.clone();
+        let ewatch = watch.clone();
         std::thread::spawn(move || {
-            let code = pty_reader(reader, log_path, &etx, &echild);
+            let code = pty_reader(reader, log_path, &etx, &echild, ewatch.as_deref());
             let _ = etx.send(Ev::Exited(code));
             hub.mark_stopped(&sid);
         });
@@ -356,6 +468,7 @@ impl Hub {
             master: Arc::new(Mutex::new(pair.master)),
             child,
             tx,
+            watch,
         })
     }
 
@@ -419,6 +532,7 @@ impl Hub {
                     status: Status::Running,
                     created_at: now_secs(),
                     parent: None,
+                    activity: Activity::Unknown,
                 };
                 self.sessions
                     .lock()
@@ -456,6 +570,7 @@ impl Hub {
                     status: Status::Running,
                     created_at: now_secs(),
                     parent: Some(parent),
+                    activity: Activity::Unknown,
                 };
                 self.sessions
                     .lock()
@@ -481,12 +596,7 @@ impl Hub {
                 let sub = {
                     let s = self.sessions.lock().unwrap();
                     s.get(&id).and_then(|x| x.run.as_ref()).map(|r| {
-                        let _ = r.master.lock().unwrap().resize(PtySize {
-                            rows: rows.max(1),
-                            cols: cols.max(1),
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        });
+                        r.resize(cols, rows);
                         r.tx.subscribe()
                     })
                 };
@@ -534,17 +644,9 @@ impl Hub {
             }
 
             Req::Resize { id, cols, rows } => {
-                let m = {
-                    let s = self.sessions.lock().unwrap();
-                    s.get(&id).and_then(|x| x.run.as_ref()).map(|r| r.master.clone())
-                };
-                if let Some(m) = m {
-                    let _ = m.lock().unwrap().resize(PtySize {
-                        rows: rows.max(1),
-                        cols: cols.max(1),
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
+                let s = self.sessions.lock().unwrap();
+                if let Some(r) = s.get(&id).and_then(|x| x.run.as_ref()) {
+                    r.resize(cols, rows);
                 }
             }
 
@@ -596,6 +698,7 @@ impl Hub {
             let mut s = self.sessions.lock().unwrap();
             if let Some(sess) = s.get_mut(id) {
                 sess.info.status = Status::Running;
+                sess.info.activity = Activity::Unknown;
                 sess.run = Some(run);
             }
         }
@@ -737,6 +840,15 @@ pub async fn serve(dir: PathBuf, cfg: Config) -> Result<()> {
     });
 
     let hub = Arc::new(Hub::new(dir, cfg));
+    let scanner = hub.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SCAN_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            scanner.scan(Instant::now());
+        }
+    });
     loop {
         let (stream, _) = listener.accept().await?;
         tokio::spawn(serve_conn(hub.clone(), stream));

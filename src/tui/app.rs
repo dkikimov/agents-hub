@@ -9,7 +9,6 @@ use crate::proto::{Req, SessionInfo};
 use ratatui::crossterm::event::MouseEvent;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tui_term::vt100;
 
@@ -96,9 +95,9 @@ pub struct App {
     pub focus: Focus,
     pub panes: HashMap<Pane, vt100::Parser<Clipboard>>,
     pub attached: HashSet<Pane>,
-    pub activity: HashMap<Pane, Instant>,
-    /// When we last sent something at a pane. See `POKE_GRACE`.
-    pub poked: HashMap<Pane, Instant>,
+    /// Agents that finished a turn, or answered a prompt, since you last looked at them.
+    /// The daemon only knows working and idle; who has *seen* the idle is per client.
+    pub done: HashSet<Pane>,
     /// (vm, directory) → its subdirectories, as the daemon on that machine reported them.
     /// Emptied whenever the new-session modal opens, so a listing can't go stale for long.
     pub dirs: HashMap<(usize, String), Vec<String>>,
@@ -131,8 +130,7 @@ impl App {
             focus: Focus::Sidebar,
             panes: HashMap::new(),
             attached: HashSet::new(),
-            activity: HashMap::new(),
-            poked: HashMap::new(),
+            done: HashSet::new(),
             dirs: HashMap::new(),
             modal: None,
             filter: String::new(),
@@ -277,15 +275,6 @@ impl App {
     }
 
     pub fn send(&mut self, vm: usize, req: Req) {
-        // Whatever comes back next is a reply to this, not the agent working of its own
-        // accord: `Attach` and `Resize` both SIGWINCH the PTY, `Input` echoes.
-        if let Req::Input { id, .. }
-        | Req::Resize { id, .. }
-        | Req::Attach { id, .. }
-        | Req::Restart { id, .. } = &req
-        {
-            self.poked.insert((vm, id.clone()), Instant::now());
-        }
         if let Some(v) = self.vms.get(vm) {
             if v.tx.send(req).is_err() {
                 self.status = format!("{}: link closed", v.name);
@@ -301,8 +290,7 @@ impl App {
         let live: HashSet<String> = self.vms[vi].sessions.iter().map(|s| s.id.clone()).collect();
         self.panes.retain(|(v, id), _| *v != vi || live.contains(id));
         self.attached.retain(|(v, id)| *v != vi || live.contains(id));
-        self.activity.retain(|(v, id), _| *v != vi || live.contains(id));
-        self.poked.retain(|(v, id), _| *v != vi || live.contains(id));
+        self.done.retain(|(v, id)| *v != vi || live.contains(id));
         if self
             .selection
             .as_ref()
@@ -381,7 +369,7 @@ pub mod fixture {
     //! be writing requests into so a test can read back what it sent.
 
     use super::*;
-    use crate::proto::Status;
+    use crate::proto::{Activity, Status};
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
     pub fn app(cwds: &[&str]) -> (App, UnboundedReceiver<Req>) {
@@ -397,6 +385,7 @@ pub mod fixture {
                 status: Status::Running,
                 created_at: i as u64,
                 parent: None,
+                activity: Activity::Unknown,
             })
             .collect();
         let vm = VmState {

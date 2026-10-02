@@ -4,6 +4,7 @@
 //! daemon that owns the PTYs, and the `stdio` pipe SSH runs on a remote VM.
 
 mod config;
+mod detect;
 mod proto;
 mod server;
 mod setup;

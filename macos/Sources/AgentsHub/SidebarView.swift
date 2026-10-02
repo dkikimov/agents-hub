@@ -44,7 +44,8 @@ private struct VimKeys: ViewModifier {
 struct StatusDot: View {
     let online: Bool
     let status: Status
-    let active: Bool
+    let activity: Activity
+    let done: Bool
 
     @AppStorage("theme") private var theme = Theme.classic
 
@@ -55,12 +56,16 @@ struct StatusDot: View {
     private var glyph: String {
         if !online { return "◌" }
         if status == .stopped { return "○" }
-        return active ? "◉" : "●"
+        return activity == .working || activity == .blocked ? "◉" : "●"
     }
 
     private var color: Color {
         if !online || status == .stopped { return .secondary }
-        return active ? theme.palette.attention : theme.palette.running
+        switch activity {
+        case .working: return theme.palette.attention
+        case .blocked: return theme.palette.blocked
+        case .idle, .unknown: return done ? theme.palette.done : theme.palette.running
+        }
     }
 }
 
@@ -172,7 +177,8 @@ struct SidebarView: View {
                 indent(depth)
                 StatusDot(online: model.isOnline(vm),
                           status: info?.status ?? .stopped,
-                          active: model.activeDots.contains(key))
+                          activity: info?.activity ?? .unknown,
+                          done: model.doneDots.contains(key))
                 Text(info?.agent ?? "?").foregroundStyle(theme.palette.agent).font(Ghostty.ui())
                 Text(info?.name ?? id)
                     .font(Ghostty.ui())
