@@ -40,6 +40,7 @@ help:
 	@echo '  make fmt         cargo fmt'
 	@echo
 	@echo '  make install     put agents-hub on PATH (cargo install --locked)'
+	@echo '  make install-app copy AgentsHub.app to ~/Applications'
 	@echo '  make service     install the launchd/systemd unit and start it'
 	@echo '  make vm HOST=x   build and install on a remote over SSH, add it to config'
 	@echo
@@ -108,6 +109,14 @@ $(APP): $(SWIFT_BIN) $(RUST_BIN) $(ICNS) macos/Info.plist
 .PHONY: run
 run: app
 	open $(APP)
+
+.PHONY: install-app
+install-app: app
+	@osascript -e 'quit app "AgentsHub"' 2>/dev/null || true
+	@mkdir -p ~/Applications
+	@rm -rf ~/Applications/AgentsHub.app
+	@cp -R $(APP) ~/Applications/
+	@echo "installed ~/Applications/AgentsHub.app"
 
 # ── checks ───────────────────────────────────────────────────────────────────
 
