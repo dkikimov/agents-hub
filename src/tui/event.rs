@@ -8,12 +8,11 @@ use super::input::{
     click_bytes, key_bytes, mouse_bytes, pane_cell, paste_bytes, row_at, on_split, scroll_screen,
     selected_text, url_at,
 };
-use super::{POKE_GRACE, WHEEL};
-use crate::proto::{b64, unb64, Req, Resp, Status};
+use super::WHEEL;
+use crate::proto::{b64, unb64, Activity, Req, Resp, Status};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use std::time::Instant;
 
 // ── keys ──────────────────────────────────────────────────────────────────────
 
@@ -334,6 +333,14 @@ fn pane_overshoot(org: u16, rows: u16, row: u16) -> i16 {
     over.clamp(i16::MIN.into(), i16::MAX.into()) as i16
 }
 
+/// Looking at a finished agent is what makes it not news any more. Driven by the frame
+/// tick, so it catches every way the selection moves.
+pub fn seen(app: &mut App) {
+    let Some((vi, s)) = app.cur() else { return };
+    let pane = (vi, s.id.clone());
+    app.dirty |= app.done.remove(&pane);
+}
+
 /// Scrolls the pane while a drag is parked past its edge. Driven by the frame tick
 /// because crossterm reports a motionless pointer not at all.
 pub fn autoscroll(app: &mut App) {
@@ -604,6 +611,20 @@ pub fn on_msg(app: &mut App, vi: usize, resp: Resp) {
                     app.attached.remove(&(vi, s.id.clone()));
                 }
             }
+            // herdr's rule: a turn that ends, or a prompt that gets answered, is news
+            // until you look. Idle on first sight is just how the agent was left.
+            let watching = app.cur().map(|(v, s)| (v, s.id.clone()));
+            for s in &sessions {
+                let pane = (vi, s.id.clone());
+                let was = app.vms[vi].sessions.iter().find(|o| o.id == s.id).map(|o| o.activity);
+                if s.activity != Activity::Idle {
+                    app.done.remove(&pane);
+                } else if matches!(was, Some(Activity::Working | Activity::Blocked))
+                    && watching.as_ref() != Some(&pane)
+                {
+                    app.done.insert(pane);
+                }
+            }
             app.vms[vi].sessions = sessions;
             app.rebuild();
             app.reconcile(vi);
@@ -623,21 +644,13 @@ pub fn on_msg(app: &mut App, vi: usize, resp: Resp) {
             if let (Ok(bytes), Some(p)) = (unb64(&data), app.panes.get_mut(&(vi, id.clone()))) {
                 p.process(&bytes);
                 copy = p.callbacks_mut().take_if(live && selected).pop();
-                let now = Instant::now();
-                let ours = app
-                    .poked
-                    .get(&(vi, id.clone()))
-                    .is_some_and(|last| now.duration_since(*last) <= POKE_GRACE);
-                if live && !ours {
-                    app.activity.insert((vi, id.clone()), now);
-                }
             }
             if let Some(copy) = copy {
                 app.status = copy_status(&copy);
             }
         }
         Resp::Exited { id, code } => {
-            app.activity.remove(&(vi, id.clone()));
+            app.done.remove(&(vi, id.clone()));
             if let Some(s) = app.vms[vi].sessions.iter_mut().find(|s| s.id == id) {
                 s.status = Status::Stopped;
                 app.status = format!("{} exited ({code}) — r to restart", s.name);
@@ -1369,7 +1382,7 @@ mod tests {
         let (mut a, _rx) = app(&["~/a"]);
         a.sel = a.rows.len() - 1;
         a.focus = Focus::Terminal;
-        a.activity.insert((0, "s0".into()), Instant::now());
+        a.done.insert((0, "s0".into()));
 
         on_msg(
             &mut a,
@@ -1381,78 +1394,84 @@ mod tests {
         );
         assert_eq!(a.vms[0].sessions[0].status, Status::Stopped);
         assert!(a.focus == Focus::Sidebar);
-        assert!(a.activity.is_empty());
+        assert!(a.done.is_empty());
         assert!(a.status.contains("exited (1)"));
     }
 
     #[test]
-    fn output_feeds_the_pane_and_only_live_bytes_count_as_activity() {
+    fn output_feeds_the_pane() {
         let (mut a, mut rx) = app(&["~/a"]);
         a.reconcile(0);
         sent(&mut rx);
-        // The attach it just sent would swallow the live line below; that rule is next.
-        a.poked.clear();
-
-        on_msg(
-            &mut a,
-            0,
-            Resp::Output {
-                id: "s0".into(),
-                data: b64(b"replayed"),
-                live: false,
-            },
-        );
-        assert!(a.activity.is_empty(), "replay is history, not activity");
-
-        on_msg(
-            &mut a,
-            0,
-            Resp::Output {
-                id: "s0".into(),
-                data: b64(b" now"),
-                live: true,
-            },
-        );
-        assert!(a.activity.contains_key(&(0, "s0".to_string())));
+        for (data, live) in [(&b"replayed"[..], false), (&b" now"[..], true)] {
+            on_msg(
+                &mut a,
+                0,
+                Resp::Output {
+                    id: "s0".into(),
+                    data: b64(data),
+                    live,
+                },
+            );
+        }
         assert!(a.panes[&(0, "s0".to_string())]
             .screen()
             .contents()
             .starts_with("replayed now"));
     }
 
-    /// `Attach` resizes the pty server-side, and `reconcile` attaches every session at
-    /// once — so without the grace a reconnect lights every dot in the sidebar.
+    /// The daemon's next `Sessions` frame, with one agent's reading moved.
+    fn reads(a: &mut App, id: &str, activity: Activity) {
+        let mut sessions = a.vms[0].sessions.clone();
+        for s in &mut sessions {
+            if s.id == id {
+                s.activity = activity;
+            }
+        }
+        on_msg(a, 0, Resp::Sessions { sessions });
+    }
+
+    /// A turn that ends while you're looking elsewhere is news until you look; one
+    /// that was already over when we connected is not.
     #[test]
-    fn a_redraw_we_asked_for_is_not_the_agent_working() {
-        let (mut a, mut rx) = app(&["~/a"]);
-        a.reconcile(0);
-        sent(&mut rx);
+    fn a_turn_that_ends_offscreen_is_done_until_seen() {
+        let (mut a, _rx) = app(&["~/a", "~/b"]);
+        a.sel = a.rows.len() - 1; // s1, so s0 is offscreen
+        let s0 = (0, "s0".to_string());
 
-        on_msg(
-            &mut a,
-            0,
-            Resp::Output {
-                id: "s0".into(),
-                data: b64(b"repaint"),
-                live: true,
-            },
-        );
-        assert!(a.activity.is_empty(), "the attach asked for this");
+        reads(&mut a, "s0", Activity::Idle);
+        assert!(a.done.is_empty(), "idle on first sight is not a completion");
 
-        a.poked
-            .insert((0, "s0".into()), Instant::now() - POKE_GRACE * 2);
-        on_msg(
-            &mut a,
-            0,
-            Resp::Output {
-                id: "s0".into(),
-                data: b64(b" and keeps going"),
-                live: true,
-            },
-        );
-        assert!(
-            a.activity.contains_key(&(0, "s0".to_string())),
-            "past the grace it is the agent's own"
-        );
+        reads(&mut a, "s0", Activity::Working);
+        reads(&mut a, "s0", Activity::Idle);
+        assert!(a.done.contains(&s0));
+
+        seen(&mut a);
+        assert!(a.done.contains(&s0), "still not the one on screen");
+        a.sel = a.rows.iter().position(|r| matches!(r, Row::Session(0, 0, _))).unwrap();
+        seen(&mut a);
+        assert!(a.done.is_empty());
+    }
+
+    #[test]
+    fn answering_a_prompt_offscreen_is_done_too_and_new_work_clears_it() {
+        let (mut a, _rx) = app(&["~/a", "~/b"]);
+        a.sel = a.rows.len() - 1;
+        let s0 = (0, "s0".to_string());
+
+        reads(&mut a, "s0", Activity::Blocked);
+        reads(&mut a, "s0", Activity::Idle);
+        assert!(a.done.contains(&s0));
+        reads(&mut a, "s0", Activity::Working);
+        assert!(a.done.is_empty());
+    }
+
+    #[test]
+    fn the_session_on_screen_never_goes_done() {
+        let (mut a, _rx) = app(&["~/a"]);
+        a.sel = a.rows.len() - 1;
+        reads(&mut a, "s0", Activity::Working);
+        reads(&mut a, "s0", Activity::Idle);
+        assert!(a.done.is_empty());
     }
 }

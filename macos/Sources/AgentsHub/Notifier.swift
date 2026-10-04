@@ -14,8 +14,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     private let center: UNUserNotificationCenter? =
         Bundle.main.bundleIdentifier == nil ? nil : .current()
 
-    /// `onFailure` goes to the status line: a bell that reaches a denied notification
-    /// centre is indistinguishable from one that never rang, and this feature's whole
+    /// `onFailure` goes to the status line: a banner that reaches a denied notification
+    /// centre is indistinguishable from one that never fired, and this feature's whole
     /// point is that you are not watching.
     func start(onFailure: @escaping @MainActor (String) -> Void) {
         guard let center else {
@@ -34,8 +34,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    /// Keyed by session, so an agent that rings twice replaces its own banner instead of
-    /// stacking two that say the same thing.
+    /// Keyed by session, so an agent that asks, then finishes, replaces its own banner
+    /// instead of stacking two.
     func post(_ key: SessionKey, title: String, body: String) {
         guard let center else { return }
         let content = UNMutableNotificationContent()

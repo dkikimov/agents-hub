@@ -36,6 +36,8 @@ import Testing
                                    status: .stopped, createdAt: 7)]),
             .sessions([SessionInfo(id: "2", agent: "shell", name: "api", cwd: "/tmp",
                                    status: .running, createdAt: 8, parent: "1")]),
+            .sessions([SessionInfo(id: "3", agent: "claude", name: "api", cwd: "/tmp",
+                                   status: .running, createdAt: 9, activity: .blocked)]),
             .sessions([]),
             .output(id: "x", data: Data([0, 255, 10, 13]), live: true),
             .exited(id: "x", code: -1),
@@ -79,6 +81,7 @@ import Testing
         #expect(json?["status"] as? String == "Running", "serde emits the bare variant name")
         #expect(json?.keys.contains("parent") == false,
                 "an ordinary session carries no parent, as skip_serializing_if leaves it")
+        #expect(json?["activity"] as? String == "Unknown", "serde emits the bare variant name")
 
         let shell = try line(Req.shell(parent: "a", cols: 80, rows: 12))
         let fields = try JSONSerialization.jsonObject(with: Data(shell.utf8)) as? [String: Any]
@@ -93,6 +96,7 @@ import Testing
         let info = try JSONDecoder().decode(SessionInfo.self, from: Data(raw.utf8))
         #expect(info.parent == nil)
         #expect(!info.isShell)
+        #expect(info.activity == .unknown, "a daemon before detect.rs sends no activity")
     }
 
     @Test func unknownFramesFailLoudlyRatherThanSilently() {

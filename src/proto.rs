@@ -87,12 +87,29 @@ pub struct SessionInfo {
     /// that know nothing of shells must not list these, and killing the parent kills them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// What the agent is doing, as the daemon reads it off the screen (`detect.rs`).
+    /// Absent from an older daemon, which reads as `Unknown`.
+    #[serde(default)]
+    pub activity: Activity,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Status {
     Running,
     Stopped,
+}
+
+/// `Unknown` is everything the daemon has no reading for: a shell, an agent it has no
+/// rules for, the first seconds of a launch, a stopped session. Clients show it as plain
+/// running.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Activity {
+    #[default]
+    Unknown,
+    Idle,
+    Working,
+    /// Waiting on the user: a permission prompt, a question, a trust dialog.
+    Blocked,
 }
 
 // ponytail: base64-in-JSON costs ~33% on PTY output. Fine at terminal data rates;
@@ -150,6 +167,7 @@ mod tests {
                     status: Status::Stopped,
                     created_at: 7,
                     parent: None,
+                    activity: Activity::Unknown,
                 }],
             },
             Resp::Sessions {
@@ -161,6 +179,7 @@ mod tests {
                     status: Status::Running,
                     created_at: 8,
                     parent: Some("1".into()),
+                    activity: Activity::Blocked,
                 }],
             },
             Resp::Sessions { sessions: vec![] },
@@ -207,6 +226,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old_info.parent, None);
+        assert_eq!(old_info.activity, Activity::Unknown);
         assert!(!serde_json::to_string(&old_info).unwrap().contains("parent"));
     }
 

@@ -13,6 +13,17 @@ public enum Status: String, Codable, Sendable, Equatable {
     case stopped = "Stopped"
 }
 
+/// What an agent is doing, as the daemon reads it off the agent's screen (`detect.rs`).
+/// `unknown` is everything it has no reading for — a shell, an agent it has no rules for,
+/// the first seconds of a launch, a stopped session — and shows as plain running.
+public enum Activity: String, Codable, Sendable, Equatable {
+    case unknown = "Unknown"
+    case idle = "Idle"
+    case working = "Working"
+    /// Waiting on the user: a permission prompt, a question, a trust dialog.
+    case blocked = "Blocked"
+}
+
 public struct SessionInfo: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let agent: String
@@ -23,14 +34,16 @@ public struct SessionInfo: Codable, Sendable, Equatable, Identifiable {
     /// Set on a companion shell (`Req.shell`), naming the session it belongs to. Absent
     /// on the wire otherwise, exactly as serde's `skip_serializing_if` leaves it.
     public let parent: String?
+    public let activity: Activity
 
     enum CodingKeys: String, CodingKey {
-        case id, agent, name, cwd, status, parent
+        case id, agent, name, cwd, status, parent, activity
         case createdAt = "created_at"
     }
 
     public init(id: String, agent: String, name: String, cwd: String,
-                status: Status, createdAt: UInt64, parent: String? = nil) {
+                status: Status, createdAt: UInt64, parent: String? = nil,
+                activity: Activity = .unknown) {
         self.id = id
         self.agent = agent
         self.name = name
@@ -38,6 +51,21 @@ public struct SessionInfo: Codable, Sendable, Equatable, Identifiable {
         self.status = status
         self.createdAt = createdAt
         self.parent = parent
+        self.activity = activity
+    }
+
+    /// By hand only for `activity`, which a daemon older than `detect.rs` never sends:
+    /// serde's `#[serde(default)]`, which synthesized decoding has no way to say.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        agent = try c.decode(String.self, forKey: .agent)
+        name = try c.decode(String.self, forKey: .name)
+        cwd = try c.decode(String.self, forKey: .cwd)
+        status = try c.decode(Status.self, forKey: .status)
+        createdAt = try c.decode(UInt64.self, forKey: .createdAt)
+        parent = try c.decodeIfPresent(String.self, forKey: .parent)
+        activity = try c.decodeIfPresent(Activity.self, forKey: .activity) ?? .unknown
     }
 
     /// A companion shell rather than a session of its own: never a sidebar row.

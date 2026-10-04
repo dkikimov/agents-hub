@@ -9,26 +9,16 @@ import GhosttyTerminal
 final class TerminalRouter: @unchecked Sendable {
     private let lock = NSLock()
     private var sinks: [SessionKey: AttachFeed] = [:]
-    private var watch = ActivityWatch()
 
     func set(_ key: SessionKey, _ sink: AttachFeed?) {
         lock.lock()
         defer { lock.unlock() }
         sinks[key] = sink
-        if sink == nil { watch.forget(key) }
     }
 
-    func poked(_ key: SessionKey) {
-        lock.lock()
-        defer { lock.unlock() }
-        watch.poked(key)
-    }
-
-    func deliver(_ key: SessionKey, _ data: Data, live: Bool) {
+    func deliver(_ key: SessionKey, _ data: Data) {
         lock.lock()
         let sink = sinks[key]
-        // Replay is history, not activity — a reconnect must not light up every dot.
-        if live { watch.output(key) }
         lock.unlock()
         sink?.receive(data)
     }
@@ -38,13 +28,6 @@ final class TerminalRouter: @unchecked Sendable {
         let sink = sinks[key]
         lock.unlock()
         sink?.finish(exitCode: UInt32(bitPattern: code))
-    }
-
-    /// Keys that produced output of their own within `window`.
-    func active(within window: TimeInterval) -> Set<SessionKey> {
-        lock.lock()
-        defer { lock.unlock() }
-        return watch.active(within: window)
     }
 }
 
@@ -60,19 +43,7 @@ final class TerminalSession {
     let session: InMemoryTerminalSession
     let feed = AttachFeed()
 
-    private var bellsAtReplayEnd: Int?
     private var layout: AnyCancellable?
-
-    /// Bells rung since the attach replay finished.
-    ///
-    /// Replay is real scrollback fed to a real emulator, so a bell buried in it rings
-    /// exactly like a live one — counting from zero would fire a notification for every
-    /// answer already read, on every reconnect and every restart. Same hazard as the
-    /// feed's writeback, so it is drawn from the same line.
-    var liveBells: Int {
-        guard let bellsAtReplayEnd else { return 0 }
-        return max(0, state.bellCount - bellsAtReplayEnd)
-    }
 
     /// `onGrid` reports the *real* grid ghostty laid out. It is the only trustworthy
     /// source: the cell size depends on the user's font, which comes from their own
@@ -152,14 +123,6 @@ final class TerminalSession {
         let dropped = feed.openWriteback()
         if dropped > 0 {
             NSLog("agents-hub: dropped %d bytes of replay writeback for %@", dropped, key.id)
-        }
-        // A turn late, deliberately. Replay's bells are parsed by the time
-        // `waitForPendingOutput` returns but publish through `terminalRunOnMainNextTurn`,
-        // so they are sitting on the main queue ahead of this — which is FIFO, so reading
-        // the count here counts all of them.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            MainActor.assumeIsolated { self.bellsAtReplayEnd = self.state.bellCount }
         }
     }
 }

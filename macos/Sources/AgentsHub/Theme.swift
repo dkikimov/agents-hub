@@ -7,8 +7,12 @@ struct Palette {
     let folder: Color
     let agent: Color
     let running: Color
-    /// Wants looking at — a session printing output, or a VM that dropped.
+    /// Wants looking at — an agent mid-turn, or a VM that dropped.
     let attention: Color
+    /// An agent stopped on a prompt only you can answer.
+    let blocked: Color
+    /// An agent that finished while you were looking elsewhere.
+    let done: Color
     /// The focus ring and every "this one is picked" tint.
     let accent: Color
 }
@@ -33,19 +37,24 @@ enum Theme: String, CaseIterable, Identifiable {
         case .classic:
             // The system colours, which follow light/dark and the user's accent on their own.
             return Palette(vm: .cyan, folder: .blue, agent: .purple,
-                           running: .green, attention: .yellow, accent: .accentColor)
+                           running: .green, attention: .yellow, blocked: .red, done: .teal,
+                           accent: .accentColor)
         case .nord:
             return Palette(vm: hex(0x88C0D0), folder: hex(0x81A1C1), agent: hex(0xB48EAD),
-                           running: hex(0xA3BE8C), attention: hex(0xEBCB8B), accent: hex(0x88C0D0))
+                           running: hex(0xA3BE8C), attention: hex(0xEBCB8B),
+                           blocked: hex(0xBF616A), done: hex(0x8FBCBB), accent: hex(0x88C0D0))
         case .gruvbox:
             return Palette(vm: hex(0x8EC07C), folder: hex(0x83A598), agent: hex(0xD3869B),
-                           running: hex(0xB8BB26), attention: hex(0xFABD2F), accent: hex(0xFE8019))
+                           running: hex(0xB8BB26), attention: hex(0xFABD2F),
+                           blocked: hex(0xFB4934), done: hex(0x8EC07C), accent: hex(0xFE8019))
         case .catppuccin:
             return Palette(vm: hex(0x94E2D5), folder: hex(0x89B4FA), agent: hex(0xCBA6F7),
-                           running: hex(0xA6E3A1), attention: hex(0xF9E2AF), accent: hex(0xF5C2E7))
+                           running: hex(0xA6E3A1), attention: hex(0xF9E2AF),
+                           blocked: hex(0xF38BA8), done: hex(0x94E2D5), accent: hex(0xF5C2E7))
         case .tokyoNight:
             return Palette(vm: hex(0x7DCFFF), folder: hex(0x7AA2F7), agent: hex(0xBB9AF7),
-                           running: hex(0x9ECE6A), attention: hex(0xE0AF68), accent: hex(0x7AA2F7))
+                           running: hex(0x9ECE6A), attention: hex(0xE0AF68),
+                           blocked: hex(0xF7768E), done: hex(0x73DACA), accent: hex(0x7AA2F7))
         }
     }
 }

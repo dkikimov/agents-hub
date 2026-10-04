@@ -4,8 +4,8 @@
 
 use super::app::{default_name, App, Focus, Modal, Row};
 use super::input::links;
-use super::{ACTIVITY_WINDOW, CWD_MENU, PANE_MIN, SIDE_MIN};
-use crate::proto::Status;
+use super::{CWD_MENU, PANE_MIN, SIDE_MIN};
+use crate::proto::{Activity, Status};
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -13,30 +13,28 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use std::num::NonZeroU16;
-use std::time::Instant;
 use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
 
+/// herdr's colours: yellow working, red waiting on you, cyan finished while you were
+/// elsewhere, green idle. An agent with no reading (or none yet) is plain running.
 fn session_marker(
     online: bool,
     status: Status,
-    last_activity: Option<Instant>,
-    now: Instant,
+    activity: Activity,
+    done: bool,
 ) -> (&'static str, Color) {
-    match (online, status) {
-        (false, _) => ("◌", Color::DarkGray),
-        (true, Status::Stopped) => ("○", Color::DarkGray),
-        (true, Status::Running)
-            if last_activity.is_some_and(|last| now.duration_since(last) < ACTIVITY_WINDOW) =>
-        {
-            ("◉", Color::Yellow)
-        }
-        (true, Status::Running) => ("●", Color::Green),
+    match (online, status, activity) {
+        (false, _, _) => ("◌", Color::DarkGray),
+        (true, Status::Stopped, _) => ("○", Color::DarkGray),
+        (true, Status::Running, Activity::Working) => ("◉", Color::Yellow),
+        (true, Status::Running, Activity::Blocked) => ("◉", Color::Red),
+        (true, Status::Running, _) if done => ("●", Color::Cyan),
+        (true, Status::Running, _) => ("●", Color::Green),
     }
 }
 
 fn sidebar_items(app: &App) -> Vec<ListItem<'static>> {
-    let now = Instant::now();
     app.rows
         .iter()
         .map(|row| match *row {
@@ -79,8 +77,8 @@ fn sidebar_items(app: &App) -> Vec<ListItem<'static>> {
             Row::Session(vi, si, depth) => {
                 let vm = &app.vms[vi];
                 let s = &vm.sessions[si];
-                let last = app.activity.get(&(vi, s.id.clone())).copied();
-                let (glyph, color) = session_marker(vm.online, s.status, last, now);
+                let done = app.done.contains(&(vi, s.id.clone()));
+                let (glyph, color) = session_marker(vm.online, s.status, s.activity, done);
                 ListItem::new(Line::from(vec![
                     Span::raw("  ".repeat(depth + 1)),
                     Span::styled(glyph, Style::default().fg(color)),
@@ -222,9 +220,8 @@ fn draw_pane(f: &mut Frame, app: &mut App, area: Rect) {
     let sel = app.cur().map(|(vi, s)| (vi, s.clone()));
     let pane_title = match &sel {
         Some((vi, s)) => {
-            let last = app.activity.get(&(*vi, s.id.clone())).copied();
-            let (glyph, color) =
-                session_marker(app.vms[*vi].online, s.status, last, Instant::now());
+            let done = app.done.contains(&(*vi, s.id.clone()));
+            let (glyph, color) = session_marker(app.vms[*vi].online, s.status, s.activity, done);
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled(glyph, Style::default().fg(color)),
@@ -477,34 +474,18 @@ fn draw_modal(f: &mut Frame, app: &App, m: &Modal) {
 mod tests {
     use super::super::app::fixture::app;
     use super::*;
-    use std::time::Duration;
 
     #[test]
-    fn session_marker_reflects_lifecycle_and_recent_output() {
-        let now = Instant::now();
-        let recent = Some(now - Duration::from_millis(999));
-        let quiet = Some(now - Duration::from_secs(1));
-
-        assert_eq!(
-            session_marker(false, Status::Running, recent, now),
-            ("◌", Color::DarkGray)
-        );
-        assert_eq!(
-            session_marker(true, Status::Stopped, recent, now),
-            ("○", Color::DarkGray)
-        );
-        assert_eq!(
-            session_marker(true, Status::Running, None, now),
-            ("●", Color::Green)
-        );
-        assert_eq!(
-            session_marker(true, Status::Running, recent, now),
-            ("◉", Color::Yellow)
-        );
-        assert_eq!(
-            session_marker(true, Status::Running, quiet, now),
-            ("●", Color::Green)
-        );
+    fn session_marker_reflects_lifecycle_and_activity() {
+        use Activity::*;
+        let run = |a, done| session_marker(true, Status::Running, a, done);
+        assert_eq!(session_marker(false, Status::Running, Working, false), ("◌", Color::DarkGray));
+        assert_eq!(session_marker(true, Status::Stopped, Working, true), ("○", Color::DarkGray));
+        assert_eq!(run(Unknown, false), ("●", Color::Green));
+        assert_eq!(run(Idle, false), ("●", Color::Green));
+        assert_eq!(run(Idle, true), ("●", Color::Cyan));
+        assert_eq!(run(Working, false), ("◉", Color::Yellow));
+        assert_eq!(run(Blocked, false), ("◉", Color::Red));
     }
 
     /// The one test that actually paints: a narrow terminal must still leave both

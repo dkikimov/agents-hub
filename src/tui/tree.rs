@@ -175,6 +175,7 @@ mod tests {
             status: Status::Stopped,
             created_at: 0,
             parent: None,
+            activity: Default::default(),
         }
     }
 

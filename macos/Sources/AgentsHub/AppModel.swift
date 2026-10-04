@@ -87,7 +87,8 @@ final class AppModel: ObservableObject {
     /// notice a click landing straight in the surface, and an indicator that lies is
     /// worse than none.
     @Published private(set) var terminalFocused = false
-    @Published private(set) var activeDots: Set<SessionKey> = []
+    /// Agents that finished a turn, or answered a prompt, while you looked elsewhere.
+    @Published private(set) var doneDots: Set<SessionKey> = []
     @Published private(set) var configError: String?
 
     /// Completion listings, keyed by the VM that would host the session and the directory
@@ -100,7 +101,7 @@ final class AppModel: ObservableObject {
     private var registry = SessionRegistry()
     private var links: [VMLink] = []
     private let router = TerminalRouter()
-    private var bells = BellWatch()
+    private var agents = AgentWatch()
     private let notifier = Notifier()
     private var collapsed: Set<PathKey> = []
     private var favourites: Set<PathKey> = []
@@ -125,9 +126,6 @@ final class AppModel: ObservableObject {
     /// target the machine the path is actually on — every reader of `currentVM` is
     /// sheet-scoped, which is what makes overriding it safe.
     private var drop: (cwd: String, vm: Int?)?
-
-    /// Matches `mod.rs`'s ACTIVITY_WINDOW.
-    private let activityWindow: TimeInterval = 1
 
     // MARK: - lifecycle
 
@@ -183,8 +181,8 @@ final class AppModel: ObservableObject {
     private nonisolated func handle(_ index: Int, _ event: LinkEvent) {
         // PTY bytes never touch the main actor: the router feeds ghostty's own serial
         // queue directly. Everything else is UI-rate and hops.
-        if case let .frame(.output(id, data, live)) = event {
-            router.deliver(SessionKey(vm: index, id: id), data, live: live)
+        if case let .frame(.output(id, data, _)) = event {
+            router.deliver(SessionKey(vm: index, id: id), data)
             return
         }
         Task { @MainActor in self.onMain(index, event) }
@@ -214,6 +212,7 @@ final class AppModel: ObservableObject {
             vms[index].sessions = list
             apply(registry.sessions(vm: index, list, cols: pane.cols, rows: pane.rows,
                                     shellCols: shellGrid.cols, shellRows: shellGrid.rows))
+            readActivity(index, list)
             rebuild()
             pruneSelection(near: previous)
             adoptNewShell()
@@ -246,18 +245,7 @@ final class AppModel: ObservableObject {
 
     // MARK: - effects
 
-    /// The one way out. Every request aimed at a session is also a poke that will make the
-    /// agent print — a focus report, a SIGWINCH from `attach` or `resize`, an echoed
-    /// keystroke — and `ActivityWatch` needs to know so it doesn't read our own nudge as
-    /// the agent working. A second exit would be a dot that lies again.
     private func send(_ vm: Int, _ req: Req) {
-        switch req {
-        case let .input(id, _), let .resize(id, _, _),
-             let .attach(id, _, _), let .restart(id, _, _):
-            router.poked(SessionKey(vm: vm, id: id))
-        default:
-            break
-        }
         links[safe: vm]?.send(req)
     }
 
@@ -271,7 +259,7 @@ final class AppModel: ObservableObject {
             case let .forget(key):
                 router.set(key, nil)
                 terminals[key] = nil
-                bells.forget(key)
+                agents.forget(key)
                 mounted.removeAll { $0 == key }
                 mountedShells.removeAll { $0 == key }
                 shellOpen.remove(key)
@@ -292,12 +280,8 @@ final class AppModel: ObservableObject {
         let hadFocus = terminals[key]?.ownsKeyboard ?? false
         let terminal = TerminalSession(
             key: key,
-            send: { [weak self, router] req in
+            send: { [weak self] req in
                 // Off the main actor: this is ghostty's write callback, at keystroke rate.
-                // The poke is taken here rather than after the hop, because a main actor
-                // busy with a window drag is exactly when this fires and the dot has to
-                // know about the nudge before the reply to it lands.
-                router.poked(key)
                 Task { @MainActor in self?.send(vm, req) }
             },
             onGrid: { [weak self] cols, rows in
@@ -384,8 +368,8 @@ final class AppModel: ObservableObject {
     }
 
     /// The selected session draws, plus its shell when the panel is open, and only while
-    /// the window is on screen. Hidden surfaces keep parsing — that is what still rings
-    /// their bells.
+    /// the window is on screen. Hidden surfaces keep parsing, so their scrollback is
+    /// current the moment you switch to them.
     private func applySurfaceVisibility() {
         let drawing: Set<SessionKey> = windowVisible
             ? Set([selectedKey, visibleShellKey].compactMap { $0 })
@@ -765,35 +749,44 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// ponytail: focus rides the dot timer rather than a Combine subscription per
-    /// terminal, so it can lag a quarter second. Subscribe to `state.$isFocused` if that
-    /// ever shows.
+    /// ponytail: focus and "seen" ride the dot timer rather than a Combine subscription
+    /// per terminal, so either can lag a quarter second. Subscribe to `state.$isFocused`
+    /// if that ever shows.
     private func refreshDots() {
         refreshWindowVisibility()
-        let next = router.active(within: activityWindow)
-        if next != activeDots { activeDots = next }
         let focused = [selectedKey, visibleShellKey].compactMap { $0 }
             .contains { terminals[$0]?.state.isFocused == true }
         if focused != terminalFocused { terminalFocused = focused }
-        notifyBells()
+        if let key = watchingKey {
+            agents.seen(key)
+            publishDone()
+        }
     }
 
-    /// An agent rings the bell when it wants you, and ghostty's parser is what tells a real
-    /// BEL from the `ESC]0;…BEL` window title Claude Code sets on every turn.
-    ///
-    /// Every terminal is counted whether or not it will notify, so a bell you watched
-    /// arrive is spent rather than waiting to fire the moment you look away.
-    private func notifyBells() {
-        let watching = NSApp.isActive ? selectedKey : nil
-        for (key, terminal) in terminals {
-            guard bells.rang(key, count: terminal.liveBells), key != watching else { continue }
-            // A shell's bell is a failed tab completion, not an agent wanting you.
-            guard let session = info(for: key), !session.isShell,
-                  let vm = vms[safe: key.vm] else { continue }
+    /// The session actually in front of you: selected, in a window on screen, in the
+    /// app you are using. Its news is never news.
+    private var watchingKey: SessionKey? {
+        NSApp.isActive && windowVisible ? selectedKey : nil
+    }
+
+    /// The daemon reads each agent's screen and says what it is doing; a prompt waiting
+    /// on you, or a turn that ended while you were elsewhere, is worth a banner.
+    private func readActivity(_ vm: Int, _ list: [SessionInfo]) {
+        let watching = watchingKey
+        for session in list where !session.isShell {
+            let key = SessionKey(vm: vm, id: session.id)
+            guard let news = agents.update(key, session.activity, watching: key == watching),
+                  let host = vms[safe: vm] else { continue }
+            let what = news == .needsYou ? "needs you" : "finished"
             notifier.post(key,
-                          title: "\(session.agent) · \(session.name)",
-                          body: "\(vm.name) · \(session.cwd)")
+                          title: "\(session.agent) · \(session.name) \(what)",
+                          body: "\(host.name) · \(session.cwd)")
         }
+        publishDone()
+    }
+
+    private func publishDone() {
+        if agents.done != doneDots { doneDots = agents.done }
     }
 
     func info(for key: SessionKey) -> SessionInfo? {

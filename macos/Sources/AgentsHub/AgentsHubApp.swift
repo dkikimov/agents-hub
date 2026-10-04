@@ -332,7 +332,8 @@ struct RootView: View {
             if let key = model.selectedKey, let info = model.selectedInfo {
                 StatusDot(online: model.isOnline(key.vm),
                           status: info.status,
-                          active: model.activeDots.contains(key))
+                          activity: info.activity,
+                          done: model.doneDots.contains(key))
                 Text(info.agent)
                     .font(Ghostty.ui(weight: .bold))
                     .foregroundStyle(theme.palette.agent)
