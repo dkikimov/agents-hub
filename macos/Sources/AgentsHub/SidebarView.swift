@@ -81,28 +81,12 @@ struct SidebarView: View {
             // its own — without this the cursor walks off the visible rows.
             ScrollViewReader { proxy in
                 List(selection: $model.selection) {
-                    ForEach(model.vms.indices, id: \.self) { vi in
-                        Section {
-                            ForEach(model.rowsByVM[safe: vi] ?? []) { row in
-                                rowView(row).tag(row.id).id(row.id)
-                                    .frame(height: 22)
-                                    .listRowInsets(EdgeInsets(top: 0, leading: 6,
-                                                              bottom: 0, trailing: 6))
-                                    .listRowSeparator(.hidden)
-                            }
-                        } header: {
-                            HStack(spacing: 6) {
-                                Text(model.vms[vi].name)
-                                    .font(Ghostty.ui(Ghostty.fontSize - 1, weight: .bold))
-                                    .foregroundStyle(theme.palette.vm)
-                                if !model.vms[vi].online {
-                                    Text("offline")
-                                        .font(Ghostty.ui(Ghostty.fontSize - 3))
-                                        .foregroundStyle(theme.palette.attention)
-                                }
-                            }
+                    ForEach(model.rowsByVM.flatMap { $0 }) { row in
+                        rowView(row).tag(row.id).id(row.id)
+                            .frame(height: 22)
+                            .listRowInsets(EdgeInsets(top: 0, leading: 6,
+                                                      bottom: 0, trailing: 6))
                             .listRowSeparator(.hidden)
-                        }
                     }
                 }
                 // .sidebar pins its rows to the system's source-list height, which no
@@ -139,6 +123,18 @@ struct SidebarView: View {
     @ViewBuilder
     private func rowView(_ row: SidebarRow) -> some View {
         switch row {
+        case let .vm(vi):
+            HStack(spacing: 6) {
+                Text(model.vms[vi].name)
+                    .font(Ghostty.ui(Ghostty.fontSize - 1, weight: .bold))
+                    .foregroundStyle(theme.palette.vm)
+                if !model.vms[vi].online {
+                    Text("offline")
+                        .font(Ghostty.ui(Ghostty.fontSize - 3))
+                        .foregroundStyle(theme.palette.attention)
+                }
+            }
+
         case let .folder(vm, path, seg, depth, hasSub):
             HStack(spacing: 4) {
                 indent(depth)

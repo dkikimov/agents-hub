@@ -13,12 +13,14 @@ struct VMState {
 /// A sidebar row. The id must be stable and content-derived: the list is rebuilt on every
 /// `Sessions` frame, and array indices would make the selection jump under the user.
 enum SidebarRow: Identifiable, Hashable {
+    case vm(Int)
     case folder(vm: Int, path: String, seg: String, depth: Int, hasSub: Bool)
     case elide(vm: Int, path: String, depth: Int)
     case session(vm: Int, id: String, depth: Int)
 
     var id: String {
         switch self {
+        case let .vm(vm): return "v/\(vm)"
         case let .folder(vm, path, _, _, _): return "f/\(vm)/\(path)"
         case let .elide(vm, path, _): return "e/\(vm)/\(path)"
         case let .session(vm, id, _): return "s/\(vm)/\(id)"
@@ -27,6 +29,7 @@ enum SidebarRow: Identifiable, Hashable {
 
     var depth: Int {
         switch self {
+        case .vm: return 0
         case let .folder(_, _, _, d, _), let .elide(_, _, d), let .session(_, _, d): return d
         }
     }
@@ -336,6 +339,12 @@ final class AppModel: ObservableObject {
         return true
     }
 
+    var selectionIsVM: Bool {
+        guard let selection, case .vm = allRows.first(where: { $0.id == selection })
+        else { return false }
+        return true
+    }
+
     /// Deliberately does *not* take keyboard focus. Moving the selection with j/k has to
     /// leave focus in the sidebar, or the second keystroke lands in the agent — the
     /// terminal is entered explicitly, with ⏎ or a click.
@@ -638,7 +647,8 @@ final class AppModel: ObservableObject {
         if let vm = drop?.vm { return vm }
         if let selection, let row = allRows.first(where: { $0.id == selection }) {
             switch row {
-            case let .folder(vm, _, _, _, _), let .elide(vm, _, _), let .session(vm, _, _):
+            case let .vm(vm), let .folder(vm, _, _, _, _), let .elide(vm, _, _),
+                 let .session(vm, _, _):
                 return vm
             }
         }
@@ -655,7 +665,7 @@ final class AppModel: ObservableObject {
             case let .folder(_, path, _, _, _): return path
             case let .session(vm, id, _):
                 if let s = vms[safe: vm]?.sessions.first(where: { $0.id == id }) { return s.cwd }
-            case .elide: break
+            case .vm, .elide: break
             }
         }
         return "~"
@@ -735,8 +745,8 @@ final class AppModel: ObservableObject {
             let folds = Set(collapsed.filter { $0.vm == vi }.map(\.path))
             // A filter is a search for sessions, so an empty favourite is noise in it.
             let favs = filter.isEmpty ? Set(favourites.filter { $0.vm == vi }.map(\.path)) : []
-            return tree(sessions: sessions, idx: Array(idx),
-                        collapsed: folds, favourites: favs).map { row in
+            let rows: [SidebarRow] = tree(sessions: sessions, idx: Array(idx),
+                                          collapsed: folds, favourites: favs).map { row in
                 switch row.node {
                 case let .folder(path, seg, hasSub):
                     return .folder(vm: vi, path: path, seg: seg, depth: row.depth, hasSub: hasSub)
@@ -746,6 +756,8 @@ final class AppModel: ObservableObject {
                     return .session(vm: vi, id: sessions[i].id, depth: row.depth)
                 }
             }
+            // The VM's own row is what makes an empty VM selectable, and so a target for ⌘N.
+            return [.vm(vi)] + rows
         }
     }
 
