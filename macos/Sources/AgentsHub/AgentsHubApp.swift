@@ -350,6 +350,7 @@ struct RootView: View {
 
     private var hints: String {
         if model.terminalFocused { return "⌘L back to list · ⌘B shell · ⌘T new · ⌘W close · ⌘1-9 switch" }
+        if model.selectionIsVM { return "j/k move · n new" }
         if model.selectionIsFolder { return "j/k move · space fold · f favourite · n new" }
         return "j/k move · ⏎ attach · ⌘B shell · n new · d kill · / filter"
     }
