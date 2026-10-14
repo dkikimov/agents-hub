@@ -40,7 +40,7 @@ help:
 	@echo '  make fmt         cargo fmt'
 	@echo
 	@echo '  make install     put agents-hub on PATH (cargo install --locked)'
-	@echo '  make install-app copy AgentsHub.app to ~/Applications'
+	@echo '  make install-app copy AgentsHub.app to /Applications'
 	@echo '  make service     install the launchd/systemd unit and start it'
 	@echo '  make vm HOST=x   build and install on a remote over SSH, add it to config'
 	@echo
@@ -113,10 +113,10 @@ run: app
 .PHONY: install-app
 install-app: app
 	@osascript -e 'quit app "AgentsHub"' 2>/dev/null || true
-	@mkdir -p ~/Applications
-	@rm -rf ~/Applications/AgentsHub.app
-	@cp -R $(APP) ~/Applications/
-	@echo "installed ~/Applications/AgentsHub.app"
+# A second copy anywhere is how a stale app keeps launching and starts its own old daemon.
+	@rm -rf ~/Applications/AgentsHub.app /Applications/AgentsHub.app
+	@cp -R $(APP) /Applications/
+	@echo "installed /Applications/AgentsHub.app"
 
 # ── checks ───────────────────────────────────────────────────────────────────
 
