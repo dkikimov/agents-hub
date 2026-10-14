@@ -48,11 +48,21 @@ struct PathKey: Hashable, Codable {
 enum Sheet: Identifiable {
     case newSession
     case confirmKill(SessionKey, label: String)
+    case newSpace
+    case renameSpace(UUID)
+    case deleteSpace(UUID)
+    case moveToSpace([SessionKey], label: String)
+    case goTo
 
     var id: String {
         switch self {
         case .newSession: return "new"
         case let .confirmKill(k, _): return "kill/\(k.vm)/\(k.id)"
+        case .newSpace: return "space/new"
+        case let .renameSpace(id): return "space/rename/\(id)"
+        case let .deleteSpace(id): return "space/delete/\(id)"
+        case let .moveToSpace(keys, _): return "space/move/" + keys.map { "\($0.vm)/\($0.id)" }.joined(separator: ",")
+        case .goTo: return "goto"
         }
     }
 }
@@ -93,6 +103,12 @@ final class AppModel: ObservableObject {
     /// Agents that finished a turn, or answered a prompt, while you looked elsewhere.
     @Published private(set) var doneDots: Set<SessionKey> = []
     @Published private(set) var configError: String?
+    @Published private(set) var book = SpaceBook() {
+        didSet { if book != oldValue { Self.save(book, Self.spacesKey) } }
+    }
+    @Published private(set) var showing = SpaceView.all {
+        didSet { if showing != oldValue { Self.save(showing, Self.viewKey) } }
+    }
 
     /// Completion listings, keyed by the VM that would host the session and the directory
     /// asked about. One request per directory serves every later keystroke.
@@ -108,6 +124,12 @@ final class AppModel: ObservableObject {
     private let notifier = Notifier()
     private var collapsed: Set<PathKey> = []
     private var favourites: Set<PathKey> = []
+    /// Where each view's selection was when you left it, so switching back lands there.
+    private var lastSelection: [SpaceView: SidebarRow.ID] = [:]
+    private var pendingCreates = PendingCreates()
+    /// The VM picked in the New Session sheet, which a space spanning machines needs and an
+    /// empty space has no row to imply.
+    @Published private var pickedVM: Int?
     private var pane = AppModel.loadGrid(AppModel.paneGridKey) ?? (80, 24)
     /// The panel's own grid, reported by whichever shell surface laid out last. Only the
     /// size a brand-new shell starts at; a mounted one resizes itself.
@@ -149,8 +171,10 @@ final class AppModel: ObservableObject {
         }
         agentNames = config.agentNames
         vms = config.vm.map { VMState(config: $0) }
-        collapsed = Self.load(Self.foldsKey)
-        favourites = Self.load(Self.favouritesKey)
+        collapsed = Self.load(Self.foldsKey) ?? []
+        favourites = Self.load(Self.favouritesKey) ?? []
+        book = Self.load(Self.spacesKey) ?? SpaceBook()
+        showing = Self.load(Self.viewKey).flatMap { book.has($0) ? $0 : nil } ?? .all
         rebuild()
         notifier.start { [weak self] reason in self?.status = reason }
 
@@ -212,7 +236,10 @@ final class AppModel: ObservableObject {
         switch frame {
         case let .sessions(list):
             let previous = allRows
+            let known = Set(vms[index].sessions.map(\.id))
             vms[index].sessions = list
+            claimCreated(index, list.filter { !known.contains($0.id) })
+            book.prune(vm: vms[index].name, alive: Set(list.map(\.id)))
             apply(registry.sessions(vm: index, list, cols: pane.cols, rows: pane.rows,
                                     shellCols: shellGrid.cols, shellRows: shellGrid.rows))
             readActivity(index, list)
@@ -605,6 +632,9 @@ final class AppModel: ObservableObject {
         let vm = currentVM
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let display = name.isEmpty ? defaultName(cwd: cwd, agent: agent) : name
+        if case let .space(space) = showing {
+            pendingCreates.expect(vm: vm, agent: agent, name: display, space: space)
+        }
         send(vm, .create(agent: agent, name: display, cwd: cwd,
                          cols: pane.cols, rows: pane.rows))
         status = "starting \(agent) · \(display)…"
@@ -623,7 +653,16 @@ final class AppModel: ObservableObject {
         Task { @MainActor in sheet = .newSession }
     }
 
-    func clearDrop() { drop = nil }
+    func clearDrop() {
+        drop = nil
+        pickedVM = nil
+    }
+
+    /// The sheet's VM picker. A dropped folder still wins: it only exists on this machine.
+    func pickVM(_ vm: Int) {
+        pickedVM = vm
+        forgetDirCache()
+    }
 
     func kill(_ key: SessionKey) {
         send(key.vm, .kill(id: key.id))
@@ -642,9 +681,10 @@ final class AppModel: ObservableObject {
     }
 
     /// The VM a new session would land on: the one a dropped folder lives on, else the one
-    /// holding the selection, else the first.
+    /// picked in the sheet, else the one holding the selection, else the first.
     var currentVM: Int {
         if let vm = drop?.vm { return vm }
+        if let vm = pickedVM { return vm }
         if let selection, let row = allRows.first(where: { $0.id == selection }) {
             switch row {
             case let .vm(vm), let .folder(vm, _, _, _, _), let .elide(vm, _, _),
@@ -696,6 +736,193 @@ final class AppModel: ObservableObject {
 
     private static func dirKey(_ vm: Int, _ path: String) -> String { "\(vm)\u{0}\(path)" }
 
+    // MARK: - spaces
+
+    private func member(_ key: SessionKey) -> MemberKey? {
+        vms[safe: key.vm].map { MemberKey(vm: $0.name, id: key.id) }
+    }
+
+    private func shows(_ key: SessionKey, in view: SpaceView? = nil) -> Bool {
+        member(key).map { book.contains(view ?? showing, $0) } ?? false
+    }
+
+    /// Every agent session the view holds; shells ride with their parent.
+    func sessions(in view: SpaceView) -> [SessionKey] {
+        vms.indices.flatMap { vi in
+            vms[vi].sessions.filter { !$0.isShell }.map { SessionKey(vm: vi, id: $0.id) }
+        }
+        .filter { shows($0, in: view) }
+    }
+
+    func mood(of key: SessionKey) -> Mood {
+        guard let info = info(for: key) else { return .empty }
+        return Mood(online: isOnline(key.vm), status: info.status, activity: info.activity,
+                    done: doneDots.contains(key))
+    }
+
+    func mood(of view: SpaceView) -> Mood {
+        Mood.rollup(sessions(in: view).map(mood(of:)))
+    }
+
+    var barViews: [SpaceView] {
+        book.bar(showing: showing, unsorted: sessions(in: .unsorted).count)
+    }
+
+    func title(of view: SpaceView) -> String {
+        switch view {
+        case let .space(id): return book.space(id)?.name ?? "?"
+        case .unsorted: return "Unsorted"
+        case .all: return "All"
+        }
+    }
+
+    var activeSpace: Space? {
+        if case let .space(id) = showing { return book.space(id) }
+        return nil
+    }
+
+    func spaceID(of key: SessionKey) -> UUID? {
+        member(key).flatMap(book.space(of:))
+    }
+
+    func spaceName(of key: SessionKey) -> String? {
+        spaceID(of: key).flatMap(book.space)?.name
+    }
+
+    func selectSpace(_ next: SpaceView) {
+        guard book.has(next), next != showing else { return }
+        lastSelection[showing] = selection
+        showing = next
+        rebuild()
+        let remembered = lastSelection[next].flatMap { id in
+            allRows.contains { $0.id == id } ? id : nil
+        }
+        selection = remembered ?? allRows.first { $0.key != nil }?.id ?? allRows.first?.id
+        selectionChanged()
+    }
+
+    func stepSpace(by delta: Int) {
+        selectSpace(showing.stepped(by: delta, in: barViews))
+    }
+
+    func createSpace(named name: String) {
+        guard let name = Self.cleanName(name) else { return }
+        selectSpace(.space(book.create(name: name)))
+    }
+
+    func renameSpace(_ id: UUID, to name: String) {
+        guard let name = Self.cleanName(name) else { return }
+        book.rename(id, to: name)
+    }
+
+    /// An empty space goes at once; one holding sessions asks first. Either way its
+    /// sessions only move to Unsorted.
+    func deleteSpace(_ id: UUID, confirmed: Bool = false) {
+        guard book.space(id) != nil else { return }
+        if !confirmed, !sessions(in: .space(id)).isEmpty {
+            sheet = .deleteSpace(id)
+            return
+        }
+        book.delete(id)
+        if showing == .space(id) {
+            selectSpace(book.landing(unsorted: sessions(in: .unsorted).count))
+        } else {
+            let previous = allRows
+            rebuild()
+            pruneSelection(near: previous)
+        }
+    }
+
+    /// What `m` moves: the selected session, or everything this view shows under the
+    /// selected folder.
+    private var movableSelection: [SessionKey] {
+        guard let selection, let row = allRows.first(where: { $0.id == selection }) else { return [] }
+        switch row {
+        case let .session(vm, id, _): return [SessionKey(vm: vm, id: id)]
+        case let .folder(vm, path, _, _, _): return sessionKeys(under: path, vm: vm)
+        case .vm, .elide: return []
+        }
+    }
+
+    private func sessionKeys(under folder: String, vm: Int) -> [SessionKey] {
+        (vms[safe: vm]?.sessions ?? [])
+            .filter { !$0.isShell && matches($0) && cwd($0.cwd, isUnder: folder) }
+            .map { SessionKey(vm: vm, id: $0.id) }
+            .filter { shows($0) }
+    }
+
+    func moveSelection() {
+        let keys = movableSelection
+        guard let first = keys.first else { return }
+        let label = keys.count > 1
+            ? "\(keys.count) sessions"
+            : info(for: first).map { "\($0.agent) · \($0.name)" } ?? first.id
+        sheet = .moveToSpace(keys, label: label)
+    }
+
+    /// `nil` is Unsorted. Sessions that no longer belong in this view leave it, and the
+    /// selection goes to a neighbour as it does after a kill.
+    func move(_ keys: [SessionKey], to space: UUID?) {
+        let previous = allRows
+        book.move(keys.compactMap(member), to: space)
+        let target = title(of: space.map(SpaceView.space) ?? .unsorted)
+        status = "\(keys.count) session\(keys.count == 1 ? "" : "s") moved to \(target)"
+        rebuild()
+        pruneSelection(near: previous)
+    }
+
+    func move(_ keys: [SessionKey], toNewSpace name: String) {
+        guard let name = Self.cleanName(name) else { return }
+        move(keys, to: book.create(name: name))
+    }
+
+    /// A drop on a chip, carrying sidebar row ids, of which only sessions count.
+    func move(rowIDs: [String], to target: SpaceView) {
+        let keys = rowIDs.compactMap { id in allRows.first { $0.id == id }?.key }
+        switch target {
+        case let .space(id): move(keys, to: id)
+        case .unsorted: move(keys, to: nil)
+        case .all: break
+        }
+    }
+
+    /// `s` on a folder: a space named after it, holding what this view shows under it. A
+    /// space of that name already there takes them rather than gaining a twin.
+    func newSpaceFromSelectedFolder() {
+        guard let selection,
+              case let .folder(vm, path, seg, _, _) = allRows.first(where: { $0.id == selection })
+        else { return }
+        let keys = sessionKeys(under: path, vm: vm)
+        let id = book.space(named: seg)
+        book.move(keys.compactMap(member), to: id)
+        status = "\(keys.count) session\(keys.count == 1 ? "" : "s") in \(seg)"
+        if showing == .space(id) { rebuild() } else { selectSpace(.space(id)) }
+    }
+
+    /// ⌘P on a session: its space comes to the front, and a filter that would hide it
+    /// goes, so the row it lands on is actually in the list.
+    func reveal(_ key: SessionKey) {
+        if !shows(key) {
+            let home = spaceID(of: key).map(SpaceView.space)
+            selectSpace(home ?? (book.spaces.isEmpty ? .all : .unsorted))
+        }
+        let id = SidebarRow.session(vm: key.vm, id: key.id, depth: 0).id
+        if !allRows.contains(where: { $0.id == id }) { filter = "" }
+        selection = id
+        selectionChanged()
+    }
+
+    private func claimCreated(_ vm: Int, _ fresh: [SessionInfo]) {
+        for (id, space) in pendingCreates.claim(vm: vm, fresh) {
+            if let key = member(SessionKey(vm: vm, id: id)) { book.move([key], to: space) }
+        }
+    }
+
+    private static func cleanName(_ raw: String) -> String? {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
     // MARK: - folds and filter
 
     func isCollapsed(vm: Int, path: String) -> Bool {
@@ -741,10 +968,16 @@ final class AppModel: ObservableObject {
         rowsByVM = vms.indices.map { vi in
             let sessions = vms[vi].sessions
             // Companion shells ride along in the list but are reached with ⌘B, not a row.
-            let idx = sessions.indices.filter { !sessions[$0].isShell && matches(sessions[$0]) }
+            let idx = sessions.indices.filter {
+                !sessions[$0].isShell && matches(sessions[$0])
+                    && shows(SessionKey(vm: vi, id: sessions[$0].id))
+            }
             let folds = Set(collapsed.filter { $0.vm == vi }.map(\.path))
-            // A filter is a search for sessions, so an empty favourite is noise in it.
-            let favs = filter.isEmpty ? Set(favourites.filter { $0.vm == vi }.map(\.path)) : []
+            // A filter is a search for sessions, so an empty favourite is noise in it. So
+            // is it inside a space: favourites are per machine, and every space would grow
+            // every one of them.
+            let favs = filter.isEmpty && showing == .all
+                ? Set(favourites.filter { $0.vm == vi }.map(\.path)) : []
             let rows: [SidebarRow] = tree(sessions: sessions, idx: Array(idx),
                                           collapsed: folds, favourites: favs).map { row in
                 switch row.node {
@@ -757,6 +990,8 @@ final class AppModel: ObservableObject {
                 }
             }
             // The VM's own row is what makes an empty VM selectable, and so a target for ⌘N.
+            // A space lists only the machines it has sessions on; the sheet picks the rest.
+            if showing != .all, rows.isEmpty { return [] }
             return [.vm(vi)] + rows
         }
     }
@@ -790,8 +1025,9 @@ final class AppModel: ObservableObject {
             guard let news = agents.update(key, session.activity, watching: key == watching),
                   let host = vms[safe: vm] else { continue }
             let what = news == .needsYou ? "needs you" : "finished"
+            let space = spaceName(of: key).map { "\($0) · " } ?? ""
             notifier.post(key,
-                          title: "\(session.agent) · \(session.name) \(what)",
+                          title: "\(space)\(session.agent) · \(session.name) \(what)",
                           body: "\(host.name) · \(session.cwd)")
         }
         publishDone()
@@ -814,15 +1050,16 @@ final class AppModel: ObservableObject {
     private static let foldsKey = "collapsedFolders"
     private static let favouritesKey = "favouriteFolders"
 
-    private static func load(_ key: String) -> Set<PathKey> {
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let paths = try? JSONDecoder().decode(Set<PathKey>.self, from: data)
-        else { return [] }
-        return paths
+    private static let spacesKey = "spaces"
+    private static let viewKey = "activeSpace"
+
+    private static func load<T: Decodable>(_ key: String) -> T? {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(T.self, from: data)
     }
 
-    private static func save(_ paths: Set<PathKey>, _ key: String) {
-        guard let data = try? JSONEncoder().encode(paths) else { return }
+    private static func save<T: Encodable>(_ value: T, _ key: String) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
         UserDefaults.standard.set(data, forKey: key)
     }
 

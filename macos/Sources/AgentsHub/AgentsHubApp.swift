@@ -79,6 +79,37 @@ struct AgentsHubApp: App {
                 Button("Close") { closeShellOrWindow() }
                     .keyboardShortcut("w", modifiers: .command)
             }
+            // Print… would hold ⌘P, and there is nothing here to print.
+            CommandGroup(replacing: .printItem) {}
+            // ⌃⌘, and ⌘P: ghostty binds most plain ⌘ and ⌥⌘ keys by default
+            // (`ghostty +list-keybinds --default`), and a focused surface takes those first.
+            CommandMenu("Space") {
+                Button("New Space…") { model.sheet = .newSpace }
+                    .keyboardShortcut("n", modifiers: [.control, .command])
+                Button("Rename Space…") {
+                    if let space = model.activeSpace { model.sheet = .renameSpace(space.id) }
+                }
+                .disabled(model.activeSpace == nil)
+                Button("Delete Space…") {
+                    if let space = model.activeSpace { model.deleteSpace(space.id) }
+                }
+                .disabled(model.activeSpace == nil)
+                Divider()
+                Button("Move to Space…") { model.moveSelection() }
+                    .keyboardShortcut("m", modifiers: [.control, .command])
+                Button("Go to…") { model.sheet = .goTo }
+                    .keyboardShortcut("p", modifiers: .command)
+                Divider()
+                Button("Previous Space") { model.stepSpace(by: -1) }
+                    .keyboardShortcut("[", modifiers: [.control, .command])
+                Button("Next Space") { model.stepSpace(by: 1) }
+                    .keyboardShortcut("]", modifiers: [.control, .command])
+                Divider()
+                ForEach(Array(model.barViews.enumerated()), id: \.element) { i, view in
+                    Button(model.title(of: view)) { model.selectSpace(view) }
+                        .keyboardShortcut(spaceShortcut(view, index: i))
+                }
+            }
             CommandMenu("View") {
                 // ⌘L is the way back out of a focused terminal: once ghostty has the
                 // keyboard it takes everything except the command layer.
@@ -124,6 +155,13 @@ struct AgentsHubApp: App {
     }
 
     private static let settingsWindow = "com_apple_SwiftUI_Settings_window"
+
+    /// ⌃⌘1…⌃⌘9 in bar order, and ⌃⌘0 for All wherever it sits.
+    private func spaceShortcut(_ view: SpaceView, index: Int) -> KeyboardShortcut? {
+        let digit = view == .all ? 0 : index + 1
+        guard digit <= 9 else { return nil }
+        return KeyboardShortcut(KeyEquivalent(Character("\(digit)")), modifiers: [.control, .command])
+    }
 }
 
 struct SettingsView: View {
@@ -228,6 +266,23 @@ struct RootView: View {
                 NewSessionSheet(model: model)
             case let .confirmKill(key, label):
                 KillConfirm(model: model, key: key, label: label)
+            case .newSpace:
+                SpaceNameSheet(title: "New space", action: "Create", initial: "") {
+                    model.createSpace(named: $0)
+                }
+            case let .renameSpace(id):
+                SpaceNameSheet(title: "Rename space", action: "Rename",
+                               initial: model.title(of: .space(id))) {
+                    model.renameSpace(id, to: $0)
+                }
+            case let .deleteSpace(id):
+                SpaceDeleteConfirm(model: model, id: id)
+            case let .moveToSpace(keys, label):
+                PickerSheet(title: "Move \(label) to", items: model.moveTargets(keys)) {
+                    model.move(keys, toNewSpace: $0)
+                }
+            case .goTo:
+                PickerSheet(title: "Go to", items: model.goToItems)
             }
         }
     }
@@ -330,6 +385,10 @@ struct RootView: View {
     private var header: some View {
         HStack(spacing: 6) {
             if let key = model.selectedKey, let info = model.selectedInfo {
+                if let space = model.spaceName(of: key) {
+                    Text(space).font(Ghostty.ui(weight: .bold)).foregroundStyle(.secondary)
+                    Text("·").foregroundStyle(.tertiary)
+                }
                 StatusDot(online: model.isOnline(key.vm),
                           status: info.status,
                           activity: info.activity,
@@ -350,9 +409,9 @@ struct RootView: View {
 
     private var hints: String {
         if model.terminalFocused { return "⌘L back to list · ⌘B shell · ⌘T new · ⌘W close · ⌘1-9 switch" }
-        if model.selectionIsVM { return "j/k move · n new" }
-        if model.selectionIsFolder { return "j/k move · space fold · f favourite · n new" }
-        return "j/k move · ⏎ attach · ⌘B shell · n new · d kill · / filter"
+        if model.selectionIsVM { return "j/k move · n new · [ ] space · ⌘P go to" }
+        if model.selectionIsFolder { return "j/k move · space fold · s new space · m move · f favourite · n new" }
+        return "j/k move · ⏎ attach · ⌘B shell · n new · m move · [ ] space · ⌘P go to"
     }
 
     private var statusBar: some View {

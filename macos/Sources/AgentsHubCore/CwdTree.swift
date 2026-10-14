@@ -49,7 +49,19 @@ public func segments(_ cwd: String, home: String? = ProcessInfo.processInfo.envi
     return [root] + rest.split(separator: "/").map(String.init)
 }
 
-/// Last component of a tree path: `~/a/b` → `b`; the roots `~` and `/` map to themselves.
+/// Whether a session in `cwd` sits at or below the tree folder `folder`, as `tree` would
+/// place it.
+public func cwd(_ cwd: String, isUnder folder: String,
+                home: String? = ProcessInfo.processInfo.environment["HOME"]) -> Bool {
+    var path = ""
+    for seg in segments(cwd, home: home) {
+        path = joinPath(path, seg)
+        if path == folder { return true }
+    }
+    return false
+}
+
+/// Last component of a tree path:`~/a/b` → `b`; the roots `~` and `/` map to themselves.
 func segOf(_ path: String) -> String {
     let last = path.split(separator: "/", omittingEmptySubsequences: false).last.map(String.init) ?? ""
     return last.isEmpty ? path : last
