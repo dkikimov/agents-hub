@@ -46,6 +46,10 @@ pub const AGENT_UPSTREAM: &str = "agent.upstream";
 /// The socket the daemon proxies, and the only agent path a session ever sees.
 pub const AGENT_PROXY: &str = "agent.sock";
 
+/// `-i` on macOS only: a non-interactive zsh skips `.zshrc`, where a Mac's PATH is
+/// usually set. See `setup::launchd_plist`.
+const LOGIN_SHELL_FLAGS: &str = if cfg!(target_os = "macos") { "-lic" } else { "-lc" };
+
 pub fn agent_upstream_path() -> PathBuf {
     state_dir().join(AGENT_UPSTREAM)
 }
@@ -80,6 +84,11 @@ fn relink_agent_sock(sock: &Path, link: &Path) -> Result<()> {
 
 /// Launches the daemon detached. `ssh host cmd` allocates no TTY, so the daemon
 /// gets no SIGHUP on disconnect — nulling its stdio is all the detaching needed.
+///
+/// Through a login shell, like the launchd/systemd unit and for the same reason: the
+/// caller may be the app launched from Finder or a non-login `ssh host cmd`, both with
+/// the bare system PATH, and every session inherits the daemon's — "Unable to spawn
+/// claude" until the daemon restarts.
 fn spawn_daemon() -> Result<()> {
     let exe = std::env::current_exe()?;
     std::fs::create_dir_all(state_dir())?;
@@ -87,9 +96,19 @@ fn spawn_daemon() -> Result<()> {
         .create(true)
         .append(true)
         .open(state_dir().join("daemon.log"))?;
-    std::process::Command::new(exe)
-        .arg("serve")
-        .stdin(Stdio::null())
+    let mut cmd = match std::env::var_os("SHELL") {
+        Some(shell) => {
+            let mut c = std::process::Command::new(shell);
+            c.arg(LOGIN_SHELL_FLAGS).arg("exec \"$0\" serve").arg(exe);
+            c
+        }
+        None => {
+            let mut c = std::process::Command::new(exe);
+            c.arg("serve");
+            c
+        }
+    };
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()
