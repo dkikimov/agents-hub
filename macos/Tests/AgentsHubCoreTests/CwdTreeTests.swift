@@ -38,6 +38,14 @@ import Testing
         #expect(segments("/Users/dx/a", home: home) == ["/", "Users", "dx", "a"])
     }
 
+    @Test func underAFolderMatchesWholeSegments() {
+        #expect(cwd("/Users/d/src/app", isUnder: "~/src", home: home))
+        #expect(cwd("~/src", isUnder: "~/src", home: home))
+        #expect(!cwd("/Users/d/srcx", isUnder: "~/src", home: home))
+        #expect(cwd("/etc/nginx", isUnder: "/", home: home))
+        #expect(!cwd("/etc/nginx", isUnder: "~", home: home))
+    }
+
     @Test func treeGroupsSessionsByCwd() {
         let s = [sess("~/Documents/agents-hub"), sess("~/Documents/notes")]
         #expect(shape(tree(sessions: s, idx: [0, 1], collapsed: [], home: home)) == [

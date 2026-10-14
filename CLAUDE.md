@@ -135,6 +135,12 @@ idempotent (create, relaunch if stopped, else nothing) unless `new` asks for ano
 client filters them out of the sidebar and keeps them out of `SessionRegistry.resized`,
 because a shell is sized by its own panel.
 
+**Spaces are macOS-client state, nothing more.** A space is a named set of sessions,
+keyed by VM *name* plus session id (`AgentsHubCore/Spaces.swift`), kept in UserDefaults; the
+daemon and the protocol never hear of them, so one space can span VMs. The sidebar shows the
+active space, the space bar above it rolls each space up to its most urgent dot, and a
+`Sessions` frame prunes the members its VM no longer lists. The TUI still shows everything.
+
 **Persistence semantics** (deliberate, confirmed with the user): PTYs die with the daemon since
 it holds the master fd. `state.json` + per-session logs survive, so after any restart sessions
 come back listed as `Stopped` with readable history, and `r` relaunches (using `resume` argv if

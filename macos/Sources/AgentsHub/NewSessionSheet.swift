@@ -18,9 +18,11 @@ struct NewSessionSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("New session on \(model.vms[safe: model.currentVM]?.name ?? "?")")
-                .font(Ghostty.ui(Ghostty.fontSize + 1, weight: .bold))
+            Text(title).font(Ghostty.ui(Ghostty.fontSize + 1, weight: .bold))
 
+            if model.vms.count > 1 {
+                LabeledContent("VM") { vmPicker }
+            }
             LabeledContent("Agent") { agentPicker }
 
             LabeledContent("Name") {
@@ -76,37 +78,65 @@ struct NewSessionSheet: View {
         .onDisappear { model.clearDrop() }
     }
 
-    /// Command-digit rather than a segmented `Picker`: an NSSegmentedControl is reachable
-    /// only by mouse unless Full Keyboard Access is on, and this modal has to be typeable.
-    private var agentPicker: some View {
+    private var title: String {
+        let vm = model.vms[safe: model.currentVM]?.name ?? "?"
+        guard let space = model.activeSpace else { return "New session on \(vm)" }
+        return "New session on \(vm), in \(space.name)"
+    }
+
+    /// Control-digit, as the agents below are command-digit and for the same reason.
+    private var vmPicker: some View {
         HStack(spacing: 4) {
-            ForEach(Array(model.agentNames.enumerated()), id: \.element) { i, name in
-                Button { agent = name } label: { segment(name, index: i) }
-                    .buttonStyle(.plain)
-                    .keyboardShortcut(shortcut(i))
+            ForEach(Array(model.vms.enumerated()), id: \.offset) { i, vm in
+                Button {
+                    model.pickVM(i)
+                    model.requestDirs(cwd)
+                } label: {
+                    segment(vm.name, picked: i == model.currentVM, hint: digit(i).map { "⌃\($0)" })
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(digit(i).map {
+                    KeyboardShortcut(KeyEquivalent(Character("\($0)")), modifiers: .control)
+                })
             }
             Spacer()
         }
     }
 
-    private func segment(_ name: String, index: Int) -> some View {
+    /// Command-digit rather than a segmented `Picker`: an NSSegmentedControl is reachable
+    /// only by mouse unless Full Keyboard Access is on, and this modal has to be typeable.
+    private var agentPicker: some View {
+        HStack(spacing: 4) {
+            ForEach(Array(model.agentNames.enumerated()), id: \.element) { i, name in
+                Button { agent = name } label: {
+                    segment(name, picked: name == agent, hint: digit(i).map { "⌘\($0)" })
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(digit(i).map {
+                    KeyboardShortcut(KeyEquivalent(Character("\($0)")), modifiers: .command)
+                })
+            }
+            Spacer()
+        }
+    }
+
+    private func segment(_ name: String, picked: Bool, hint: String?) -> some View {
         HStack(spacing: 5) {
             Text(name)
-            if shortcut(index) != nil {
-                Text("⌘\(index + 1)")
+            if let hint {
+                Text(hint)
                     .font(Ghostty.ui(Ghostty.fontSize - 3))
                     .foregroundStyle(.secondary)
             }
         }
         .padding(.horizontal, 8).padding(.vertical, 3)
-        .background(name == agent ? theme.palette.accent.opacity(0.35) : Color.secondary.opacity(0.15))
+        .background(picked ? theme.palette.accent.opacity(0.35) : Color.secondary.opacity(0.15))
         .cornerRadius(4)
         .contentShape(Rectangle())
     }
 
-    private func shortcut(_ index: Int) -> KeyboardShortcut? {
-        guard index < 9 else { return nil }
-        return KeyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+    private func digit(_ index: Int) -> Int? {
+        index < 9 ? index + 1 : nil
     }
 
     private var completionMenu: some View {

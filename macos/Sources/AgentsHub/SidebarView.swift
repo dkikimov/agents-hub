@@ -29,6 +29,10 @@ private struct VimKeys: ViewModifier {
             .onKeyPress("d") { model.killSelected(); return .handled }
             .onKeyPress("f") { model.toggleFavouriteAtSelection(); return .handled }
             .onKeyPress("r") { model.restartSelected(); return .handled }
+            .onKeyPress("m") { model.moveSelection(); return .handled }
+            .onKeyPress("s") { model.newSpaceFromSelectedFolder(); return .handled }
+            .onKeyPress("[") { model.stepSpace(by: -1); return .handled }
+            .onKeyPress("]") { model.stepSpace(by: 1); return .handled }
     }
 
     private func enterTerminal() -> KeyPress.Result {
@@ -47,6 +51,15 @@ struct StatusDot: View {
     let activity: Activity
     let done: Bool
 
+    var body: some View {
+        MoodDot(mood: Mood(online: online, status: status, activity: activity, done: done))
+    }
+}
+
+/// A session's dot, or a whole space's, which wears its most urgent session's.
+struct MoodDot: View {
+    let mood: Mood
+
     @AppStorage("theme") private var theme = Theme.classic
 
     var body: some View {
@@ -54,17 +67,22 @@ struct StatusDot: View {
     }
 
     private var glyph: String {
-        if !online { return "◌" }
-        if status == .stopped { return "○" }
-        return activity == .working || activity == .blocked ? "◉" : "●"
+        switch mood {
+        case .empty: return "·"
+        case .offline: return "◌"
+        case .stopped: return "○"
+        case .working, .blocked: return "◉"
+        case .idle, .done: return "●"
+        }
     }
 
     private var color: Color {
-        if !online || status == .stopped { return .secondary }
-        switch activity {
+        switch mood {
+        case .empty, .offline, .stopped: return .secondary
         case .working: return theme.palette.attention
         case .blocked: return theme.palette.blocked
-        case .idle, .unknown: return done ? theme.palette.done : theme.palette.running
+        case .done: return theme.palette.done
+        case .idle: return theme.palette.running
         }
     }
 }
@@ -77,6 +95,8 @@ struct SidebarView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            SpaceBar(model: model)
+            Divider()
             // j/k move the selection in the model, and a List only follows the mouse on
             // its own — without this the cursor walks off the visible rows.
             ScrollViewReader { proxy in
@@ -100,6 +120,7 @@ struct SidebarView: View {
                     proxy.scrollTo(id)
                 }
                 .modifier(VimKeys(model: model, focus: $focus, filterFocused: $filterFocused))
+                .overlay { emptySpace }
             }
 
             Divider()
@@ -117,6 +138,21 @@ struct SidebarView: View {
                 }
             }
             .padding(.horizontal, 8).padding(.vertical, 5)
+        }
+    }
+
+    @ViewBuilder
+    private var emptySpace: some View {
+        if let space = model.activeSpace, model.rowsByVM.allSatisfy(\.isEmpty) {
+            VStack(spacing: 4) {
+                Text("No sessions in \(space.name)")
+                Text(model.filter.isEmpty ? "⌘N starts one, or drop one on its chip" : "nothing matches the filter")
+                    .font(Ghostty.ui(Ghostty.fontSize - 2))
+            }
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .padding()
+            .allowsHitTesting(false)
         }
     }
 
@@ -180,6 +216,7 @@ struct SidebarView: View {
                     .font(Ghostty.ui())
                     .lineLimit(1).truncationMode(.tail)
             }
+            .draggable(row.id)
         }
     }
 
