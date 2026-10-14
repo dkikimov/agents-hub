@@ -67,6 +67,14 @@ enum Sheet: Identifiable {
     }
 }
 
+/// A daemon's `Error` in full. The status bar has one line, and the cause — "No viable
+/// candidates found in PATH" — is usually on the next.
+struct DaemonError: Identifiable {
+    let id = UUID()
+    let vm: String
+    let message: String
+}
+
 /// All client state, plus the queries over it. The twin of `src/tui/app.rs` and the
 /// `on_msg` half of `event.rs`.
 ///
@@ -81,6 +89,7 @@ final class AppModel: ObservableObject {
     @Published var filter = "" { didSet { rebuild() } }
     @Published var status = ""
     @Published var sheet: Sheet?
+    @Published var error: DaemonError?
     /// Toggled by ⌘L; the root view watches it and moves focus. A plain signal rather
     /// than reaching into `@FocusState` from the model.
     @Published var requestSidebarFocus = false
@@ -262,7 +271,8 @@ final class AppModel: ObservableObject {
         case let .dirs(path, names):
             dirs[Self.dirKey(index, path)] = names
         case let .error(msg):
-            status = "\(vms[index].name): \(msg)"
+            status = "\(vms[index].name): \(msg.prefix { $0 != "\n" })"
+            error = DaemonError(vm: vms[index].name, message: msg)
             // Most likely a daemon that predates `Shell` and has no idea what we asked
             // for. Leaving the panel open would be a blank promise that never resolves.
             if let parent = shellFocusPending, parent.vm == index, shellKeys(for: parent).isEmpty {

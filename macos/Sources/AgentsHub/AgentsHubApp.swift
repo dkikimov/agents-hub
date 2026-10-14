@@ -260,6 +260,11 @@ struct RootView: View {
         .onDisappear { model.windowClosed() }
         .onChange(of: scheme) { _, new in Ghostty.apply(new) }
         .onChange(of: model.requestSidebarFocus) { _, _ in focus = .sidebar }
+        .alert("Error on \(model.error?.vm ?? "")",
+               isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } }),
+               presenting: model.error) { _ in
+            Button("OK") {}
+        } message: { Text($0.message) }
         .sheet(item: $model.sheet) { sheet in
             switch sheet {
             case .newSession:
