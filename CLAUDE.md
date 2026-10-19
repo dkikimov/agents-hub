@@ -22,7 +22,7 @@ make vm HOST=buildbox                          # provision a remote over SSH
 Underneath, and for anything narrower than a whole suite:
 
 ```bash
-cargo test                                     # 93 unit + 3 integration
+cargo test                                     # 99 unit + 3 integration
 cargo test --test roundtrip                    # integration only (spawns real daemons + PTYs)
 cargo test tui::event::                        # one module's tests
 cargo test key_bytes_match_a_real_terminal     # single test by name
@@ -146,6 +146,15 @@ it holds the master fd. `state.json` + per-session logs survive, so after any re
 come back listed as `Stopped` with readable history, and `r` relaunches (using `resume` argv if
 the agent defines it). Nothing auto-relaunches. `Hub::new` force-sets every restored session to
 `Stopped` — that's not a bug to "fix".
+
+**A session resumes its own conversation, never the folder's newest.** `claude --continue`
+did the latter, so restarting one of two sessions in a cwd brought back the other.
+`src/conversation.rs` gives each session a UUID for `{conversation}` in its argv, kept in
+`state.json` beside `SessionInfo` but never sent to clients. `/clear` and `/resume` move
+Claude onto another id; `Hub::scan` rereads it from `~/.claude/sessions/<pid>.json`
+whenever the activity changes, since a conversation worth resuming had a turn. Claude
+deletes that file on exit, so it can't be read afterwards. A `resume` whose transcript
+doesn't exist falls back to `command`, because `--resume` of an unknown id exits.
 
 ### Locking discipline in server.rs
 

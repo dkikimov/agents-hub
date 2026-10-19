@@ -3,10 +3,12 @@
 //! access arrives via `agents-hub stdio` on the far end of an SSH pipe.
 
 use crate::config::{expand, Config};
+use crate::conversation;
 use crate::detect::{self, Agent, Tracker};
 use crate::proto::*;
 use anyhow::{anyhow, Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -44,6 +46,7 @@ struct Run {
     tx: broadcast::Sender<Ev>,
     /// Only for an agent `detect` has rules for.
     watch: Option<Arc<Mutex<Watch>>>,
+    pid: Option<u32>,
 }
 
 impl Run {
@@ -117,6 +120,17 @@ impl Watch {
 struct Session {
     info: SessionInfo,
     run: Option<Run>,
+    /// Daemon-only, so clients never see it; `None` on a session older than the field.
+    conversation: Option<String>,
+}
+
+/// A `state.json` entry. Flattened, so a file written before `conversation` still loads.
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    #[serde(flatten)]
+    info: SessionInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation: Option<String>,
 }
 
 pub struct Hub {
@@ -141,6 +155,12 @@ fn new_id() -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     format!("{:x}{:x}", nanos, SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A `resume` that names a conversation needs it to exist; otherwise the session
+/// starts over under the same id.
+fn resumable(resume: &[String], conversation: &str, exists: impl Fn(&str) -> bool) -> bool {
+    !conversation::names_one(resume) || exists(conversation)
 }
 
 fn expand_home(cwd: &str) -> PathBuf {
@@ -317,11 +337,11 @@ impl Hub {
     fn new(dir: PathBuf, cfg: Config) -> Hub {
         let restored = Self::load_state(&dir);
         let mut sessions = HashMap::new();
-        for mut info in restored {
+        for Saved { mut info, conversation } in restored {
             // Nothing survives the daemon dying: the PTY master died with it.
             info.status = Status::Stopped;
             info.activity = Activity::Unknown;
-            sessions.insert(info.id.clone(), Session { info, run: None });
+            sessions.insert(info.id.clone(), Session { info, run: None, conversation });
         }
         Hub {
             dir,
@@ -339,7 +359,7 @@ impl Hub {
         self.dir.join("state.json")
     }
 
-    fn load_state(dir: &Path) -> Vec<SessionInfo> {
+    fn load_state(dir: &Path) -> Vec<Saved> {
         std::fs::read_to_string(dir.join("state.json"))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
@@ -355,8 +375,16 @@ impl Hub {
 
     /// tmp-file + rename, so a crash mid-write can't leave a truncated state file.
     fn save(&self) {
-        let infos = self.list();
-        let Ok(json) = serde_json::to_string_pretty(&infos) else {
+        let saved: Vec<Saved> = {
+            let s = self.sessions.lock().unwrap();
+            s.values()
+                .map(|x| Saved {
+                    info: x.info.clone(),
+                    conversation: x.conversation.clone(),
+                })
+                .collect()
+        };
+        let Ok(json) = serde_json::to_string_pretty(&saved) else {
             return;
         };
         let tmp = self.state_path().with_extension("tmp");
@@ -383,28 +411,50 @@ impl Hub {
     }
 
     /// Rereads every agent screen that changed, and tells clients about what moved.
-    /// Not saved: activity is live state, and a restored session starts `Unknown`.
+    /// Activity is not saved: it is live state, and a restored session starts `Unknown`.
+    /// A Claude conversation is: one that changed (`/clear`, `/resume`) shows up here,
+    /// because a conversation worth resuming had a turn, and a turn moves the activity.
     fn scan(&self, now: Instant) {
-        let watches: Vec<(String, Arc<Mutex<Watch>>)> = {
+        let watches: Vec<(String, Arc<Mutex<Watch>>, Option<u32>)> = {
             let s = self.sessions.lock().unwrap();
             s.iter()
-                .filter_map(|(id, x)| Some((id.clone(), x.run.as_ref()?.watch.clone()?)))
+                .filter_map(|(id, x)| {
+                    let run = x.run.as_ref()?;
+                    Some((id.clone(), run.watch.clone()?, run.pid))
+                })
                 .collect()
         };
-        let moved: Vec<(String, Activity)> = watches
+        let moved: Vec<(String, Activity, Option<String>)> = watches
             .into_iter()
-            .filter_map(|(id, w)| Some((id, w.lock().unwrap().scan(now)?)))
+            .filter_map(|(id, w, pid)| {
+                let (activity, agent) = {
+                    let mut w = w.lock().unwrap();
+                    (w.scan(now)?, w.agent)
+                };
+                let conversation = pid
+                    .filter(|_| agent == Agent::Claude)
+                    .and_then(conversation::current);
+                Some((id, activity, conversation))
+            })
             .collect();
         if moved.is_empty() {
             return;
         }
+        let mut switched = false;
         {
             let mut s = self.sessions.lock().unwrap();
-            for (id, activity) in moved {
+            for (id, activity, conversation) in moved {
                 if let Some(sess) = s.get_mut(&id).filter(|x| x.run.is_some()) {
                     sess.info.activity = activity;
+                    if conversation.is_some() && conversation != sess.conversation {
+                        sess.conversation = conversation;
+                        switched = true;
+                    }
                 }
             }
+        }
+        if switched {
+            self.save();
         }
         let _ = self.changed.send(());
     }
@@ -430,6 +480,9 @@ impl Hub {
         cmd.cwd(expand_home(cwd));
         // Agent CLIs render badly without this.
         cmd.env("TERM", "xterm-256color");
+        for var in conversation::PARENT_ENV {
+            cmd.env_remove(var);
+        }
         // The proxy, not the forwarded socket: this path outlives every client, so the
         // env frozen here stays valid across reconnects instead of naming a `/tmp/ssh-*`
         // that dies with the connection that made it. Absent only if the proxy failed
@@ -444,6 +497,7 @@ impl Hub {
             .spawn_command(cmd)
             .with_context(|| format!("launching {prog}"))?;
         drop(pair.slave);
+        let pid = child.process_id();
 
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
@@ -469,6 +523,7 @@ impl Hub {
             child,
             tx,
             watch,
+            pid,
         })
     }
 
@@ -482,16 +537,17 @@ impl Hub {
         vec![shell, "-l".into()]
     }
 
-    fn argv_for(&self, agent: &str, resuming: bool) -> Result<Vec<String>> {
+    fn argv_for(&self, agent: &str, resuming: bool, conversation: &str) -> Result<Vec<String>> {
         let a = self
             .cfg
             .agents
             .get(agent)
             .ok_or_else(|| anyhow!("unknown agent type '{agent}' — add [agents.{agent}] to config.toml"))?;
-        Ok(match (resuming, &a.resume) {
-            (true, Some(r)) => r.clone(),
-            _ => a.command.clone(),
-        })
+        let argv = match &a.resume {
+            Some(r) if resuming && resumable(r, conversation, conversation::has_transcript) => r,
+            _ => &a.command,
+        };
+        Ok(conversation::fill(argv, conversation))
     }
 
     /// `streams` is this connection's live forwarder per session: an `Attach` replaces
@@ -521,7 +577,8 @@ impl Hub {
                 cols,
                 rows,
             } => {
-                let argv = self.argv_for(&agent, false)?;
+                let conversation = conversation::new_id()?;
+                let argv = self.argv_for(&agent, false, &conversation)?;
                 let id = new_id();
                 let run = self.spawn(&id, &argv, &cwd, cols, rows)?;
                 let info = SessionInfo {
@@ -537,7 +594,14 @@ impl Hub {
                 self.sessions
                     .lock()
                     .unwrap()
-                    .insert(id, Session { info, run: Some(run) });
+                    .insert(
+                        id,
+                        Session {
+                            info,
+                            run: Some(run),
+                            conversation: Some(conversation),
+                        },
+                    );
                 self.announce();
             }
 
@@ -575,7 +639,14 @@ impl Hub {
                 self.sessions
                     .lock()
                     .unwrap()
-                    .insert(id, Session { info, run: Some(run) });
+                    .insert(
+                        id,
+                        Session {
+                            info,
+                            run: Some(run),
+                            conversation: None,
+                        },
+                    );
                 self.announce();
             }
 
@@ -678,20 +749,31 @@ impl Hub {
     }
 
     /// Relaunches a stopped session under its own id; a running one is left alone. A
-    /// companion shell comes back as a shell, an agent through its `resume` argv.
+    /// companion shell comes back as a shell, an agent through its `resume` argv. A
+    /// session from before conversations were tracked gets a fresh one rather than
+    /// someone else's.
     fn restart(self: &Arc<Self>, id: &str, cols: u16, rows: u16) -> Result<()> {
-        let (agent, cwd, shell) = {
+        let (agent, cwd, shell, conversation) = {
             let s = self.sessions.lock().unwrap();
             let sess = s.get(id).ok_or_else(|| anyhow!("no such session"))?;
             if sess.run.is_some() {
                 return Ok(()); // already running, nothing to do
             }
-            (sess.info.agent.clone(), sess.info.cwd.clone(), sess.info.parent.is_some())
+            (
+                sess.info.agent.clone(),
+                sess.info.cwd.clone(),
+                sess.info.parent.is_some(),
+                sess.conversation.clone(),
+            )
+        };
+        let conversation = match conversation {
+            Some(c) => c,
+            None => conversation::new_id()?,
         };
         let argv = if shell {
             Self::shell_argv()
         } else {
-            self.argv_for(&agent, true)?
+            self.argv_for(&agent, true, &conversation)?
         };
         let run = self.spawn(id, &argv, &cwd, cols, rows)?;
         {
@@ -700,6 +782,7 @@ impl Hub {
                 sess.info.status = Status::Running;
                 sess.info.activity = Activity::Unknown;
                 sess.run = Some(run);
+                sess.conversation = Some(conversation);
             }
         }
         self.announce();
@@ -1020,6 +1103,31 @@ mod tests {
             "and with the env pointing at us too there is nothing left to forward to"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resume_needs_the_conversation_it_names() {
+        let named = ["claude", "--resume", "{conversation}"].map(String::from);
+        let plain = ["claude", "--continue"].map(String::from);
+        assert!(resumable(&named, "abc", |c| c == "abc"));
+        assert!(!resumable(&named, "abc", |_| false));
+        assert!(resumable(&plain, "abc", |_| false));
+    }
+
+    #[test]
+    fn state_from_before_conversations_still_loads() {
+        let old = r#"[{"id":"1","agent":"claude","name":"api","cwd":"/tmp","status":"Stopped","created_at":7}]"#;
+        let saved: Vec<Saved> = serde_json::from_str(old).unwrap();
+        assert_eq!(saved[0].info.id, "1");
+        assert_eq!(saved[0].conversation, None);
+
+        let json = serde_json::to_string(&Saved {
+            conversation: Some("c-1".into()),
+            ..saved.into_iter().next().unwrap()
+        })
+        .unwrap();
+        let back: Saved = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.conversation.as_deref(), Some("c-1"));
     }
 
     #[test]

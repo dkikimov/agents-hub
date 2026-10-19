@@ -74,6 +74,11 @@ PTYs die with the daemon. The session list and logs don't: after a restart every
 comes back as **Stopped** with its history readable, and `r` relaunches it (using the
 agent's `resume` command if it has one). Nothing relaunches on its own.
 
+Each Claude session keeps its own conversation: `{conversation}` in `command` and
+`resume` is an id the daemon assigns and follows through `/clear` and `/resume`, so
+two sessions in one folder never resume each other. A conversation with no messages yet
+has nothing to resume and starts fresh.
+
 ## Configure
 
 `~/.config/agents-hub/config.toml`, written with defaults on first run:
@@ -88,8 +93,8 @@ ssh  = "buildbox"                 # host alias from ~/.ssh/config
 # remote_bin = "agents-hub"       # if it isn't on the remote PATH
 
 [agents.claude]
-command = ["claude"]
-resume  = ["claude", "--continue"]
+command = ["claude", "--session-id", "{conversation}"]
+resume  = ["claude", "--resume", "{conversation}"]
 
 [agents.codex]
 command = ["codex", "--no-alt-screen"]
