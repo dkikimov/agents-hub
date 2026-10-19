@@ -29,6 +29,7 @@ pub struct Vm {
 pub struct Agent {
     pub command: Vec<String>,
     /// Used by `r` on a stopped session, so Claude Code can pick its thread back up.
+    /// `{conversation}` here and in `command` is the session's own conversation id.
     #[serde(default)]
     pub resume: Option<Vec<String>>,
 }
@@ -48,8 +49,10 @@ name = "local"                    # group name in the sidebar
 # remote_bin = "agents-hub"       # override if not on the remote PATH
 
 [agents.claude]
-command = ["claude"]
-resume  = ["claude", "--continue"]
+# {conversation} is this session's own Claude conversation id, so resuming a session
+# brings back its conversation and not the newest one in the folder.
+command = ["claude", "--session-id", "{conversation}"]
+resume  = ["claude", "--resume", "{conversation}"]
 
 [agents.codex]
 command = ["codex", "--no-alt-screen"]
@@ -99,7 +102,7 @@ mod tests {
         assert_eq!(cfg.vm.len(), 1);
         assert_eq!(cfg.vm[0].name, "local");
         assert!(cfg.vm[0].ssh.is_none());
-        assert_eq!(cfg.agents["claude"].command, vec!["claude"]);
+        assert_eq!(cfg.agents["claude"].command[0], "claude");
         assert!(cfg.agents["claude"].resume.is_some());
         assert_eq!(cfg.agents["codex"].command, ["codex", "--no-alt-screen"]);
         assert_eq!(cfg.agent_names(), ["claude", "codex", "shell"]);
