@@ -1,6 +1,6 @@
 # agents-hub
 
-Claude Code, Codex and plain-shell sessions across your Mac and remote VMs, in one
+Claude Code, Codex, OpenCode and plain-shell sessions across your Mac and remote VMs, in one
 place. Sessions are grouped by VM and by working directory, and their scrollback
 survives restarts.
 
@@ -79,6 +79,10 @@ Each Claude session keeps its own conversation: `{conversation}` in `command` an
 two sessions in one folder never resume each other. A conversation with no messages yet
 has nothing to resume and starts fresh.
 
+OpenCode sessions do the same through `--session`, which needs OpenCode 2. Switching
+to another session inside OpenCode isn't followed: `r` brings back the one the session
+started with.
+
 ## Configure
 
 `~/.config/agents-hub/config.toml`, written with defaults on first run:
@@ -99,12 +103,16 @@ resume  = ["claude", "--resume", "{conversation}"]
 [agents.codex]
 command = ["codex", "--no-alt-screen"]
 
+[agents.opencode]
+command = ["opencode", "--session", "ses_{conversation}"]
+
 [agents.shell]
 command = ["$SHELL", "-l"]
 ```
 
 `[[vm]]` is read by the client. `[agents.*]` is read by the daemon on each machine, so a
-remote VM's own config decides how `claude` launches there.
+remote VM's own config decides how `claude` launches there. The defaults are only written
+on first run, so an older config needs `[agents.opencode]` added by hand.
 
 State lives in `~/.local/state/agents-hub/` (socket, `state.json`, per-session logs,
 `daemon.log`). `AGENTS_HUB_DIR` and `AGENTS_HUB_CONFIG` override both paths.

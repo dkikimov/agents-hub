@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`agents-hub` manages Claude Code / Codex / plain-shell sessions across a local Mac and
+`agents-hub` manages Claude Code / Codex / OpenCode / plain-shell sessions across a local Mac and
 remote VMs from one TUI, grouped by VM name. Sessions and their scrollback survive restarts.
 
 ## Commands
@@ -22,7 +22,7 @@ make vm HOST=buildbox                          # provision a remote over SSH
 Underneath, and for anything narrower than a whole suite:
 
 ```bash
-cargo test                                     # 99 unit + 3 integration
+cargo test                                     # 101 unit + 3 integration
 cargo test --test roundtrip                    # integration only (spawns real daemons + PTYs)
 cargo test tui::event::                        # one module's tests
 cargo test key_bytes_match_a_real_terminal     # single test by name
@@ -110,10 +110,10 @@ into `vt100::Parser` and renders with `tui-term`. Keep the server dumb about scr
 with one exception:
 
 **The daemon reads agent screens to say what they're doing.** `src/detect.rs` is herdr's
-Claude and Codex detection (herdrdev/herdr, Apache-2.0) ported rule for rule: working,
+Claude, Codex and OpenCode detection (herdrdev/herdr, Apache-2.0) ported rule for rule: working,
 blocked on a prompt, or idle, from the visible screen plus the OSC title, never from output
 timing. That approach lit every dot whenever the client resized or refocused anything. For
-a session whose argv names `claude` or `codex`, `server.rs` keeps a private `vt100` screen
+a session whose argv names `claude`, `codex` or `opencode`, `server.rs` keeps a private `vt100` screen
 that is fed by the reader thread and resized with the PTY. A 100 ms scan rereads only the
 screens that changed, and changes go out as `SessionInfo.activity`. A
 launch reads `Unknown` for 3 s, and working → idle waits 300 ms unless a prompt box is on
@@ -155,6 +155,9 @@ Claude onto another id; `Hub::scan` rereads it from `~/.claude/sessions/<pid>.js
 whenever the activity changes, since a conversation worth resuming had a turn. Claude
 deletes that file on exit, so it can't be read afterwards. A `resume` whose transcript
 doesn't exist falls back to `command`, because `--resume` of an unknown id exits.
+OpenCode 2's `--session` creates an unknown id and reopens a known one, so its entry has
+no `resume`; ids must start `ses`, hence `ses_{conversation}`. Nothing follows a session
+switched from inside OpenCode.
 
 ### Locking discipline in server.rs
 

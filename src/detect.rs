@@ -6,8 +6,8 @@
 //! running turn, `Do you want to proceed?` over a permission prompt, a bare `❯` in an
 //! idle prompt box, and a spinner at the front of its window title.
 //!
-//! The rules are herdr's Claude and Codex manifests (github.com/herdrdev/herdr,
-//! Apache-2.0, `src/detect/manifests/{claude,codex}.toml`), ported rule for rule and
+//! The rules are herdr's Claude, Codex and OpenCode manifests (github.com/herdrdev/herdr,
+//! Apache-2.0, `src/detect/manifests/{claude,codex,opencode}.toml`), ported rule for rule and
 //! listed in its priority order, so the first rule that matches decides. Each carries
 //! herdr's id so the two can be diffed when an agent's UI moves.
 //!
@@ -30,6 +30,7 @@ pub const IDLE_HOLD: Duration = Duration::from_millis(300);
 pub enum Agent {
     Claude,
     Codex,
+    OpenCode,
 }
 
 impl Agent {
@@ -47,6 +48,7 @@ impl Agent {
                 match base.split('@').next().unwrap_or(base) {
                     "claude" | "claude-code" => Some(Agent::Claude),
                     "codex" => Some(Agent::Codex),
+                    "opencode" | "opencode2" => Some(Agent::OpenCode),
                     _ => None,
                 }
             })
@@ -73,6 +75,7 @@ pub fn detect(agent: Agent, screen: &str, title: &str) -> Option<Reading> {
     let rules = match agent {
         Agent::Claude => CLAUDE,
         Agent::Codex => CODEX,
+        Agent::OpenCode => OPENCODE,
     };
     match rules.iter().find(|(hit, _)| hit(&v)) {
         Some((_, verdict)) => *verdict,
@@ -799,6 +802,49 @@ fn codex_trailer(line: &str) -> bool {
     !line.starts_with(|c: char| "◦›■✗✓─".contains(c))
 }
 
+// --- OpenCode ------------------------------------------------------------------------
+
+const OPENCODE: &[Rule] = &[
+    (opencode_permission, says(Activity::Blocked, true)),
+    (opencode_interrupt_hint, says(Activity::Working, true)),
+    (opencode_progress_bar, says(Activity::Working, true)),
+];
+
+/// `permission_required`: the permission dialog, or the footer of a question form.
+fn opencode_permission(v: &View) -> bool {
+    let r = v.all();
+    v.has(r.clone(), "△ permission required")
+        || (v.has(r.clone(), "esc dismiss")
+            && v.has_any(r.clone(), &["enter confirm", "enter submit", "enter toggle"])
+            && v.has_any(r, &["↑↓ select", "⇆ tab"]))
+}
+
+/// `interrupt_hint_working`.
+fn opencode_interrupt_hint(v: &View) -> bool {
+    let r = v.all();
+    v.has_any(
+        r.clone(),
+        &["esc to interrupt", "ctrl+c to interrupt", "press esc to interrupt"],
+    ) || v.lower[r].iter().any(|l| {
+        l.find("opencode").is_some_and(|i| {
+            let rest = &l[i + "opencode".len()..];
+            rest.contains("esc interrupt") || rest.contains("esc again to interrupt")
+        })
+    })
+}
+
+/// `progress_bar_working`: the scanner a running turn puts in the footer, `⬝⬝⬝⬝⬝■■■`.
+fn opencode_progress_bar(v: &View) -> bool {
+    v.line(v.all(), |l| {
+        l.chars()
+            .scan(0, |run, c| {
+                *run = if matches!(c, '■' | '⬝') { *run + 1 } else { 0 };
+                Some(*run)
+            })
+            .any(|run| run >= 4)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +856,17 @@ mod tests {
 
     fn codex(screen: &str, title: &str) -> Option<Activity> {
         detect(Agent::Codex, screen, title).map(|r| r.state)
+    }
+
+    fn opencode(screen: &str) -> Option<Activity> {
+        detect(Agent::OpenCode, screen, "OC | Fix the login bug").map(|r| r.state)
+    }
+
+    /// OpenCode 2.2's prompt box over the footer line it swaps while a turn runs.
+    fn opencode_screen(above: &str, footer: &str) -> String {
+        format!(
+            "{above}\n\n  ┃\n  ┃  Build · GLM (latest)\n  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n{footer}\n"
+        )
     }
 
     const RULE: &str = "────────────────────────────────────────────────────────";
@@ -836,6 +893,10 @@ mod tests {
         assert_eq!(
             Agent::of(&argv(&["bash", "-lc", "cd ~/x && claude --continue"])),
             Some(Agent::Claude)
+        );
+        assert_eq!(
+            Agent::of(&argv(&["opencode", "--session", "ses_1"])),
+            Some(Agent::OpenCode)
         );
         assert_eq!(Agent::of(&argv(&["/bin/zsh", "-l"])), None);
         // A model name is not the agent.
@@ -957,6 +1018,37 @@ mod tests {
         let trust =
             "> You are in /home/me/x\n\n  Do you trust the contents of\n  this directory?\n";
         assert_eq!(codex(trust, ""), Some(Blocked));
+    }
+
+    #[test]
+    fn opencode_working_and_idle() {
+        let working = opencode_screen(
+            "  ┃  ⠙ sleep 6 && echo done",
+            "   ⬝⬝⬝⬝⬝■■■ esc interrupt                    ↓ 1 shell  ctrl+p commands",
+        );
+        assert_eq!(detect(Agent::OpenCode, &working, ""), says(Working, true));
+        // With animations off there is no scanner, only `[⋯]`, and herdr's line rule then
+        // needs the name on the same line.
+        let armed = opencode_screen("", "  opencode  [⋯] esc again to interrupt");
+        assert_eq!(opencode(&armed), Some(Working));
+
+        let idle = opencode_screen(
+            "     ok\n\n     Build · GLM (latest) · 10.2s · 10.0 tok/s",
+            "  ~/src/opencode       12.4K (6%)  ctrl+p commands",
+        );
+        assert_eq!(detect(Agent::OpenCode, &idle, ""), says(Idle, false));
+    }
+
+    #[test]
+    fn opencode_blocked() {
+        let question = "  ┃  Please pick A or B.\n  ┃\n  ┃  1. A\n  ┃  2. B\n  ┃\n  \
+                        ┃  ↑↓ select  enter submit  esc dismiss\n  ┃\n";
+        assert_eq!(opencode(question), Some(Blocked));
+        let permission =
+            "  ┃  △ Permission required\n  ┃    → Read /etc/hosts\n  ┃\n  ┃  ⇆ select  enter confirm\n";
+        assert_eq!(opencode(permission), Some(Blocked));
+        let no_answer_key = "  ┃  ⇆ tab  esc dismiss\n";
+        assert_eq!(opencode(no_answer_key), Some(Idle));
     }
 
     #[test]

@@ -431,6 +431,9 @@ impl Hub {
                     let mut w = w.lock().unwrap();
                     (w.scan(now)?, w.agent)
                 };
+                // ponytail: only Claude leaves its current conversation in a file, so an
+                // OpenCode session switched from its TUI still resumes the one it launched
+                // with. Following it takes a plugin reporting the id, which is what herdr does.
                 let conversation = pid
                     .filter(|_| agent == Agent::Claude)
                     .and_then(conversation::current);
