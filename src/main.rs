@@ -149,7 +149,7 @@ async fn stdio() -> Result<()> {
 }
 
 const HELP: &str = "\
-agents-hub — manage Claude Code / Codex / shell sessions across machines
+agents-hub — manage Claude Code / Codex / OpenCode / shell sessions across machines
 
   agents-hub                       launch the TUI
   agents-hub --app gui             launch the macOS app instead

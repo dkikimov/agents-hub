@@ -57,6 +57,11 @@ resume  = ["claude", "--resume", "{conversation}"]
 [agents.codex]
 command = ["codex", "--no-alt-screen"]
 
+[agents.opencode]
+# OpenCode 2 creates a session under an unknown id and reopens a known one, so the same
+# command starts this session's conversation and resumes it. Its ids must start "ses".
+command = ["opencode", "--session", "ses_{conversation}"]
+
 [agents.shell]
 command = ["$SHELL", "-l"]
 "#;
@@ -105,7 +110,8 @@ mod tests {
         assert_eq!(cfg.agents["claude"].command[0], "claude");
         assert!(cfg.agents["claude"].resume.is_some());
         assert_eq!(cfg.agents["codex"].command, ["codex", "--no-alt-screen"]);
-        assert_eq!(cfg.agent_names(), ["claude", "codex", "shell"]);
+        assert!(cfg.agents["opencode"].resume.is_none());
+        assert_eq!(cfg.agent_names(), ["claude", "codex", "opencode", "shell"]);
     }
 
     #[test]
