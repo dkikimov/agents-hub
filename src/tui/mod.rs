@@ -134,21 +134,26 @@ pub async fn run() -> Result<()> {
                         app.dirty = true;
                     }
                     Ui::Input(_) => {}
+                    // Up only means ssh started, so online waits for the daemon's first
+                    // frame, and the sidebar's "(offline)" carries link state instead of
+                    // the status line: otherwise every retry against an unreachable host
+                    // flashes "connected", and several such hosts take turns on it.
                     Ui::Up(i) => {
-                        app.vms[i].online = true;
                         // Force a re-attach: the daemon on the far side has no memory
                         // of the subscriptions the dropped connection held.
                         app.attached.retain(|(v, _)| *v != i);
-                        app.status = format!("{} connected", app.vms[i].name);
                         app.send(i, Req::List);
-                        app.dirty = true;
                     }
                     Ui::Down(i) => {
-                        app.vms[i].online = false;
-                        app.status = format!("{} offline — retrying", app.vms[i].name);
-                        app.dirty = true;
+                        if app.vms[i].online {
+                            app.vms[i].online = false;
+                            app.dirty = true;
+                        }
                     }
-                    Ui::Msg(i, resp) => event::on_msg(&mut app, i, resp),
+                    Ui::Msg(i, resp) => {
+                        app.vms[i].online = true;
+                        event::on_msg(&mut app, i, resp);
+                    }
                 }
             }
         }

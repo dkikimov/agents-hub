@@ -5,6 +5,8 @@ import SwiftUI
 struct VMState {
     let config: VMConfig
     var online = false
+    /// Why the last attempt failed, kept until the daemon answers again.
+    var linkError: String?
     var sessions: [SessionInfo] = []
 
     var name: String { config.name }
@@ -226,17 +228,22 @@ final class AppModel: ObservableObject {
 
     private func onMain(_ index: Int, _ event: LinkEvent) {
         switch event {
+        // `.up` only means ssh started. Online waits for the daemon's first frame, and
+        // link trouble stays out of `status`, or every retry against an unreachable host
+        // flashes "connected" and several of them take turns on the one line.
         case .up:
-            vms[index].online = true
-            status = "\(vms[index].name) connected"
             apply(registry.connected(vm: index))
         case let .down(reason):
-            vms[index].online = false
-            status = reason.map { "\(vms[index].name): \($0)" }
-                ?? "\(vms[index].name) offline — retrying"
+            vms[index].linkError = reason ?? "offline"
             apply(registry.disconnected(vm: index))
+            guard vms[index].online else { return }
+            vms[index].online = false
             rebuild()
         case let .frame(frame):
+            if !vms[index].online {
+                vms[index].online = true
+                vms[index].linkError = nil
+            }
             onFrame(index, frame)
         }
     }
@@ -1052,6 +1059,13 @@ final class AppModel: ObservableObject {
     }
 
     func isOnline(_ vm: Int) -> Bool { vms[safe: vm]?.online ?? false }
+
+    /// Every unreachable VM and why, in config order: one steady line however many fail.
+    var linkErrors: String {
+        vms.filter { !$0.online }
+            .compactMap { vm in vm.linkError.map { "\(vm.name): \($0)" } }
+            .joined(separator: " · ")
+    }
 
     // MARK: - persistence
 
