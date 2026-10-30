@@ -421,6 +421,10 @@ struct RootView: View {
 
     private var statusBar: some View {
         HStack(spacing: 10) {
+            if !model.linkErrors.isEmpty {
+                Text(model.linkErrors).lineLimit(1).truncationMode(.middle)
+                    .foregroundStyle(.orange).help(model.linkErrors)
+            }
             Text(model.status).lineLimit(1).truncationMode(.middle)
             Spacer()
             // Permanent rather than a status message: a config the terminal silently

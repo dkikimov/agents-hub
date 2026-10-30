@@ -151,7 +151,13 @@ public final class VMLink: @unchecked Sendable {
                 }
             }
             if done {
-                self.teardown(reason: self.connected ? "link closed" : nil, notify: true)
+                // ssh prints why and exits, closing both pipes at once, and the stderr
+                // read can land after this EOF; without the wait a failing host
+                // alternates between its real reason and "link closed".
+                self.queue.asyncAfter(deadline: .now() + .milliseconds(100)) {
+                    guard self.proc === p else { return }
+                    self.teardown(reason: "link closed", notify: true)
+                }
             }
         }
         self.io = io

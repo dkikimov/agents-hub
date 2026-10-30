@@ -168,6 +168,7 @@ struct SidebarView: View {
                     Text("offline")
                         .font(Ghostty.ui(Ghostty.fontSize - 3))
                         .foregroundStyle(theme.palette.attention)
+                        .help(model.vms[vi].linkError ?? "")
                 }
             }
 
