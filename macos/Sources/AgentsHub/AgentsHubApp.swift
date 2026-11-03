@@ -5,7 +5,7 @@ import SwiftUI
 /// `.onOpenURL` is not an option: it fires for URL schemes, not for a `CFBundleDocumentTypes`
 /// file open, which only AppKit's delegate sees.
 ///
-/// A cold launch delivers the drop before the scene's `.task` has run `AppModel.start`, so an
+/// A cold launch delivers the drop before the scene's `.task` has run `Hub.start`, so an
 /// open with nobody yet to take it waits in `pending` until there is.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor static var onOpen: (([String]) -> Void)?
@@ -44,102 +44,135 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct AgentsHubApp: App {
     static let mainWindow = "main"
 
-    @StateObject private var model = AppModel()
+    /// Shared by every window; each window builds its own `AppModel` over it.
+    @StateObject private var hub = Hub()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @AppStorage("appearance") private var appearance = AppAppearance.dark
     @AppStorage("theme") private var theme = Theme.classic
 
     var body: some Scene {
         WindowGroup(id: Self.mainWindow) {
-            RootView(model: model, appearance: appearance)
+            RootView(hub: hub, appearance: appearance)
                 .task {
                     // Launched from a shell rather than Finder, the app otherwise opens
                     // behind whatever is frontmost. Never `ignoringOtherApps` — that
                     // steals keystrokes mid-sentence into whichever session is attached.
                     NSApp.activate()
-                    model.start()
+                    hub.start()
                 }
         }
         .defaultSize(width: 1280, height: 820)
         // One short band instead of titlebar-plus-toolbar; the header is a line of text.
         .windowToolbarStyle(.unifiedCompact)
-        .commands {
-            // Replaces File > New Window: a second window would show the same terminals,
-            // and each surface steals the session's output from the other.
-            CommandGroup(replacing: .newItem) {
-                Button("New Session…") { model.sheet = .newSession }
-                    .keyboardShortcut("n", modifiers: .command)
-                Divider()
-                Button("Restart Session") { model.restartSelected() }
-                    .keyboardShortcut("r", modifiers: [.command, .shift])
-                Button("Kill Session…") { model.killSelected() }
-                    .keyboardShortcut(.delete, modifiers: .command)
+        .commands { AppCommands(appearance: $appearance, theme: $theme) }
+
+        // ⌘, for free, and the window macOS users look for when a menu picker isn't enough.
+        Settings { SettingsView() }
+    }
+}
+
+/// The menu bar, acting on the key window's model. With no window in front (Settings is
+/// key, or every window is closed) there is nothing for the session commands to act on.
+struct AppCommands: Commands {
+    @FocusedObject private var model: AppModel?
+    @Environment(\.openWindow) private var openWindow
+    let appearance: Binding<AppAppearance>
+    let theme: Binding<Theme>
+
+    init(appearance: Binding<AppAppearance>, theme: Binding<Theme>) {
+        self.appearance = appearance
+        self.theme = theme
+    }
+
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button("New Session…") { model?.sheet = .newSession }
+                .keyboardShortcut("n", modifiers: .command)
+                .disabled(model == nil)
+            // ⇧⌘N, because ⌘N is a new session. Each window is a client of its own: its
+            // own selection and surfaces, while the one you use last sizes every session.
+            Button("New Window") { openWindow(id: AgentsHubApp.mainWindow) }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+            Divider()
+            Button("Restart Session") { model?.restartSelected() }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(model == nil)
+            Button("Kill Session…") { model?.killSelected() }
+                .keyboardShortcut(.delete, modifiers: .command)
+                .disabled(model == nil)
+        }
+        CommandGroup(replacing: .saveItem) {
+            Button("Close") { closeShellOrWindow() }
+                .keyboardShortcut("w", modifiers: .command)
+        }
+        // Print… would hold ⌘P, and there is nothing here to print.
+        CommandGroup(replacing: .printItem) {}
+        // ⌃⌘, and ⌘P: ghostty binds most plain ⌘ and ⌥⌘ keys by default
+        // (`ghostty +list-keybinds --default`), and a focused surface takes those first.
+        CommandMenu("Space") {
+            Button("New Space…") { model?.sheet = .newSpace }
+                .keyboardShortcut("n", modifiers: [.control, .command])
+                .disabled(model == nil)
+            Button("Rename Space…") {
+                if let model, let space = model.activeSpace { model.sheet = .renameSpace(space.id) }
             }
-            CommandGroup(replacing: .saveItem) {
-                Button("Close") { closeShellOrWindow() }
-                    .keyboardShortcut("w", modifiers: .command)
+            .disabled(model?.activeSpace == nil)
+            Button("Delete Space…") {
+                if let model, let space = model.activeSpace { model.deleteSpace(space.id) }
             }
-            // Print… would hold ⌘P, and there is nothing here to print.
-            CommandGroup(replacing: .printItem) {}
-            // ⌃⌘, and ⌘P: ghostty binds most plain ⌘ and ⌥⌘ keys by default
-            // (`ghostty +list-keybinds --default`), and a focused surface takes those first.
-            CommandMenu("Space") {
-                Button("New Space…") { model.sheet = .newSpace }
-                    .keyboardShortcut("n", modifiers: [.control, .command])
-                Button("Rename Space…") {
-                    if let space = model.activeSpace { model.sheet = .renameSpace(space.id) }
-                }
-                .disabled(model.activeSpace == nil)
-                Button("Delete Space…") {
-                    if let space = model.activeSpace { model.deleteSpace(space.id) }
-                }
-                .disabled(model.activeSpace == nil)
-                Divider()
-                Button("Move to Space…") { model.moveSelection() }
-                    .keyboardShortcut("m", modifiers: [.control, .command])
-                Button("Go to…") { model.sheet = .goTo }
-                    .keyboardShortcut("p", modifiers: .command)
-                Divider()
-                Button("Previous Space") { model.stepSpace(by: -1) }
-                    .keyboardShortcut("[", modifiers: [.control, .command])
-                Button("Next Space") { model.stepSpace(by: 1) }
-                    .keyboardShortcut("]", modifiers: [.control, .command])
-                Divider()
+            .disabled(model?.activeSpace == nil)
+            Divider()
+            Button("Move to Space…") { model?.moveSelection() }
+                .keyboardShortcut("m", modifiers: [.control, .command])
+                .disabled(model == nil)
+            Button("Go to…") { model?.sheet = .goTo }
+                .keyboardShortcut("p", modifiers: .command)
+                .disabled(model == nil)
+            Divider()
+            Button("Previous Space") { model?.stepSpace(by: -1) }
+                .keyboardShortcut("[", modifiers: [.control, .command])
+                .disabled(model == nil)
+            Button("Next Space") { model?.stepSpace(by: 1) }
+                .keyboardShortcut("]", modifiers: [.control, .command])
+                .disabled(model == nil)
+            Divider()
+            if let model {
                 ForEach(Array(model.barViews.enumerated()), id: \.element) { i, view in
                     Button(model.title(of: view)) { model.selectSpace(view) }
                         .keyboardShortcut(spaceShortcut(view, index: i))
                 }
             }
-            CommandMenu("View") {
-                // ⌘L is the way back out of a focused terminal: once ghostty has the
-                // keyboard it takes everything except the command layer.
-                Button("Focus Sidebar") { model.requestSidebarFocus.toggle() }
-                    .keyboardShortcut("l", modifiers: .command)
-                // A shell in the selected session's cwd, on its VM, run by that VM's daemon.
-                // Must be a key ghostty leaves unbound (`ghostty +list-keybinds --default`),
-                // or a focused surface eats it before the menu: ⌘J is scroll_to_selection.
-                Button("Toggle Terminal") { model.toggleShell() }
-                    .keyboardShortcut("b", modifiers: .command)
-                Button("New Terminal") { model.newShell() }
-                    .keyboardShortcut("t", modifiers: .command)
-                Menu("Switch Terminal") {
-                    ForEach(1...9, id: \.self) { n in
-                        Button("Terminal \(n)") { model.selectShell(at: n - 1) }
-                            .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
-                    }
-                }
-                Divider()
-                Picker("Appearance", selection: $appearance) {
-                    ForEach(AppAppearance.allCases) { Text($0.label).tag($0) }
-                }
-                Picker("Theme", selection: $theme) {
-                    ForEach(Theme.allCases) { Text($0.label).tag($0) }
+        }
+        CommandMenu("View") {
+            // ⌘L is the way back out of a focused terminal: once ghostty has the
+            // keyboard it takes everything except the command layer.
+            Button("Focus Sidebar") { model?.requestSidebarFocus.toggle() }
+                .keyboardShortcut("l", modifiers: .command)
+                .disabled(model == nil)
+            // A shell in the selected session's cwd, on its VM, run by that VM's daemon.
+            // Must be a key ghostty leaves unbound (`ghostty +list-keybinds --default`),
+            // or a focused surface eats it before the menu: ⌘J is scroll_to_selection.
+            Button("Toggle Terminal") { model?.toggleShell() }
+                .keyboardShortcut("b", modifiers: .command)
+                .disabled(model == nil)
+            Button("New Terminal") { model?.newShell() }
+                .keyboardShortcut("t", modifiers: .command)
+                .disabled(model == nil)
+            Menu("Switch Terminal") {
+                ForEach(1...9, id: \.self) { n in
+                    Button("Terminal \(n)") { model?.selectShell(at: n - 1) }
+                        .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
                 }
             }
+            .disabled(model == nil)
+            Divider()
+            Picker("Appearance", selection: appearance) {
+                ForEach(AppAppearance.allCases) { Text($0.label).tag($0) }
+            }
+            Picker("Theme", selection: theme) {
+                ForEach(Theme.allCases) { Text($0.label).tag($0) }
+            }
         }
-
-        // ⌘, for free, and the window macOS users look for when a menu picker isn't enough.
-        Settings { SettingsView() }
     }
 
     /// ⌘W takes the visible ⌘B tab first, as in any editor's terminal panel, and only then
@@ -147,7 +180,8 @@ struct AgentsHubApp: App {
     @MainActor
     private func closeShellOrWindow() {
         let window = NSApp.keyWindow
-        if let shell = model.visibleShellKey, window?.identifier?.rawValue != Self.settingsWindow {
+        if let model, let shell = model.visibleShellKey,
+           window?.identifier?.rawValue != Self.settingsWindow {
             model.closeShellTab(shell)
         } else {
             window?.performClose(nil)
@@ -211,8 +245,10 @@ struct SettingsView: View {
     }
 }
 
+/// One window. Its model is its own, so a second window has a selection, a space and
+/// surfaces of its own over the same hub.
 struct RootView: View {
-    @ObservedObject var model: AppModel
+    @StateObject private var model: AppModel
     let appearance: AppAppearance
 
     @Environment(\.colorScheme) private var systemScheme
@@ -223,6 +259,12 @@ struct RootView: View {
     @State private var widthAtDragStart: Double?
     @AppStorage(ShellPanelSize.key) private var shellFraction = ShellPanelSize.initial
     @State private var fractionAtDragStart: Double?
+
+    @MainActor
+    init(hub: Hub, appearance: AppAppearance) {
+        _model = StateObject(wrappedValue: AppModel(hub: hub))
+        self.appearance = appearance
+    }
 
     private var scheme: ColorScheme { appearance.colorScheme ?? systemScheme }
 
@@ -247,6 +289,8 @@ struct RootView: View {
         // in the terminal's own font, in the titlebar the window already reserves.
         .withoutToolbarTitle()
         .toolbar { headerItem }
+        // The menu bar acts on whichever window is key.
+        .focusedSceneObject(model)
         .preferredColorScheme(appearance.colorScheme)
         // The terminal has its own notion of light/dark: a ghostty config using
         // `theme = "light:…,dark:…"` needs telling, and so does "Apple System Colors".

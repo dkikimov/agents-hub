@@ -3,31 +3,49 @@ import Combine
 import Foundation
 import GhosttyTerminal
 
-/// Routes PTY bytes from the link queues to the right terminal without ever touching the
-/// main actor. `AppModel` owns the terminals; this owns just enough to feed them, because
+/// Routes PTY bytes from the link queues to the right terminals without ever touching the
+/// main actor. Windows own the terminals; this owns just enough to feed them, because
 /// hopping every 8 KB chunk onto the main actor is what makes a busy agent stutter.
+///
+/// One feed per session per window: each window has a surface of its own for every
+/// session, and all of them parse the same stream.
 final class TerminalRouter: @unchecked Sendable {
     private let lock = NSLock()
-    private var sinks: [SessionKey: AttachFeed] = [:]
+    private var sinks: [SessionKey: [ObjectIdentifier: AttachFeed]] = [:]
 
-    func set(_ key: SessionKey, _ sink: AttachFeed?) {
+    func set(_ key: SessionKey, for window: ObjectIdentifier, _ sink: AttachFeed?) {
         lock.lock()
         defer { lock.unlock() }
-        sinks[key] = sink
+        sinks[key, default: [:]][window] = sink
+    }
+
+    func forget(_ key: SessionKey) {
+        lock.lock()
+        defer { lock.unlock() }
+        sinks[key] = nil
+    }
+
+    /// A closed window's surfaces are gone; nothing may parse into them.
+    func drop(_ window: ObjectIdentifier) {
+        lock.lock()
+        defer { lock.unlock() }
+        for key in Array(sinks.keys) {
+            sinks[key]?[window] = nil
+        }
     }
 
     func deliver(_ key: SessionKey, _ data: Data) {
-        lock.lock()
-        let sink = sinks[key]
-        lock.unlock()
-        sink?.receive(data)
+        for sink in feeds(key) { sink.receive(data) }
     }
 
     func finish(_ key: SessionKey, code: Int32) {
+        for sink in feeds(key) { sink.finish(exitCode: UInt32(bitPattern: code)) }
+    }
+
+    private func feeds(_ key: SessionKey) -> [AttachFeed] {
         lock.lock()
-        let sink = sinks[key]
-        lock.unlock()
-        sink?.finish(exitCode: UInt32(bitPattern: code))
+        defer { lock.unlock() }
+        return sinks[key].map { Array($0.values) } ?? []
     }
 }
 
@@ -45,7 +63,8 @@ final class TerminalSession {
 
     private var layout: AnyCancellable?
 
-    /// `onGrid` reports the *real* grid ghostty laid out. It is the only trustworthy
+    /// `onGrid` reports the *real* grid ghostty laid out, and is the only path a resize
+    /// takes to the PTY. It is the only trustworthy
     /// source: the cell size depends on the user's font, which comes from their own
     /// ghostty config, so anything derived from view geometry here would be a guess that
     /// fights the surface and leaves the guest wrapping at the wrong width.
@@ -55,8 +74,9 @@ final class TerminalSession {
         self.key = key
         let id = key.id
         let feed = self.feed
+        // Not sent from here: whether this grid reaches the PTY depends on whether this
+        // surface's window is the one sizing the sessions, which only the window knows.
         let report: @Sendable (AttachFeed.Grid) -> Void = { grid in
-            send(.resize(id: id, cols: grid.cols, rows: grid.rows))
             onGrid(grid.cols, grid.rows)
         }
         session = InMemoryTerminalSession(

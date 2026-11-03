@@ -34,7 +34,8 @@ struct TerminalPane: View {
         // Spacing around the grid is ghostty's `window-padding-*`, from the user's own
         // config; this only fills what the surface leaves over.
         .background(Ghostty.background)
-        .background(WindowTracker { model.trackWindow($0) })
+        .background(WindowTracker(onWindow: { model.trackWindow($0) },
+                                  onKey: { model.windowBecameKey() }))
     }
 
     private var placeholder: some View {
@@ -142,7 +143,8 @@ enum ShellPanelSize {
 }
 
 /// Hands the model the window holding the panes, so it can ask whether that window is on
-/// screen. Sits in the pane's own background rather than the root view so it can only ever
+/// screen, and says when that window becomes key — the window in use is the one every
+/// session takes its size from. Sits in the pane's own background rather than the root view so it can only ever
 /// answer for the window the surfaces are in — the Settings window is one too.
 ///
 /// The occlusion notification is a hint, not the source of truth: a view attaches before
@@ -152,20 +154,26 @@ enum ShellPanelSize {
 /// hidden immediate rather than a tick late.
 private struct WindowTracker: NSViewRepresentable {
     let onWindow: (NSWindow?) -> Void
+    let onKey: () -> Void
 
     func makeNSView(context _: Context) -> Tracker {
         let tracker = Tracker()
         tracker.onWindow = onWindow
+        tracker.onKey = onKey
         return tracker
     }
 
     func updateNSView(_ tracker: Tracker, context _: Context) {
         tracker.onWindow = onWindow
+        tracker.onKey = onKey
     }
 
     final class Tracker: NSView {
         var onWindow: ((NSWindow?) -> Void)?
+        var onKey: (() -> Void)?
 
+        /// A window that is already key when the view arrives posts nothing more, so that
+        /// one is read here.
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             NotificationCenter.default.removeObserver(self)
@@ -176,12 +184,23 @@ private struct WindowTracker: NSViewRepresentable {
                     name: NSWindow.didChangeOcclusionStateNotification,
                     object: window
                 )
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(becameKey),
+                    name: NSWindow.didBecomeKeyNotification,
+                    object: window
+                )
             }
             report()
+            if window?.isKeyWindow == true { becameKey() }
         }
 
         @objc private func report() {
             onWindow?(window)
+        }
+
+        @objc private func becameKey() {
+            onKey?()
         }
     }
 }

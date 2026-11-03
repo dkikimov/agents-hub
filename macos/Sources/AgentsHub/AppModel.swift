@@ -1,4 +1,5 @@
 import AgentsHubCore
+import Combine
 import Foundation
 import SwiftUI
 
@@ -77,21 +78,22 @@ struct DaemonError: Identifiable {
     let message: String
 }
 
-/// All client state, plus the queries over it. The twin of `src/tui/app.rs` and the
-/// `on_msg` half of `event.rs`.
+/// One window: its selection, the space it shows, its ⌘B panel, and a surface of its own
+/// for every session. The twin of `src/tui/app.rs` and the `on_msg` half of `event.rs`,
+/// with everything windows share — links, the attach set, spaces — in `Hub`.
 ///
-/// Every mutation of the attach set goes through `SessionRegistry`, which returns effects
-/// this applies. Nothing else may touch it — that is what keeps the three rules that each
-/// cost the Rust client a bug in one testable place.
+/// Every mutation of the attach set goes through the hub's `SessionRegistry`, which
+/// returns effects the hub applies, building terminals here. Nothing else may touch it —
+/// that is what keeps the three rules that each cost the Rust client a bug in one
+/// testable place.
 @MainActor
 final class AppModel: ObservableObject {
-    @Published private(set) var vms: [VMState] = []
+    let hub: Hub
+
     @Published private(set) var rowsByVM: [[SidebarRow]] = []
     @Published var selection: SidebarRow.ID?
     @Published var filter = "" { didSet { rebuild() } }
-    @Published var status = ""
     @Published var sheet: Sheet?
-    @Published var error: DaemonError?
     /// Toggled by ⌘L; the root view watches it and moves focus. A plain signal rather
     /// than reaching into `@FocusState` from the model.
     @Published var requestSidebarFocus = false
@@ -111,51 +113,31 @@ final class AppModel: ObservableObject {
     /// notice a click landing straight in the surface, and an indicator that lies is
     /// worse than none.
     @Published private(set) var terminalFocused = false
-    /// Agents that finished a turn, or answered a prompt, while you looked elsewhere.
-    @Published private(set) var doneDots: Set<SessionKey> = []
-    @Published private(set) var configError: String?
-    @Published private(set) var book = SpaceBook() {
-        didSet { if book != oldValue { Self.save(book, Self.spacesKey) } }
-    }
     @Published private(set) var showing = SpaceView.all {
-        didSet { if showing != oldValue { Self.save(showing, Self.viewKey) } }
+        didSet { if showing != oldValue { Hub.save(showing, Self.viewKey) } }
     }
 
-    /// Completion listings, keyed by the VM that would host the session and the directory
-    /// asked about. One request per directory serves every later keystroke.
-    @Published private(set) var dirs: [String: [String]] = [:]
-
-    private(set) var agentNames: [String] = []
     private(set) var terminals: [SessionKey: TerminalSession] = [:]
+    /// This window's agent grid, as its surfaces laid it out. Every PTY takes it while
+    /// this window owns the sessions.
+    private(set) var pane: (cols: UInt16, rows: UInt16)
+    /// This window's shell panel grid, reported by whichever shell surface laid out last.
+    private(set) var shellGrid: (cols: UInt16, rows: UInt16)
 
-    private var registry = SessionRegistry()
-    private var links: [VMLink] = []
-    private let router = TerminalRouter()
-    private var agents = AgentWatch()
-    private let notifier = Notifier()
-    private var collapsed: Set<PathKey> = []
-    private var favourites: Set<PathKey> = []
     /// Where each view's selection was when you left it, so switching back lands there.
     private var lastSelection: [SpaceView: SidebarRow.ID] = [:]
-    private var pendingCreates = PendingCreates()
     /// The VM picked in the New Session sheet, which a space spanning machines needs and an
     /// empty space has no row to imply.
     @Published private var pickedVM: Int?
-    private var pane = AppModel.loadGrid(AppModel.paneGridKey) ?? (80, 24)
-    /// The panel's own grid, reported by whichever shell surface laid out last. Only the
-    /// size a brand-new shell starts at; a mounted one resizes itself.
-    private var shellGrid = AppModel.loadGrid(AppModel.shellGridKey) ?? (80, 12)
     /// The session whose shell ⌘B just asked for, so it takes the keyboard the moment it
     /// has a live surface — which, for a first open, is a round trip to the daemon later.
     private var shellFocusPending: SessionKey?
     /// A new tab asked of the daemon, and the shells its parent had before — the one not
     /// among them when it shows up is the tab to switch to.
     private var awaitingShell: (parent: SessionKey, known: Set<String>)?
-    private var dotTimer: Timer?
-    private var requestedDirs: Set<String> = []
     private var windowVisible = true
-    private var windowShown = false
     private weak var paneWindow: NSWindow?
+    private var hubChanges: AnyCancellable?
 
     /// Set only while the New Session sheet is showing a dropped folder, and cleared when it
     /// closes. It overrides the VM the selection implies, so cwd completion and `create` both
@@ -163,180 +145,103 @@ final class AppModel: ObservableObject {
     /// sheet-scoped, which is what makes overriding it safe.
     private var drop: (cwd: String, vm: Int?)?
 
+    /// A new window opens on the space the last one chose, at the grid the sessions
+    /// already have.
+    init(hub: Hub) {
+        self.hub = hub
+        pane = hub.pane
+        shellGrid = hub.shellGrid
+        showing = Hub.load(Self.viewKey).flatMap { hub.book.has($0) ? $0 : nil } ?? .all
+        // Views read the shared state through this model, so they redraw when it moves.
+        hubChanges = hub.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+    }
+
+    // MARK: - shared state, as this window sees it
+
+    var vms: [VMState] { hub.vms }
+    var status: String {
+        get { hub.status }
+        set { hub.status = newValue }
+    }
+    var error: DaemonError? {
+        get { hub.error }
+        set { hub.error = newValue }
+    }
+    var doneDots: Set<SessionKey> { hub.doneDots }
+    var configError: String? { hub.configError }
+    var agentNames: [String] { hub.agentNames }
+    var book: SpaceBook { hub.book }
+
     // MARK: - lifecycle
 
-    /// Reopening a closed window runs the scene's `.task` again against the same model,
-    /// so this has to be a no-op the second time rather than a second set of links.
-    func start() {
-        guard links.isEmpty else { return }
-        let config: HubConfig
-        do {
-            config = try loadConfig()
-        } catch {
-            configError = error.localizedDescription
-            return
+    /// Joins the hub, which reconnects so this window's surfaces get a replay of their own.
+    func windowAppeared() {
+        hub.add(self)
+    }
+
+    /// Closing the window frees every surface, so this window's terminals go with it. If
+    /// the same window comes back it joins again and is rebuilt from a fresh replay.
+    func windowClosed() {
+        hub.remove(self)
+        terminals.removeAll()
+        mounted.removeAll()
+        mountedShells.removeAll()
+        terminalFocused = false
+    }
+
+    /// Became key: every PTY follows this window's size from now on.
+    func windowBecameKey() {
+        hub.activate(self)
+    }
+
+    /// Rows and selection after anything that changes what the sidebar can show. A space
+    /// another window deleted takes this one to wherever deleting it would have.
+    func refreshRows() {
+        guard hub.book.has(showing) else {
+            return selectSpace(hub.book.landing(unsorted: sessions(in: .unsorted).count))
         }
-        guard !config.vm.isEmpty else {
-            configError = "no [[vm]] in config.toml"
-            return
-        }
-        agentNames = config.agentNames
-        vms = config.vm.map { VMState(config: $0) }
-        collapsed = Self.load(Self.foldsKey) ?? []
-        favourites = Self.load(Self.favouritesKey) ?? []
-        book = Self.load(Self.spacesKey) ?? SpaceBook()
-        showing = Self.load(Self.viewKey).flatMap { book.has($0) ? $0 : nil } ?? .all
+        let previous = allRows
         rebuild()
-        notifier.start { [weak self] reason in self?.status = reason }
-
-        links = config.vm.enumerated().map { index, vm in
-            let link = VMLink(index: index, vm: vm)
-            link.onEvent = { [weak self] idx, event in
-                self?.handle(idx, event)
-            }
-            return link
-        }
-        links.forEach { $0.start() }
-
-        // Claimed here rather than from the scene's `.task`, so a folder can never arrive
-        // before there are VMs to route it to.
-        AppDelegate.onOpen = { [weak self] paths in self?.openFolders(paths) }
-        openFolders(AppDelegate.pending)
-        AppDelegate.pending = []
-
-        // One timer for every dot, at a quarter of the Rust client's 16 ms frame rate:
-        // SwiftUI redraws only what changed, so this only has to be fast enough to look
-        // live. It replaces the whole dirty-flag frame loop.
-        dotTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshDots() }
-        }
-        // Nothing here is deadline work, so let the OS coalesce the wakeup with whatever
-        // else it was going to run — four exact timer fires a second is pure idle energy.
-        dotTimer?.tolerance = 0.1
+        pruneSelection(near: previous)
     }
 
-    /// `nonisolated` so the link queues can call it; hops to main itself.
-    private nonisolated func handle(_ index: Int, _ event: LinkEvent) {
-        // PTY bytes never touch the main actor: the router feeds ghostty's own serial
-        // queue directly. Everything else is UI-rate and hops.
-        if case let .frame(.output(id, data, _)) = event {
-            router.deliver(SessionKey(vm: index, id: id), data)
-            return
-        }
-        Task { @MainActor in self.onMain(index, event) }
+    /// A `Sessions` frame landed and the hub has applied it.
+    func sessionsChanged() {
+        refreshRows()
+        adoptNewShell()
+        revealShell()
     }
 
-    private func onMain(_ index: Int, _ event: LinkEvent) {
-        switch event {
-        // `.up` only means ssh started. Online waits for the daemon's first frame, and
-        // link trouble stays out of `status`, or every retry against an unreachable host
-        // flashes "connected" and several of them take turns on the one line.
-        case .up:
-            apply(registry.connected(vm: index))
-        case let .down(reason):
-            vms[index].linkError = reason ?? "offline"
-            apply(registry.disconnected(vm: index))
-            guard vms[index].online else { return }
-            vms[index].online = false
-            rebuild()
-        case let .frame(frame):
-            if !vms[index].online {
-                vms[index].online = true
-                vms[index].linkError = nil
-            }
-            onFrame(index, frame)
+    /// Most likely a daemon that predates `Shell` and has no idea what we asked for.
+    /// Leaving the panel open would be a blank promise that never resolves.
+    func daemonError(vm: Int) {
+        if let parent = shellFocusPending, parent.vm == vm, shellKeys(for: parent).isEmpty {
+            closeShell(parent)
         }
     }
 
-    private func onFrame(_ index: Int, _ frame: Resp) {
-        switch frame {
-        case let .sessions(list):
-            let previous = allRows
-            let known = Set(vms[index].sessions.map(\.id))
-            vms[index].sessions = list
-            claimCreated(index, list.filter { !known.contains($0.id) })
-            book.prune(vm: vms[index].name, alive: Set(list.map(\.id)))
-            apply(registry.sessions(vm: index, list, cols: pane.cols, rows: pane.rows,
-                                    shellCols: shellGrid.cols, shellRows: shellGrid.rows))
-            readActivity(index, list)
-            rebuild()
-            pruneSelection(near: previous)
-            adoptNewShell()
-            revealShell()
-        case let .exited(id, code):
-            let key = SessionKey(vm: index, id: id)
-            router.finish(key, code: code)
-            if let s = vms[index].sessions.first(where: { $0.id == id }) {
-                if s.isShell {
-                    // `exit` closes its tab, as in any editor's terminal.
-                    closeShellTab(key)
-                    status = "shell exited (\(code))"
-                } else {
-                    status = "\(s.name) exited (\(code)) — press r to restart"
-                }
-            }
-        case let .dirs(path, names):
-            dirs[Self.dirKey(index, path)] = names
-        case let .error(msg):
-            status = "\(vms[index].name): \(msg.prefix { $0 != "\n" })"
-            error = DaemonError(vm: vms[index].name, message: msg)
-            // Most likely a daemon that predates `Shell` and has no idea what we asked
-            // for. Leaving the panel open would be a blank promise that never resolves.
-            if let parent = shellFocusPending, parent.vm == index, shellKeys(for: parent).isEmpty {
-                closeShell(parent)
-            }
-        case .output:
-            break  // handled off-main in `handle`
-        }
-    }
-
-    // MARK: - effects
-
-    private func send(_ vm: Int, _ req: Req) {
-        links[safe: vm]?.send(req)
-    }
-
-    private func apply(_ effects: [Effect]) {
-        for effect in effects {
-            switch effect {
-            case let .send(vm, req):
-                send(vm, req)
-            case let .teardown(key):
-                makeTerminal(key)
-            case let .forget(key):
-                router.set(key, nil)
-                terminals[key] = nil
-                agents.forget(key)
-                mounted.removeAll { $0 == key }
-                mountedShells.removeAll { $0 == key }
-                shellOpen.remove(key)
-                activeShells[key] = nil
-                if shellFocusPending == key { shellFocusPending = nil }
-                if awaitingShell?.parent == key { awaitingShell = nil }
-            }
-        }
-    }
+    // MARK: - terminals
 
     /// Mounted at once, selected or not: an unmounted terminal's bytes pile up in the
     /// feed's backlog, and a busy agent overflows it — trimming the mode prelude, so the
     /// screen is garbled and paste arrives unbracketed.
     ///
     /// First responder does not follow a surface to its replacement, so it is handed on.
-    private func makeTerminal(_ key: SessionKey) {
+    func makeTerminal(_ key: SessionKey) {
         let vm = key.vm
         let hadFocus = terminals[key]?.ownsKeyboard ?? false
         let terminal = TerminalSession(
             key: key,
             send: { [weak self] req in
                 // Off the main actor: this is ghostty's write callback, at keystroke rate.
-                Task { @MainActor in self?.send(vm, req) }
+                Task { @MainActor in self?.terminalSent(req, vm: vm) }
             },
             onGrid: { [weak self] cols, rows in
                 Task { @MainActor in self?.gridChanged(key, cols: cols, rows: rows) }
             }
         )
         terminals[key] = terminal
-        router.set(key, terminal.feed)
+        hub.route(key, for: self, terminal.feed)
         if info(for: key)?.isShell == true {
             if !mountedShells.contains(key) { mountedShells.append(key) }
         } else if !mounted.contains(key) {
@@ -346,20 +251,28 @@ final class AppModel: ObservableObject {
         if hadFocus { terminal.focus() }
     }
 
-    /// Closing the window frees every surface. A feed that already released its replay
-    /// would hand the reopened window's surfaces live bytes at ghostty's default grid —
-    /// forwarding that grid to every PTY and answering the queries in them — so each
-    /// terminal starts over, holding everything until a surface lays out.
-    func windowClosed() {
-        terminals.keys.sorted().forEach(makeTerminal)
+    func forget(_ key: SessionKey) {
+        terminals[key] = nil
+        mounted.removeAll { $0 == key }
+        mountedShells.removeAll { $0 == key }
+        shellOpen.remove(key)
+        activeShells[key] = nil
+        if shellFocusPending == key { shellFocusPending = nil }
+        if awaitingShell?.parent == key { awaitingShell = nil }
     }
 
-    /// Only the daemon still has the history. Reconnect rather than re-attach: a daemon
-    /// older than per-connection stream dedupe would send every byte twice.
-    func windowAppeared() {
-        defer { windowShown = true }
-        guard windowShown else { return }
-        links.forEach { $0.reconnect() }
+    /// Typing goes to the window it was typed in, and makes that window the one in use —
+    /// a safety net for a key-window notice that never came.
+    private func terminalSent(_ req: Req, vm: Int) {
+        if case .input = req, paneWindow?.isKeyWindow == true { hub.activate(self) }
+        hub.terminalSent(req, vm: vm, from: self)
+    }
+
+    private func gridChanged(_ reporter: SessionKey, cols: UInt16, rows: UInt16) {
+        guard cols > 0, rows > 0 else { return }
+        let isShell = info(for: reporter)?.isShell == true
+        if isShell { shellGrid = (cols, rows) } else { pane = (cols, rows) }
+        hub.gridChanged(from: self, reporter, cols: cols, rows: rows, isShell: isShell)
     }
 
     // MARK: - selection
@@ -478,7 +391,7 @@ final class AppModel: ObservableObject {
         shellOpen.insert(key)
         shellFocusPending = key
         awaitingShell = (key, Set(shellKeys(for: key).map(\.id)))
-        send(key.vm, .shell(parent: key.id, cols: shellGrid.cols, rows: shellGrid.rows, new: true))
+        hub.send(key.vm, .shell(parent: key.id, cols: shellGrid.cols, rows: shellGrid.rows, new: true))
         applySurfaceVisibility()
     }
 
@@ -494,25 +407,30 @@ final class AppModel: ObservableObject {
         show(shell, of: SessionKey(vm: shell.vm, id: parent), focus: true)
     }
 
-    /// A stopped tab is relaunched on sight — after a daemon restart every one is.
+    /// A stopped tab is relaunched on sight — after a daemon restart every one is — by the
+    /// window in use, so two windows moving to the same tab do not relaunch it twice.
     private func show(_ shell: SessionKey, of parent: SessionKey, focus: Bool) {
         activeShells[parent] = shell
         shellOpen.insert(parent)
         if focus { shellFocusPending = parent }
-        if info(for: shell)?.status == .stopped {
-            send(shell.vm, .restart(id: shell.id, cols: shellGrid.cols, rows: shellGrid.rows))
+        if info(for: shell)?.status == .stopped, hub.owns(self) {
+            hub.send(shell.vm, .restart(id: shell.id, cols: shellGrid.cols, rows: shellGrid.rows))
         }
         applySurfaceVisibility()
         revealShell()
     }
 
-    /// The tab's ×, and a shell's own `exit`. The panel closes with its last tab, and the
-    /// keyboard follows the tab that takes the closed one's place only if it was there.
+    /// The tab's ×. The shell is gone for every window, so the hub tells each one.
     func closeShellTab(_ shell: SessionKey) {
+        hub.closeShellTab(shell)
+    }
+
+    /// The panel closes with its last tab, and the keyboard follows the tab that takes the
+    /// closed one's place only if it was there.
+    func shellTabClosed(_ shell: SessionKey) {
         guard let parentID = info(for: shell)?.parent else { return }
         let parent = SessionKey(vm: shell.vm, id: parentID)
         let shells = shellKeys(for: parent)
-        send(shell.vm, .kill(id: shell.id))
         let rest = shells.filter { $0 != shell }
         guard let fallback = rest[safe: min(shells.firstIndex(of: shell) ?? 0, rest.count - 1)]
         else { return closeShell(parent) }
@@ -558,8 +476,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Also seeds the first selection: an app that opens onto an empty pane when there
-    /// are sessions right there makes you click before it does anything.
     // MARK: - keyboard navigation
 
     /// Elide rows are inert, exactly as in the Rust client — `j`/`k` step over them
@@ -601,6 +517,9 @@ final class AppModel: ObservableObject {
     /// A killed session hands the selection to its nearest surviving neighbour, below
     /// first: landing back at the top of the list means scrolling down again after
     /// every kill.
+    ///
+    /// Also seeds the first selection: an app that opens onto an empty pane when there
+    /// are sessions right there makes you click before it does anything.
     private func pruneSelection(near previous: [SidebarRow]) {
         if let selection, allRows.contains(where: { $0.id == selection }) { return }
         let survivors = Set(allRows.compactMap { $0.key == nil ? nil : $0.id })
@@ -615,34 +534,6 @@ final class AppModel: ObservableObject {
         selectionChanged()
     }
 
-    // MARK: - geometry
-
-    /// One geometry for every pane, as in the Rust client, but taken from whichever
-    /// surface actually laid out a grid rather than derived from view size — the cell
-    /// size follows the user's ghostty font and is not ours to guess.
-    ///
-    /// The reporter already resized itself through its own callback; this is only for
-    /// everyone else, whose surface may not be there to notice: not laid out yet, or gone
-    /// with a closed window.
-    private func gridChanged(_ reporter: SessionKey, cols: UInt16, rows: UInt16) {
-        guard cols > 0, rows > 0 else { return }
-        // A shell's surface already resized its own PTY; its grid is the panel's, not the
-        // pane everyone else shares.
-        if info(for: reporter)?.isShell == true {
-            shellGrid = (cols, rows)
-            Self.saveGrid(shellGrid, Self.shellGridKey)
-            return
-        }
-        guard (cols, rows) != (pane.cols, pane.rows) else { return }
-        pane = (cols, rows)
-        Self.saveGrid(pane, Self.paneGridKey)
-        let others = registry.resized(cols: cols, rows: rows).filter { effect in
-            guard case let .send(vm, .resize(id, _, _)) = effect else { return true }
-            return SessionKey(vm: vm, id: id) != reporter
-        }
-        apply(others)
-    }
-
     // MARK: - commands
 
     func create(agent: String, name: String, cwd: String) {
@@ -650,10 +541,10 @@ final class AppModel: ObservableObject {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let display = name.isEmpty ? defaultName(cwd: cwd, agent: agent) : name
         if case let .space(space) = showing {
-            pendingCreates.expect(vm: vm, agent: agent, name: display, space: space)
+            hub.pendingCreates.expect(vm: vm, agent: agent, name: display, space: space)
         }
-        send(vm, .create(agent: agent, name: display, cwd: cwd,
-                         cols: pane.cols, rows: pane.rows))
+        hub.send(vm, .create(agent: agent, name: display, cwd: cwd,
+                             cols: pane.cols, rows: pane.rows))
         status = "starting \(agent) · \(display)…"
     }
 
@@ -665,6 +556,7 @@ final class AppModel: ObservableObject {
         drop = (cwd: path, vm: vms.firstIndex { $0.config.isLocal })
         forgetDirCache()
         NSApp.activate()
+        paneWindow?.makeKeyAndOrderFront(nil)
         // A turn later, not now: a cold-launched open lands while the scene is still coming
         // up, and a sheet set before the window exists is dropped without a trace.
         Task { @MainActor in sheet = .newSession }
@@ -682,13 +574,12 @@ final class AppModel: ObservableObject {
     }
 
     func kill(_ key: SessionKey) {
-        send(key.vm, .kill(id: key.id))
-        status = "killed \(key.id)"
+        hub.kill(key)
     }
 
     func restartSelected() {
         guard let info = selectedInfo, info.status == .stopped, let key = selectedKey else { return }
-        send(key.vm, .restart(id: key.id, cols: pane.cols, rows: pane.rows))
+        hub.send(key.vm, .restart(id: key.id, cols: pane.cols, rows: pane.rows))
         status = "restarting \(info.name)…"
     }
 
@@ -732,31 +623,22 @@ final class AppModel: ObservableObject {
 
     func cwdMatches(_ cwd: String) -> [String] {
         guard let (dir, typed) = splitCwd(cwd) else { return [] }
-        return filterDirs(dirs[Self.dirKey(currentVM, dir)] ?? [], typed)
+        return filterDirs(hub.listing(vm: currentVM, dir), typed)
     }
 
-    /// Asks the VM that would host the session what lives in the directory being typed.
-    /// Only the first ask per directory goes out; the reply serves every later keystroke.
     func requestDirs(_ cwd: String) {
         guard let (dir, _) = splitCwd(cwd) else { return }
-        let key = Self.dirKey(currentVM, dir)
-        guard !requestedDirs.contains(key) else { return }
-        requestedDirs.insert(key)
-        send(currentVM, .listDir(path: dir))
+        hub.requestDirs(vm: currentVM, dir)
     }
 
-    /// Listings go stale as soon as anything could have changed on the far end.
     func forgetDirCache() {
-        dirs.removeAll()
-        requestedDirs.removeAll()
+        hub.forgetDirCache()
     }
-
-    private static func dirKey(_ vm: Int, _ path: String) -> String { "\(vm)\u{0}\(path)" }
 
     // MARK: - spaces
 
     private func member(_ key: SessionKey) -> MemberKey? {
-        vms[safe: key.vm].map { MemberKey(vm: $0.name, id: key.id) }
+        hub.member(key)
     }
 
     private func shows(_ key: SessionKey, in view: SpaceView? = nil) -> Bool {
@@ -803,7 +685,7 @@ final class AppModel: ObservableObject {
     }
 
     func spaceName(of key: SessionKey) -> String? {
-        spaceID(of: key).flatMap(book.space)?.name
+        hub.spaceName(of: key)
     }
 
     func selectSpace(_ next: SpaceView) {
@@ -824,30 +706,23 @@ final class AppModel: ObservableObject {
 
     func createSpace(named name: String) {
         guard let name = Self.cleanName(name) else { return }
-        selectSpace(.space(book.create(name: name)))
+        selectSpace(.space(hub.book.create(name: name)))
     }
 
     func renameSpace(_ id: UUID, to name: String) {
         guard let name = Self.cleanName(name) else { return }
-        book.rename(id, to: name)
+        hub.book.rename(id, to: name)
     }
 
     /// An empty space goes at once; one holding sessions asks first. Either way its
-    /// sessions only move to Unsorted.
+    /// sessions only move to Unsorted, and every window showing it moves on.
     func deleteSpace(_ id: UUID, confirmed: Bool = false) {
         guard book.space(id) != nil else { return }
         if !confirmed, !sessions(in: .space(id)).isEmpty {
             sheet = .deleteSpace(id)
             return
         }
-        book.delete(id)
-        if showing == .space(id) {
-            selectSpace(book.landing(unsorted: sessions(in: .unsorted).count))
-        } else {
-            let previous = allRows
-            rebuild()
-            pruneSelection(near: previous)
-        }
+        hub.book.delete(id)
     }
 
     /// What `m` moves: the selected session, or everything this view shows under the
@@ -877,20 +752,17 @@ final class AppModel: ObservableObject {
         sheet = .moveToSpace(keys, label: label)
     }
 
-    /// `nil` is Unsorted. Sessions that no longer belong in this view leave it, and the
-    /// selection goes to a neighbour as it does after a kill.
+    /// `nil` is Unsorted. Sessions that no longer belong in a window's view leave it, and
+    /// its selection goes to a neighbour as it does after a kill.
     func move(_ keys: [SessionKey], to space: UUID?) {
-        let previous = allRows
-        book.move(keys.compactMap(member), to: space)
+        hub.book.move(keys.compactMap(member), to: space)
         let target = title(of: space.map(SpaceView.space) ?? .unsorted)
         status = "\(keys.count) session\(keys.count == 1 ? "" : "s") moved to \(target)"
-        rebuild()
-        pruneSelection(near: previous)
     }
 
     func move(_ keys: [SessionKey], toNewSpace name: String) {
         guard let name = Self.cleanName(name) else { return }
-        move(keys, to: book.create(name: name))
+        move(keys, to: hub.book.create(name: name))
     }
 
     /// A drop on a chip, carrying sidebar row ids, of which only sessions count.
@@ -910,10 +782,10 @@ final class AppModel: ObservableObject {
               case let .folder(vm, path, seg, _, _) = allRows.first(where: { $0.id == selection })
         else { return }
         let keys = sessionKeys(under: path, vm: vm)
-        let id = book.space(named: seg)
-        book.move(keys.compactMap(member), to: id)
+        let id = hub.book.space(named: seg)
+        hub.book.move(keys.compactMap(member), to: id)
         status = "\(keys.count) session\(keys.count == 1 ? "" : "s") in \(seg)"
-        if showing == .space(id) { rebuild() } else { selectSpace(.space(id)) }
+        selectSpace(.space(id))
     }
 
     /// ⌘P on a session: its space comes to the front, and a filter that would hide it
@@ -929,12 +801,6 @@ final class AppModel: ObservableObject {
         selectionChanged()
     }
 
-    private func claimCreated(_ vm: Int, _ fresh: [SessionInfo]) {
-        for (id, space) in pendingCreates.claim(vm: vm, fresh) {
-            if let key = member(SessionKey(vm: vm, id: id)) { book.move([key], to: space) }
-        }
-    }
-
     private static func cleanName(_ raw: String) -> String? {
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? nil : name
@@ -943,27 +809,21 @@ final class AppModel: ObservableObject {
     // MARK: - folds and filter
 
     func isCollapsed(vm: Int, path: String) -> Bool {
-        collapsed.contains(PathKey(vm: vm, path: path))
+        hub.collapsed.contains(PathKey(vm: vm, path: path))
     }
 
     func toggleFold(vm: Int, path: String) {
-        let key = PathKey(vm: vm, path: path)
-        if collapsed.contains(key) { collapsed.remove(key) } else { collapsed.insert(key) }
-        Self.save(collapsed, Self.foldsKey)
-        rebuild()
+        hub.toggleFold(PathKey(vm: vm, path: path))
     }
 
     func isFavourite(vm: Int, path: String) -> Bool {
-        favourites.contains(PathKey(vm: vm, path: path))
+        hub.favourites.contains(PathKey(vm: vm, path: path))
     }
 
     /// A favourite folder stays in the sidebar with no sessions left in it, so it is still
     /// there to start the next one from.
     func toggleFavourite(vm: Int, path: String) {
-        let key = PathKey(vm: vm, path: path)
-        if favourites.contains(key) { favourites.remove(key) } else { favourites.insert(key) }
-        Self.save(favourites, Self.favouritesKey)
-        rebuild()
+        hub.toggleFavourite(PathKey(vm: vm, path: path))
     }
 
     func toggleFavouriteAtSelection() {
@@ -989,12 +849,12 @@ final class AppModel: ObservableObject {
                 !sessions[$0].isShell && matches(sessions[$0])
                     && shows(SessionKey(vm: vi, id: sessions[$0].id))
             }
-            let folds = Set(collapsed.filter { $0.vm == vi }.map(\.path))
+            let folds = Set(hub.collapsed.filter { $0.vm == vi }.map(\.path))
             // A filter is a search for sessions, so an empty favourite is noise in it. So
             // is it inside a space: favourites are per machine, and every space would grow
             // every one of them.
             let favs = filter.isEmpty && showing == .all
-                ? Set(favourites.filter { $0.vm == vi }.map(\.path)) : []
+                ? Set(hub.favourites.filter { $0.vm == vi }.map(\.path)) : []
             let rows: [SidebarRow] = tree(sessions: sessions, idx: Array(idx),
                                           collapsed: folds, favourites: favs).map { row in
                 switch row.node {
@@ -1013,49 +873,24 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// ponytail: focus and "seen" ride the dot timer rather than a Combine subscription
-    /// per terminal, so either can lag a quarter second. Subscribe to `state.$isFocused`
-    /// if that ever shows.
-    private func refreshDots() {
+    // MARK: - activity
+
+    /// The hub's dot timer, a quarter second apart.
+    func tick() {
         refreshWindowVisibility()
         let focused = [selectedKey, visibleShellKey].compactMap { $0 }
             .contains { terminals[$0]?.state.isFocused == true }
         if focused != terminalFocused { terminalFocused = focused }
-        if let key = watchingKey {
-            agents.seen(key)
-            publishDone()
-        }
     }
 
     /// The session actually in front of you: selected, in a window on screen, in the
-    /// app you are using. Its news is never news.
-    private var watchingKey: SessionKey? {
+    /// app you are using.
+    var watchingKey: SessionKey? {
         NSApp.isActive && windowVisible ? selectedKey : nil
     }
 
-    /// The daemon reads each agent's screen and says what it is doing; a prompt waiting
-    /// on you, or a turn that ended while you were elsewhere, is worth a banner.
-    private func readActivity(_ vm: Int, _ list: [SessionInfo]) {
-        let watching = watchingKey
-        for session in list where !session.isShell {
-            let key = SessionKey(vm: vm, id: session.id)
-            guard let news = agents.update(key, session.activity, watching: key == watching),
-                  let host = vms[safe: vm] else { continue }
-            let what = news == .needsYou ? "needs you" : "finished"
-            let space = spaceName(of: key).map { "\($0) · " } ?? ""
-            notifier.post(key,
-                          title: "\(space)\(session.agent) · \(session.name) \(what)",
-                          body: "\(host.name) · \(session.cwd)")
-        }
-        publishDone()
-    }
-
-    private func publishDone() {
-        if agents.done != doneDots { doneDots = agents.done }
-    }
-
     func info(for key: SessionKey) -> SessionInfo? {
-        vms[safe: key.vm]?.sessions.first { $0.id == key.id }
+        hub.info(for: key)
     }
 
     func isOnline(_ vm: Int) -> Bool { vms[safe: vm]?.online ?? false }
@@ -1067,41 +902,7 @@ final class AppModel: ObservableObject {
             .joined(separator: " · ")
     }
 
-    // MARK: - persistence
-
-    // Folds were in-memory only in the Rust client and reset on every launch, which was
-    // marked as debt there. Two lines here.
-    private static let foldsKey = "collapsedFolders"
-    private static let favouritesKey = "favouriteFolders"
-
-    private static let spacesKey = "spaces"
     private static let viewKey = "activeSpace"
-
-    private static func load<T: Decodable>(_ key: String) -> T? {
-        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
-        return try? JSONDecoder().decode(T.self, from: data)
-    }
-
-    private static func save<T: Encodable>(_ value: T, _ key: String) {
-        guard let data = try? JSONEncoder().encode(value) else { return }
-        UserDefaults.standard.set(data, forKey: key)
-    }
-
-    // The last real grids, so the attach burst at launch leaves every PTY the size it
-    // already is — rather than squeezing each to a placeholder and back before the first
-    // surface lays out, which a shell answers by redrawing its prompt at the wrong width.
-    private static let paneGridKey = "paneGrid"
-    private static let shellGridKey = "shellGrid"
-
-    private static func loadGrid(_ key: String) -> (cols: UInt16, rows: UInt16)? {
-        guard let grid = UserDefaults.standard.array(forKey: key) as? [Int], grid.count == 2
-        else { return nil }
-        return (UInt16(clamping: grid[0]), UInt16(clamping: grid[1]))
-    }
-
-    private static func saveGrid(_ grid: (cols: UInt16, rows: UInt16), _ key: String) {
-        UserDefaults.standard.set([Int(grid.cols), Int(grid.rows)], forKey: key)
-    }
 }
 
 extension Array {

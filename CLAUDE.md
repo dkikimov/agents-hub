@@ -141,6 +141,17 @@ daemon and the protocol never hear of them, so one space can span VMs. The sideb
 active space, the space bar above it rolls each space up to its most urgent dot, and a
 `Sessions` frame prunes the members its VM no longer lists. The TUI still shows everything.
 
+**Each macOS window is its own client.** `Hub` (shared) owns the links, the
+`SessionRegistry`, what each daemon lists, spaces and folds; `AppModel` is one window —
+its selection, its space, its ⌘B panel and a ghostty surface of its own for every
+session, fed by `TerminalRouter`'s per-window feeds. Two windows must never render one
+`TerminalViewState`: the package binds a surface to its state in `makeNSView`, so the
+other window's pane goes dark. A PTY has one size, so it follows the window used last
+(tmux's `window-size latest`, pure and tested in `AgentsHubCore/WindowOrder.swift`): a
+window becoming key re-sends its grids to every session, and only that window's surfaces
+may write to the PTY — every surface answers the guest's DA/XTWINOPS queries, and two
+answers would be typed into the session. File > New Window is ⇧⌘N; ⌘N is a session.
+
 **Persistence semantics** (deliberate, confirmed with the user): PTYs die with the daemon since
 it holds the master fd. `state.json` + per-session logs survive, so after any restart sessions
 come back listed as `Stopped` with readable history, and `r` relaunches (using `resume` argv if
@@ -207,8 +218,10 @@ work. `Run`'s fields are `Arc<Mutex<..>>` specifically to make that possible.
   `TerminalView`'s delegate to its `TerminalViewState` in `makeNSView` only, so a new
   `TerminalSession` under the same SwiftUI identity reports to the old state and its
   `AttachFeed` never releases: a blank pane with a cursor. Surfaces are `.id`'d by a
-  per-terminal UUID (an address can be reused). Closing the window frees every surface,
-  so the terminals start over and a reopen reconnects each link for a fresh replay.
+  per-terminal UUID (an address can be reused). Closing a window frees its surfaces,
+  and opening one reconnects each link, so every window's terminals start over from a
+  fresh replay — replay and live bytes share one stream per session per connection, so
+  a new window can't be fed history on its own.
 - **One connection, one stream per session.** `Attach` spawns a forwarder; a second one
   on the same connection used to add another, doubling every byte. `serve_conn` keeps
   them per session and aborts the old before the new replay goes out.
