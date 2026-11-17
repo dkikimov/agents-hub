@@ -4,6 +4,7 @@
 
 use crate::config::{expand, Config};
 use crate::conversation;
+use crate::conversation::codex;
 use crate::detect::{self, Agent, Tracker};
 use crate::proto::*;
 use anyhow::{anyhow, Context, Result};
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use tui_term::vt100;
 
 /// Replayed to a client on attach, so a reconnect shows recent history.
@@ -43,7 +44,7 @@ struct Run {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
-    tx: broadcast::Sender<Ev>,
+    output: Arc<Mutex<RunOutput>>,
     /// Only for an agent `detect` has rules for.
     watch: Option<Arc<Mutex<Watch>>>,
     pid: Option<u32>,
@@ -68,13 +69,22 @@ impl Run {
     }
 }
 
-/// The agent's latest window title, which is where Claude and Codex put their spinner.
 #[derive(Default)]
-struct Title(String);
+struct Title {
+    text: String,
+    conversation: Option<String>,
+    changed: bool,
+}
 
 impl vt100::Callbacks for Title {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
-        self.0 = String::from_utf8_lossy(title).chars().take(256).collect();
+        self.text = String::from_utf8_lossy(title).chars().take(256).collect();
+        if let Some(id) =
+            codex::title_id(&self.text).filter(|id| Some(*id) != self.conversation.as_deref())
+        {
+            self.conversation = Some(id.to_owned());
+            self.changed = true;
+        }
     }
 }
 
@@ -112,8 +122,18 @@ impl Watch {
         }
         self.scanned = self.seq;
         let text = detect::snapshot(self.parser.screen());
-        let reading = detect::detect(self.agent, &text, &self.parser.callbacks().0);
+        let reading = detect::detect(self.agent, &text, &self.parser.callbacks().text);
         self.tracker.step(reading, now).then(|| self.tracker.shown())
+    }
+
+    fn process(&mut self, chunk: &[u8]) -> Option<String> {
+        self.parser.process(chunk);
+        self.seq += 1;
+        let title = self.parser.callbacks_mut();
+        if self.agent == Agent::Codex && std::mem::take(&mut title.changed) {
+            return title.conversation.clone();
+        }
+        None
     }
 }
 
@@ -248,6 +268,12 @@ fn mode_prelude(path: &Path, tail: u64) -> Vec<u8> {
         .collect()
 }
 
+fn replay(path: &Path) -> Vec<u8> {
+    let mut bytes = mode_prelude(path, REPLAY_BYTES);
+    bytes.extend_from_slice(&read_tail(path, REPLAY_BYTES));
+    bytes
+}
+
 /// One session's append-only log, which trims its own head once it outgrows `LOG_MAX`.
 /// Every write is best-effort: a full disk must not take the session down with it.
 struct SessionLog {
@@ -304,26 +330,38 @@ impl SessionLog {
     }
 }
 
+struct RunOutput {
+    log: SessionLog,
+    tx: broadcast::Sender<Ev>,
+}
+
+impl RunOutput {
+    fn append(&mut self, chunk: &[u8]) {
+        self.log.append(chunk);
+        let _ = self.tx.send(Ev::Data(Arc::new(chunk.to_vec())));
+    }
+
+    fn attach(&self) -> (Vec<u8>, broadcast::Receiver<Ev>) {
+        (replay(&self.log.path), self.tx.subscribe())
+    }
+}
+
 /// Fans one PTY's output out to whoever is attached and appends it to the session log.
 /// Returns the child's exit code once the PTY closes.
 fn pty_reader(
     mut reader: Box<dyn Read + Send>,
-    log_path: PathBuf,
-    tx: &broadcast::Sender<Ev>,
+    output: &Mutex<RunOutput>,
     child: &Mutex<Box<dyn Child + Send + Sync>>,
     watch: Option<&Mutex<Watch>>,
+    record_conversation: impl Fn(String),
 ) -> i32 {
-    let mut log = SessionLog::open(log_path);
     let mut buf = [0u8; 8192];
     while let Ok(n @ 1..) = reader.read(&mut buf) {
         let chunk = &buf[..n];
-        log.append(chunk);
-        if let Some(w) = watch {
-            let mut w = w.lock().unwrap();
-            w.parser.process(chunk);
-            w.seq += 1;
+        if let Some(id) = watch.and_then(|w| w.lock().unwrap().process(chunk)) {
+            record_conversation(id);
         }
-        let _ = tx.send(Ev::Data(Arc::new(chunk.to_vec())));
+        output.lock().unwrap().append(chunk);
     }
     child
         .lock()
@@ -375,15 +413,14 @@ impl Hub {
 
     /// tmp-file + rename, so a crash mid-write can't leave a truncated state file.
     fn save(&self) {
-        let saved: Vec<Saved> = {
-            let s = self.sessions.lock().unwrap();
-            s.values()
-                .map(|x| Saved {
-                    info: x.info.clone(),
-                    conversation: x.conversation.clone(),
-                })
-                .collect()
-        };
+        let sessions = self.sessions.lock().unwrap();
+        let saved: Vec<Saved> = sessions
+            .values()
+            .map(|x| Saved {
+                info: x.info.clone(),
+                conversation: x.conversation.clone(),
+            })
+            .collect();
         let Ok(json) = serde_json::to_string_pretty(&saved) else {
             return;
         };
@@ -396,6 +433,17 @@ impl Hub {
     fn announce(&self) {
         self.save();
         let _ = self.changed.send(());
+    }
+
+    fn record_conversation(&self, id: &str, conversation: String) {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let Some(session) = sessions.get_mut(id) else {
+                return;
+            };
+            session.conversation = Some(conversation);
+        }
+        self.save();
     }
 
     fn mark_stopped(&self, id: &str) {
@@ -424,20 +472,17 @@ impl Hub {
                 })
                 .collect()
         };
-        let moved: Vec<(String, Activity, Option<String>)> = watches
+        let moved: Vec<_> = watches
             .into_iter()
             .filter_map(|(id, w, pid)| {
                 let (activity, agent) = {
                     let mut w = w.lock().unwrap();
                     (w.scan(now)?, w.agent)
                 };
-                // ponytail: only Claude leaves its current conversation in a file, so an
-                // OpenCode session switched from its TUI still resumes the one it launched
-                // with. Following it takes a plugin reporting the id, which is what herdr does.
                 let conversation = pid
                     .filter(|_| agent == Agent::Claude)
                     .and_then(conversation::current);
-                Some((id, activity, conversation))
+                Some((id, w, activity, conversation))
             })
             .collect();
         if moved.is_empty() {
@@ -446,8 +491,13 @@ impl Hub {
         let mut switched = false;
         {
             let mut s = self.sessions.lock().unwrap();
-            for (id, activity, conversation) in moved {
-                if let Some(sess) = s.get_mut(&id).filter(|x| x.run.is_some()) {
+            for (id, watch, activity, conversation) in moved {
+                if let Some(sess) = s.get_mut(&id).filter(|x| {
+                    x.run
+                        .as_ref()
+                        .and_then(|run| run.watch.as_ref())
+                        .is_some_and(|current| Arc::ptr_eq(current, &watch))
+                }) {
                     sess.info.activity = activity;
                     if conversation.is_some() && conversation != sess.conversation {
                         sess.conversation = conversation;
@@ -504,19 +554,23 @@ impl Hub {
 
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
-        let tx = broadcast::channel(CHUNK_CAP).0;
+        let output = Arc::new(Mutex::new(RunOutput {
+            log: SessionLog::open(self.log_path(id)),
+            tx: broadcast::channel(CHUNK_CAP).0,
+        }));
         let child = Arc::new(Mutex::new(child));
         let watch = Agent::of(&argv).map(|a| Arc::new(Mutex::new(Watch::new(a, cols, rows))));
 
         let hub = self.clone();
         let sid = id.to_string();
-        let log_path = self.log_path(id);
-        let etx = tx.clone();
+        let reader_output = output.clone();
         let echild = child.clone();
         let ewatch = watch.clone();
         std::thread::spawn(move || {
-            let code = pty_reader(reader, log_path, &etx, &echild, ewatch.as_deref());
-            let _ = etx.send(Ev::Exited(code));
+            let code = pty_reader(reader, &reader_output, &echild, ewatch.as_deref(), |id| {
+                hub.record_conversation(&sid, id);
+            });
+            let _ = reader_output.lock().unwrap().tx.send(Ev::Exited(code));
             hub.mark_stopped(&sid);
         });
 
@@ -524,7 +578,7 @@ impl Hub {
             writer: Arc::new(Mutex::new(writer)),
             master: Arc::new(Mutex::new(pair.master)),
             child,
-            tx,
+            output,
             watch,
             pid,
         })
@@ -540,17 +594,39 @@ impl Hub {
         vec![shell, "-l".into()]
     }
 
-    fn argv_for(&self, agent: &str, resuming: bool, conversation: &str) -> Result<Vec<String>> {
+    fn argv_for(
+        &self,
+        agent: &str,
+        resuming: bool,
+        conversation: &str,
+        cwd: &str,
+    ) -> Result<Vec<String>> {
         let a = self
             .cfg
             .agents
             .get(agent)
             .ok_or_else(|| anyhow!("unknown agent type '{agent}' — add [agents.{agent}] to config.toml"))?;
-        let argv = match &a.resume {
-            Some(r) if resuming && resumable(r, conversation, conversation::has_transcript) => r,
-            _ => &a.command,
-        };
-        Ok(conversation::fill(argv, conversation))
+        if let Some(cmd) = codex::Command::of(&a.command) {
+            let id = if resuming {
+                cmd.saved_id(&expand_home(cwd), conversation)
+            } else {
+                None
+            };
+            let argv = match (resuming, &a.resume, id) {
+                (true, Some(r), _) if !conversation::names_one(r) => r.clone(),
+                (true, Some(r), Some(id)) => conversation::fill(r, &id),
+                (true, None, Some(id)) => cmd.resume(&id),
+                _ => conversation::fill(&a.command, conversation),
+            };
+            return Ok(codex::track(argv));
+        }
+        let resume = a.resume.as_ref().filter(|argv| {
+            resuming
+                && resumable(argv, conversation, |id| {
+                    Agent::of(argv) == Some(Agent::OpenCode) || conversation::has_transcript(id)
+                })
+        });
+        Ok(conversation::fill(resume.unwrap_or(&a.command), conversation))
     }
 
     /// `streams` is this connection's live forwarder per session: an `Attach` replaces
@@ -559,7 +635,7 @@ impl Hub {
         self: &Arc<Self>,
         req: Req,
         tx: &mpsc::UnboundedSender<Resp>,
-        streams: &mut HashMap<String, AbortHandle>,
+        streams: &mut HashMap<String, JoinHandle<()>>,
     ) -> Result<()> {
         match req {
             Req::List => {
@@ -581,9 +657,8 @@ impl Hub {
                 rows,
             } => {
                 let conversation = conversation::new_id()?;
-                let argv = self.argv_for(&agent, false, &conversation)?;
+                let argv = self.argv_for(&agent, false, &conversation, &cwd)?;
                 let id = new_id();
-                let run = self.spawn(&id, &argv, &cwd, cols, rows)?;
                 let info = SessionInfo {
                     id: id.clone(),
                     agent,
@@ -594,10 +669,10 @@ impl Hub {
                     parent: None,
                     activity: Activity::Unknown,
                 };
-                self.sessions
-                    .lock()
-                    .unwrap()
-                    .insert(
+                {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    let run = self.spawn(&id, &argv, &info.cwd, cols, rows)?;
+                    sessions.insert(
                         id,
                         Session {
                             info,
@@ -605,6 +680,7 @@ impl Hub {
                             conversation: Some(conversation),
                         },
                     );
+                }
                 self.announce();
             }
 
@@ -657,23 +733,29 @@ impl Hub {
                 // Before the replay, so no stale live chunk can land after it.
                 if let Some(old) = streams.remove(&id) {
                     old.abort();
+                    let _ = old.await;
                 }
-                let mut replay = mode_prelude(&self.log_path(&id), REPLAY_BYTES);
-                replay.extend_from_slice(&read_tail(&self.log_path(&id), REPLAY_BYTES));
+                let output = {
+                    let s = self.sessions.lock().unwrap();
+                    s.get(&id).and_then(|x| x.run.as_ref()).map(|r| {
+                        r.resize(cols, rows);
+                        r.output.clone()
+                    })
+                };
+                let (bytes, sub) = if let Some(output) = output {
+                    // A PTY write must land in either the replay or the new stream.
+                    let (bytes, sub) = output.lock().unwrap().attach();
+                    (bytes, Some(sub))
+                } else {
+                    (replay(&self.log_path(&id)), None)
+                };
                 // Sent even when empty: it is how a client learns the replay is over, and
                 // the macOS one shuts writeback until then.
                 let _ = tx.send(Resp::Output {
                     id: id.clone(),
-                    data: b64(&replay),
+                    data: b64(&bytes),
                     live: false,
                 });
-                let sub = {
-                    let s = self.sessions.lock().unwrap();
-                    s.get(&id).and_then(|x| x.run.as_ref()).map(|r| {
-                        r.resize(cols, rows);
-                        r.tx.subscribe()
-                    })
-                };
                 if let Some(mut sub) = sub {
                     let out = tx.clone();
                     let key = id.clone();
@@ -700,7 +782,7 @@ impl Hub {
                             }
                         }
                     });
-                    streams.insert(key, task.abort_handle());
+                    streams.insert(key, task);
                 }
             }
 
@@ -756,37 +838,27 @@ impl Hub {
     /// session from before conversations were tracked gets a fresh one rather than
     /// someone else's.
     fn restart(self: &Arc<Self>, id: &str, cols: u16, rows: u16) -> Result<()> {
-        let (agent, cwd, shell, conversation) = {
-            let s = self.sessions.lock().unwrap();
-            let sess = s.get(id).ok_or_else(|| anyhow!("no such session"))?;
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let sess = sessions.get_mut(id).ok_or_else(|| anyhow!("no such session"))?;
             if sess.run.is_some() {
                 return Ok(()); // already running, nothing to do
             }
-            (
-                sess.info.agent.clone(),
-                sess.info.cwd.clone(),
-                sess.info.parent.is_some(),
-                sess.conversation.clone(),
-            )
-        };
-        let conversation = match conversation {
-            Some(c) => c,
-            None => conversation::new_id()?,
-        };
-        let argv = if shell {
-            Self::shell_argv()
-        } else {
-            self.argv_for(&agent, true, &conversation)?
-        };
-        let run = self.spawn(id, &argv, &cwd, cols, rows)?;
-        {
-            let mut s = self.sessions.lock().unwrap();
-            if let Some(sess) = s.get_mut(id) {
-                sess.info.status = Status::Running;
-                sess.info.activity = Activity::Unknown;
-                sess.run = Some(run);
-                sess.conversation = Some(conversation);
-            }
+            let conversation = match &sess.conversation {
+                Some(c) => c.clone(),
+                None => conversation::new_id()?,
+            };
+            let cwd = &sess.info.cwd;
+            let argv = if sess.info.parent.is_some() {
+                Self::shell_argv()
+            } else {
+                self.argv_for(&sess.info.agent, true, &conversation, cwd)?
+            };
+            let run = self.spawn(id, &argv, cwd, cols, rows)?;
+            sess.info.status = Status::Running;
+            sess.info.activity = Activity::Unknown;
+            sess.run = Some(run);
+            sess.conversation = Some(conversation);
         }
         self.announce();
         Ok(())
@@ -797,7 +869,7 @@ async fn serve_conn(hub: Arc<Hub>, stream: UnixStream) {
     let (r, mut w) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Resp>();
 
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         while let Some(resp) = rx.recv().await {
             let mut line = match serde_json::to_string(&resp) {
                 Ok(l) => l,
@@ -819,7 +891,7 @@ async fn serve_conn(hub: Arc<Hub>, stream: UnixStream) {
     let mut changed = hub.changed.subscribe();
     let ctx = tx.clone();
     let chub = hub.clone();
-    tokio::spawn(async move {
+    let session_updates = tokio::spawn(async move {
         loop {
             match changed.recv().await {
                 Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -851,6 +923,12 @@ async fn serve_conn(hub: Arc<Hub>, stream: UnixStream) {
             }
         }
     }
+    session_updates.abort();
+    for stream in streams.into_values() {
+        stream.abort();
+    }
+    drop(tx);
+    let _ = writer.await;
 }
 
 /// Where the forwarded agent actually is *right now*: the link the newest `stdio` left,
@@ -1115,6 +1193,25 @@ mod tests {
         assert!(resumable(&named, "abc", |c| c == "abc"));
         assert!(!resumable(&named, "abc", |_| false));
         assert!(resumable(&plain, "abc", |_| false));
+    }
+
+    #[test]
+    fn opencode_can_resume_by_id_without_a_claude_transcript() {
+        let cfg = toml::from_str(
+            r#"
+            [agents.opencode]
+            command = ["opencode", "--session", "ses_{conversation}"]
+            resume = ["opencode", "--standalone", "--session", "ses_{conversation}"]
+            "#,
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("ah-opencode-{}", new_id()));
+        let hub = Hub::new(dir, cfg);
+        let id = conversation::new_id().unwrap();
+        assert_eq!(
+            hub.argv_for("opencode", true, &id, "/tmp").unwrap(),
+            ["opencode".into(), "--standalone".into(), "--session".into(), format!("ses_{id}")]
+        );
     }
 
     #[test]

@@ -79,6 +79,12 @@ Each Claude session keeps its own conversation: `{conversation}` in `command` an
 two sessions in one folder never resume each other. A conversation with no messages yet
 has nothing to resume and starts fresh.
 
+Agents Hub sets the Codex terminal title to track the active conversation and resume it
+by ID. This works with the default launch command and with `env CODEX_HOME=... codex`
+commands. Other launch flags still apply on restart. A custom `resume` command can
+override the default. If Agents Hub has no recorded ID or cannot find its local
+transcript, it starts a fresh conversation.
+
 OpenCode sessions do the same through `--session`, which needs OpenCode 2. Switching
 to another session inside OpenCode isn't followed: `r` brings back the one the session
 started with.

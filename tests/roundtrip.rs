@@ -3,7 +3,10 @@
 //! marked Stopped, with its output replayable. The companion shell rides the same
 //! machinery, so it is proven the same way.
 
-use std::io::{BufRead, BufReader, Write};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -157,6 +160,16 @@ fn session_survives_a_daemon_restart() {
     let state = std::fs::read_to_string(dir.join("state.json")).unwrap();
     assert!(state.contains(&id) && state.contains("smoke"));
 
+    let mut reader = connect(&dir);
+    send(&mut reader, r#"{"t":"List"}"#);
+    send(&mut reader, &format!(r#"{{"t":"Attach","id":"{id}","cols":80,"rows":24}}"#));
+    reader.shutdown(Shutdown::Write).unwrap();
+    let mut replies = String::new();
+    reader
+        .read_to_string(&mut replies)
+        .expect("closing the request side should drain queued replies and close the connection");
+    assert!(replies.contains("\"Sessions\"") && replies.contains("\"live\":false"), "{replies}");
+
     drop(r);
     drop(s);
     drop(d1);
@@ -217,6 +230,147 @@ fn wait_for_output(r: &mut impl BufRead, id: &str, needle: &str) -> String {
         seen.push_str(&String::from_utf8_lossy(&base64_decode(b64)));
     }
     seen
+}
+
+#[test]
+fn attaching_during_output_joins_replay_to_the_live_stream() {
+    let dir = std::env::temp_dir().join(format!("agents-hub-stream-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.toml");
+    std::fs::write(
+        &cfg,
+        r#"
+[agents.stream]
+command = ["sh", "-c", '''
+i=0
+while [ "$i" -lt 12000 ]; do
+    printf 'seq=%06d\n' "$i"
+    i=$((i + 1))
+    if [ "$((i % 40))" -eq 0 ]; then sleep 0.02; fi
+done
+''']
+"#,
+    )
+    .unwrap();
+    let daemon = start(&dir, &cfg);
+    let mut s = connect(&dir);
+    let mut r = BufReader::new(s.try_clone().unwrap());
+    send(
+        &mut s,
+        r#"{"t":"Create","agent":"stream","name":"stream","cwd":"/tmp","cols":80,"rows":24}"#,
+    );
+    let listed = wait_for(&mut r, |line| line.contains("\"Sessions\"") && line.contains("stream"));
+    let id = &sessions(&listed)[0].0;
+    let attach = json!({"t": "Attach", "id": id, "cols": 80, "rows": 24}).to_string();
+
+    for _ in 0..20 {
+        send(&mut s, &attach);
+        let receives_output = |l: &str| l.contains("\"Output\"") && l.contains(id);
+        let replay = wait_for(&mut r, |l| receives_output(l) && l.contains("\"live\":false"));
+        let mut bytes = Vec::new();
+        for frame in [replay, wait_for(&mut r, receives_output), wait_for(&mut r, receives_output)] {
+            let output: Value = serde_json::from_str(&frame).unwrap();
+            bytes.extend(STANDARD.decode(output["data"].as_str().unwrap()).unwrap());
+        }
+        let stream = String::from_utf8(bytes).unwrap();
+        let sequence: Vec<u32> = stream
+            .split_terminator('\n')
+            .filter_map(|line| line.strip_suffix('\r')?.strip_prefix("seq=")?.parse().ok())
+            .collect();
+        assert!(sequence.len() >= 2);
+        for pair in sequence.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1, "lost or duplicated output around {pair:?}");
+        }
+    }
+    send(&mut s, &json!({"t": "Kill", "id": id}).to_string());
+    wait_for(&mut r, |l| l.contains("\"Sessions\"") && !l.contains(id));
+    drop(daemon);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn codex_restarts_the_conversation_recorded_for_each_session() {
+    let dir = std::env::temp_dir().join(format!("agents-hub-codex-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let codex = dir.join("codex");
+    std::fs::write(
+        &codex,
+        r#"#!/bin/sh
+set -eu
+stty -echo
+if [ "$1" = resume ]; then
+    IFS= read -r _
+    printf 'resumed:%s\n' "$2"
+else
+    printf 'new conversation\n'
+    IFS= read -r id
+    if [ "$id" = probe ]; then
+        printf 'started fresh\n'
+    else
+        transcripts="$CODEX_HOME/sessions/2026/11/17"
+        mkdir -p "$transcripts"
+        if [ "$id" != 03555555-5555-7555-a555-555555555555 ]; then
+            touch "$transcripts/rollout-2026-11-17T20-00-00-$id.jsonl"
+        fi
+        printf '\033]0;codex | %.29s...\007\033]0;codex\007recorded\n' "$id"
+    fi
+fi
+IFS= read -r _
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let cfg = dir.join("config.toml");
+    let argv = json!(["/usr/bin/env", "CODEX_HOME=codex-home", codex, "--no-alt-screen"]);
+    std::fs::write(&cfg, format!("[agents.codex]\ncommand = {argv}\n")).unwrap();
+
+    let daemon = start(&dir, &cfg);
+    let mut s = connect(&dir);
+    let mut r = BufReader::new(s.try_clone().unwrap());
+    let conversations = [
+        ("first", "03111111-1111-7111-a111-111111111111"),
+        ("second", "03222222-2222-7222-a222-222222222222"),
+        ("empty", "03555555-5555-7555-a555-555555555555"),
+    ];
+    let mut ids = Vec::new();
+    for (name, thread) in conversations {
+        send(&mut s, &json!({
+            "t": "Create", "agent": "codex", "name": name, "cwd": dir, "cols": 80, "rows": 24
+        }).to_string());
+        let listed = wait_for(&mut r, |line| line.contains("\"Sessions\"") && line.contains(name));
+        let frame: Value = serde_json::from_str(&listed).unwrap();
+        let session = frame["sessions"].as_array().unwrap().iter()
+            .find(|session| session["name"] == name).unwrap();
+        let id = session["id"].as_str().unwrap();
+        send(&mut s, &json!({"t": "Attach", "id": id, "cols": 80, "rows": 24}).to_string());
+        wait_for_output(&mut r, id, "new conversation");
+        let input = STANDARD.encode(format!("{thread}\n"));
+        send(&mut s, &json!({"t": "Input", "id": id, "data": input}).to_string());
+        wait_for_output(&mut r, id, "recorded");
+        ids.push(id.to_owned());
+    }
+    drop(daemon);
+
+    let daemon = start(&dir, &cfg);
+    let mut s = connect(&dir);
+    let mut r = BufReader::new(s.try_clone().unwrap());
+    for (id, (name, thread)) in ids.iter().zip(conversations) {
+        send(&mut s, &json!({"t": "Restart", "id": id, "cols": 80, "rows": 24}).to_string());
+        send(&mut s, &json!({"t": "Attach", "id": id, "cols": 80, "rows": 24}).to_string());
+        wait_for(&mut r, |l| l.contains("\"Output\"") && l.contains("\"live\":false"));
+        let input = STANDARD.encode("probe\n");
+        send(&mut s, &json!({"t": "Input", "id": id, "data": input}).to_string());
+        if name == "empty" {
+            wait_for_output(&mut r, id, "started fresh");
+        } else {
+            wait_for_output(&mut r, id, &format!("resumed:{thread}"));
+        }
+        send(&mut s, &json!({"t": "Kill", "id": id}).to_string());
+    }
+    drop(daemon);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

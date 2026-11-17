@@ -1,7 +1,6 @@
-//! Which Claude Code conversation a session is in. `claude --continue` resumes the
-//! newest conversation in the cwd, so two sessions in one folder resumed each other's;
-//! each session instead carries its own conversation id, which `{conversation}` in an
-//! agent's argv stands for.
+//! Conversation IDs belong to individual sessions, even when they share a working directory.
+
+pub mod codex;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
