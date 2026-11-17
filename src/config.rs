@@ -28,7 +28,7 @@ pub struct Vm {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Agent {
     pub command: Vec<String>,
-    /// Used by `r` on a stopped session, so Claude Code can pick its thread back up.
+    /// Overrides the command used by `r` on a stopped session.
     /// `{conversation}` here and in `command` is the session's own conversation id.
     #[serde(default)]
     pub resume: Option<Vec<String>>,
