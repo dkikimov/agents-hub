@@ -1,4 +1,5 @@
 import AgentsHubCore
+import AppKit
 import Combine
 import Foundation
 import GhosttyTerminal
@@ -93,6 +94,7 @@ final class TerminalSession {
             // is the difference between smooth and unusable.
             resizeThrottleMilliseconds: 100
         )
+        state.makePlatformView = { SessionTerminalView(frame: .zero) }
         state.isSurfaceVisible = false
     }
 
@@ -124,5 +126,75 @@ final class TerminalSession {
         if dropped > 0 {
             NSLog("agents-hub: dropped %d bytes of replay writeback for %@", dropped, key.id)
         }
+    }
+}
+
+private final class SessionTerminalView: TerminalView {
+    private var bypassesMouseCapture = false
+
+    override func mouseDown(with event: NSEvent) {
+        let checksForLink = hasLinkModifiers(event)
+        bypassesMouseCapture = checksForLink && isMouseCaptured
+        let event = mouseEvent(event, bypassingCapture: bypassesMouseCapture)
+        if checksForLink {
+            // Ghostty caches link detection by cell even when the modifiers change.
+            sendMousePos(x: -1, y: -1, modifiers: TerminalInputModifiers(from: event.modifierFlags))
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let event = mouseEvent(event, bypassingCapture: bypassesMouseCapture)
+        bypassesMouseCapture = false
+        super.mouseUp(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let bypass = switch event.type {
+        case .mouseMoved: hasLinkModifiers(event)
+        case .leftMouseDragged: bypassesMouseCapture
+        default: false
+        }
+        super.mouseMoved(with: mouseEvent(event, bypassingCapture: bypass))
+    }
+
+    private func hasLinkModifiers(_ event: NSEvent) -> Bool {
+        event.modifierFlags.intersection([.command, .control, .option]) == .command
+    }
+
+    private func mouseEvent(_ event: NSEvent, bypassingCapture: Bool) -> NSEvent {
+        // Ghostty uses Shift to bypass mouse reporting before checking for links.
+        guard bypassingCapture, isMouseCaptured, !event.modifierFlags.contains(.shift) else {
+            return event
+        }
+        return NSEvent.mouseEvent(
+            with: event.type,
+            location: event.locationInWindow,
+            modifierFlags: event.modifierFlags.union(.shift),
+            timestamp: event.timestamp,
+            windowNumber: event.windowNumber,
+            context: nil,
+            eventNumber: event.eventNumber,
+            clickCount: event.clickCount,
+            pressure: event.pressure
+        ) ?? event
+    }
+}
+
+extension TerminalViewState: @retroactive TerminalSurfaceOpenURLDelegate {
+    public func terminalDidRequestOpenURL(_ rawURL: String, kind: TerminalOpenURLKind) {
+        let url: URL
+        switch kind {
+        case .text, .html:
+            url = URL(filePath: rawURL)
+        case .unknown:
+            guard let parts = URLComponents(string: rawURL),
+                  let scheme = parts.scheme?.lowercased(), scheme == "https" || scheme == "http",
+                  let host = parts.host, !host.isEmpty, parts.user == nil, parts.password == nil,
+                  let webURL = parts.url else { return }
+            url = webURL
+        }
+        // Ghostty can request a URL while holding its renderer lock.
+        DispatchQueue.main.async { NSWorkspace.shared.open(url) }
     }
 }

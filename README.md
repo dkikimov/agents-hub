@@ -68,6 +68,8 @@ folder, on its VM, run by that VM's daemon like the session itself, so it surviv
 quitting. `⌘B` again (or `exit`) hides it. Drag its header to resize, or set its
 height in Settings (`⌘,`). Killing the session kills its shell.
 
+Command-click a web link in the macOS terminal pane to open it in your default browser.
+
 ### Restarts
 
 PTYs die with the daemon. The session list and logs don't: after a restart every session
@@ -130,6 +132,15 @@ make test                    # cargo test + swift test
 make lint                    # cargo clippy --all-targets
 make run DEBUG=1             # unoptimised build of the app, then launch it
 ```
+
+To check link handling with mouse reporting enabled, run this in a macOS terminal pane.
+
+```sh
+printf '\033[?1002h\033[?1006hhttps://example.com/\n\033]8;;https://example.com/\aExample\033]8;;\a\n'
+```
+
+Command-click the URL and the `Example` label. Both should open in the browser. Run
+`printf '\033[?1002l\033[?1006l'` to reset mouse reporting.
 
 Architecture, the protocol contract between the two clients, and the traps this
 codebase has already hit are in [CLAUDE.md](CLAUDE.md).
